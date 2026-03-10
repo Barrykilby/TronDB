@@ -12,11 +12,17 @@ pub struct Store {
     collections: DashMap<String, CollectionStore>,
 }
 
-impl Store {
-    pub fn new() -> Self {
+impl Default for Store {
+    fn default() -> Self {
         Self {
             collections: DashMap::new(),
         }
+    }
+}
+
+impl Store {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn create_collection(&self, name: &str, dimensions: usize) -> Result<(), EngineError> {
@@ -116,7 +122,7 @@ mod tests {
         let store = Store::new();
         store.create_collection("docs", 3).unwrap();
 
-        let id = LogicalId::from_str("e1");
+        let id = LogicalId::from_string("e1");
         let entity = Entity::new(id.clone())
             .with_metadata("title", Value::String("Hello".into()));
 
@@ -142,7 +148,7 @@ mod tests {
         store.create_collection("docs", 3).unwrap();
 
         for i in 0..5 {
-            let entity = Entity::new(LogicalId::from_str(&format!("e{i}")));
+            let entity = Entity::new(LogicalId::from_string(&format!("e{i}")));
             store.insert("docs", entity).unwrap();
         }
 

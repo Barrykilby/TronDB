@@ -20,7 +20,7 @@ impl LogicalId {
     }
 
     /// Create a logical ID from an existing string.
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_string(s: &str) -> Self {
         Self(s.to_owned())
     }
 
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn logical_id_from_string() {
-        let id = LogicalId::from_str("test-id-1");
+        let id = LogicalId::from_string("test-id-1");
         assert_eq!(id.as_str(), "test-id-1");
     }
 
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn entity_builder() {
-        let entity = Entity::new(LogicalId::from_str("e1"))
+        let entity = Entity::new(LogicalId::from_string("e1"))
             .with_metadata("name", Value::String("Alice".into()))
             .with_metadata("age", Value::Int(30));
 

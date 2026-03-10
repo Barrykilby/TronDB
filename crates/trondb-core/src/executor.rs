@@ -61,7 +61,7 @@ impl Executor {
             Plan::Insert(p) => {
                 // Find or generate LogicalId
                 let id = find_id_in_fields(&p.fields, &p.values)
-                    .unwrap_or_else(LogicalId::new);
+                    .unwrap_or_default();
 
                 // Build entity with metadata
                 let mut entity = Entity::new(id.clone());
@@ -226,7 +226,7 @@ fn find_id_in_fields(fields: &[String], values: &[Literal]) -> Option<LogicalId>
     for (field, value) in fields.iter().zip(values.iter()) {
         if field == "id" {
             if let Literal::String(s) = value {
-                return Some(LogicalId::from_str(s));
+                return Some(LogicalId::from_string(s));
             }
         }
     }

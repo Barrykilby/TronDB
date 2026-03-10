@@ -70,9 +70,9 @@ mod tests {
     #[test]
     fn insert_and_search() {
         let index = VectorIndex::new(3);
-        index.insert(&LogicalId::from_str("a"), &[1.0, 0.0, 0.0]);
-        index.insert(&LogicalId::from_str("b"), &[0.9, 0.1, 0.0]);
-        index.insert(&LogicalId::from_str("c"), &[0.0, 0.0, 1.0]);
+        index.insert(&LogicalId::from_string("a"), &[1.0, 0.0, 0.0]);
+        index.insert(&LogicalId::from_string("b"), &[0.9, 0.1, 0.0]);
+        index.insert(&LogicalId::from_string("c"), &[0.0, 0.0, 1.0]);
 
         let results = index.search(&[1.0, 0.0, 0.0], 3);
         assert_eq!(results.len(), 3);
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn similarity_scores_are_valid() {
         let index = VectorIndex::new(3);
-        index.insert(&LogicalId::from_str("x"), &[1.0, 2.0, 3.0]);
+        index.insert(&LogicalId::from_string("x"), &[1.0, 2.0, 3.0]);
 
         let results = index.search(&[1.0, 2.0, 3.0], 1);
         assert_eq!(results.len(), 1);
