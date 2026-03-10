@@ -1,6 +1,5 @@
 pub mod error;
 pub mod executor;
-pub mod index;
 pub mod planner;
 pub mod result;
 pub mod store;
@@ -102,44 +101,13 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_search() {
+    fn search_returns_unsupported() {
         let engine = Engine::new();
 
-        engine
-            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-            .unwrap();
-
-        engine
-            .execute_tql(
-                "INSERT INTO venues (id, name) VALUES ('v1', 'Exact') VECTOR [1.0, 0.0, 0.0];",
-            )
-            .unwrap();
-
-        engine
-            .execute_tql(
-                "INSERT INTO venues (id, name) VALUES ('v2', 'Close') VECTOR [0.9, 0.1, 0.0];",
-            )
-            .unwrap();
-
-        engine
-            .execute_tql(
-                "INSERT INTO venues (id, name) VALUES ('v3', 'Far') VECTOR [0.0, 0.0, 1.0];",
-            )
-            .unwrap();
-
         let result = engine
-            .execute_tql(
-                "SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] CONFIDENCE > 0.8;",
-            )
-            .unwrap();
+            .execute_tql("SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] CONFIDENCE > 0.8;");
 
-        // v1 and v2 should pass threshold, v3 should not
-        assert_eq!(result.rows.len(), 2);
-        // v1 (exact match) should be first
-        assert_eq!(
-            result.rows[0].values.get("name"),
-            Some(&Value::String("Exact".into()))
-        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -147,7 +115,7 @@ mod tests {
         let engine = Engine::new();
 
         let result = engine
-            .execute_tql("EXPLAIN SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0];")
+            .execute_tql("EXPLAIN FETCH * FROM venues;")
             .unwrap();
 
         let mode_row = result
@@ -158,7 +126,7 @@ mod tests {
 
         assert_eq!(
             mode_row.values.get("value"),
-            Some(&Value::String("Probabilistic".into()))
+            Some(&Value::String("Deterministic".into()))
         );
     }
 }

@@ -37,6 +37,7 @@ pub struct FetchPlan {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SearchPlan {
     pub collection: String,
     pub query_vector: Vec<f64>,
@@ -69,12 +70,9 @@ pub fn plan(stmt: &Statement) -> Result<Plan, EngineError> {
             limit: s.limit,
         })),
 
-        Statement::Search(s) => Ok(Plan::Search(SearchPlan {
-            collection: s.collection.clone(),
-            query_vector: s.near.clone(),
-            k: s.limit.unwrap_or(10),
-            confidence_threshold: s.confidence.unwrap_or(0.0),
-        })),
+        Statement::Search(_) => Err(EngineError::UnsupportedOperation(
+            "SEARCH requires vector index (Phase 4)".into(),
+        )),
 
         Statement::Explain(inner) => {
             let inner_plan = plan(inner)?;
@@ -113,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_search() {
+    fn plan_search_returns_unsupported() {
         let stmt = Statement::Search(SearchStmt {
             collection: "venues".into(),
             fields: FieldList::All,
@@ -121,34 +119,28 @@ mod tests {
             confidence: Some(0.8),
             limit: Some(5),
         });
-        let p = plan(&stmt).unwrap();
-        match p {
-            Plan::Search(sp) => {
-                assert_eq!(sp.k, 5);
-                assert!((sp.confidence_threshold - 0.8).abs() < f64::EPSILON);
-                assert_eq!(sp.query_vector, vec![1.0, 0.0, 0.0]);
-            }
-            _ => panic!("expected SearchPlan"),
-        }
+        let result = plan(&stmt);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, crate::error::EngineError::UnsupportedOperation(_)));
     }
 
     #[test]
     fn plan_explain_wraps_inner() {
-        let stmt = Statement::Explain(Box::new(Statement::Search(SearchStmt {
+        let stmt = Statement::Explain(Box::new(Statement::Fetch(FetchStmt {
             collection: "venues".into(),
             fields: FieldList::All,
-            near: vec![1.0, 0.0, 0.0],
-            confidence: None,
+            filter: None,
             limit: None,
         })));
         let p = plan(&stmt).unwrap();
         match p {
             Plan::Explain(inner) => match *inner {
-                Plan::Search(sp) => {
-                    assert_eq!(sp.k, 10); // default
-                    assert!((sp.confidence_threshold - 0.0).abs() < f64::EPSILON); // default
+                Plan::Fetch(fp) => {
+                    assert_eq!(fp.collection, "venues");
+                    assert_eq!(fp.fields, FieldList::All);
                 }
-                _ => panic!("expected SearchPlan inside Explain"),
+                _ => panic!("expected FetchPlan inside Explain"),
             },
             _ => panic!("expected Explain"),
         }

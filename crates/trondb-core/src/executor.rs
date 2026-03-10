@@ -1,11 +1,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use dashmap::DashMap;
-
 use crate::error::EngineError;
-use crate::index::VectorIndex;
-use crate::planner::{Plan, SearchPlan};
+use crate::planner::Plan;
 use crate::result::{QueryMode, QueryResult, QueryStats, Row};
 use crate::store::FjallStore;
 use crate::types::{Entity, LogicalId, ReprState, ReprType, Representation, Value};
@@ -17,15 +14,11 @@ use trondb_tql::{FieldList, Literal, WhereClause};
 
 pub struct Executor {
     store: FjallStore,
-    indexes: DashMap<String, VectorIndex>,
 }
 
 impl Executor {
     pub fn new(store: FjallStore) -> Self {
-        Self {
-            store,
-            indexes: DashMap::new(),
-        }
+        Self { store }
     }
 
     pub fn execute(&self, plan: &Plan) -> Result<QueryResult, EngineError> {
@@ -34,8 +27,6 @@ impl Executor {
         match plan {
             Plan::CreateCollection(p) => {
                 self.store.create_collection(&p.name, p.dimensions)?;
-                self.indexes
-                    .insert(p.name.clone(), VectorIndex::new(p.dimensions));
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
@@ -87,16 +78,11 @@ impl Executor {
                     let repr = Representation {
                         repr_type: ReprType::Atomic,
                         fields: p.fields.clone(),
-                        vector: vec_f32.clone(),
+                        vector: vec_f32,
                         recipe_hash: [0u8; 32],
                         state: ReprState::Clean,
                     };
                     entity.representations.push(repr);
-
-                    // Insert into vector index
-                    if let Some(index) = self.indexes.get(&p.collection) {
-                        index.insert(&id, &vec_f32);
-                    }
                 }
 
                 self.store.insert(&p.collection, entity)?;
@@ -154,7 +140,9 @@ impl Executor {
                 })
             }
 
-            Plan::Search(p) => self.execute_search(p, start),
+            Plan::Search(_) => Err(EngineError::UnsupportedOperation(
+                "SEARCH requires vector index (Phase 4)".into(),
+            )),
 
             Plan::Explain(inner) => {
                 let rows = explain_plan(inner);
@@ -170,47 +158,6 @@ impl Executor {
                 })
             }
         }
-    }
-
-    fn execute_search(&self, p: &SearchPlan, start: Instant) -> Result<QueryResult, EngineError> {
-        let index = self
-            .indexes
-            .get(&p.collection)
-            .ok_or_else(|| EngineError::CollectionNotFound(p.collection.clone()))?;
-
-        let query_f32: Vec<f32> = p.query_vector.iter().map(|v| *v as f32).collect();
-        let results = index.search(&query_f32, p.k);
-        drop(index);
-
-        let mut rows = Vec::new();
-        for (id, score) in &results {
-            if (*score as f64) < p.confidence_threshold {
-                continue;
-            }
-            let entity = self.store.get(&p.collection, id)?;
-            let mut row = entity_to_row(&entity, &FieldList::All);
-            row.score = Some(*score);
-            row.values
-                .insert("_score".into(), Value::Float(*score as f64));
-            rows.push(row);
-        }
-
-        let scanned = results.len();
-        let mut columns = build_columns(&rows, &FieldList::All);
-        if !columns.contains(&"_score".to_string()) {
-            columns.push("_score".into());
-        }
-
-        Ok(QueryResult {
-            columns,
-            rows,
-            stats: QueryStats {
-                elapsed: start.elapsed(),
-                entities_scanned: scanned,
-                mode: QueryMode::Probabilistic,
-                tier: "RAM",
-            },
-        })
     }
 
     pub fn collections(&self) -> Vec<String> {
@@ -538,108 +485,18 @@ mod tests {
     }
 
     #[test]
-    fn execute_search() {
-        let (exec, _dir) = setup_executor();
-        create_collection(&exec, "venues", 3);
-
-        insert_entity(
-            &exec,
-            "venues",
-            "v1",
-            vec![("name", Literal::String("Exact".into()))],
-            Some(vec![1.0, 0.0, 0.0]),
-        );
-        insert_entity(
-            &exec,
-            "venues",
-            "v2",
-            vec![("name", Literal::String("Close".into()))],
-            Some(vec![0.9, 0.1, 0.0]),
-        );
-        insert_entity(
-            &exec,
-            "venues",
-            "v3",
-            vec![("name", Literal::String("Far".into()))],
-            Some(vec![0.0, 0.0, 1.0]),
-        );
-
-        let result = exec
-            .execute(&Plan::Search(SearchPlan {
-                collection: "venues".into(),
-                query_vector: vec![1.0, 0.0, 0.0],
-                k: 10,
-                confidence_threshold: 0.0,
-            }))
-            .unwrap();
-
-        assert_eq!(result.rows.len(), 3);
-        // First result should be the exact match
-        assert_eq!(
-            result.rows[0].values.get("name"),
-            Some(&Value::String("Exact".into()))
-        );
-        // Scores should be descending
-        assert!(result.rows[0].score.unwrap() >= result.rows[1].score.unwrap());
-        assert!(result.rows[1].score.unwrap() >= result.rows[2].score.unwrap());
-    }
-
-    #[test]
-    fn execute_search_with_confidence_filter() {
-        let (exec, _dir) = setup_executor();
-        create_collection(&exec, "venues", 3);
-
-        insert_entity(
-            &exec,
-            "venues",
-            "v1",
-            vec![("name", Literal::String("Exact".into()))],
-            Some(vec![1.0, 0.0, 0.0]),
-        );
-        insert_entity(
-            &exec,
-            "venues",
-            "v2",
-            vec![("name", Literal::String("Close".into()))],
-            Some(vec![0.9, 0.1, 0.0]),
-        );
-        insert_entity(
-            &exec,
-            "venues",
-            "v3",
-            vec![("name", Literal::String("Far".into()))],
-            Some(vec![0.0, 0.0, 1.0]),
-        );
-
-        let result = exec
-            .execute(&Plan::Search(SearchPlan {
-                collection: "venues".into(),
-                query_vector: vec![1.0, 0.0, 0.0],
-                k: 10,
-                confidence_threshold: 0.8,
-            }))
-            .unwrap();
-
-        // "Far" vector [0,0,1] has ~0 similarity to [1,0,0], should be filtered
-        assert_eq!(result.rows.len(), 2);
-        for row in &result.rows {
-            assert!(row.score.unwrap() >= 0.8);
-        }
-    }
-
-    #[test]
     fn execute_explain() {
         let (exec, _dir) = setup_executor();
 
-        let search_plan = Plan::Search(SearchPlan {
+        let fetch_plan = Plan::Fetch(FetchPlan {
             collection: "venues".into(),
-            query_vector: vec![1.0, 0.0, 0.0],
-            k: 5,
-            confidence_threshold: 0.5,
+            fields: FieldList::All,
+            filter: None,
+            limit: None,
         });
 
         let result = exec
-            .execute(&Plan::Explain(Box::new(search_plan)))
+            .execute(&Plan::Explain(Box::new(fetch_plan)))
             .unwrap();
 
         // Should have property rows
@@ -654,7 +511,7 @@ mod tests {
 
         assert_eq!(
             mode_row.values.get("value"),
-            Some(&Value::String("Probabilistic".into()))
+            Some(&Value::String("Deterministic".into()))
         );
     }
 }
