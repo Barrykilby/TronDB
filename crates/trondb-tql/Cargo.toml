@@ -1,0 +1,9 @@
+[package]
+name = "trondb-tql"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+logos.workspace = true
+thiserror.workspace = true
+serde.workspace = true

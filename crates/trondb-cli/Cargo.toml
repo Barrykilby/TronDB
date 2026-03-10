@@ -1,0 +1,14 @@
+[package]
+name = "trondb-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "trondb"
+path = "src/main.rs"
+
+[dependencies]
+trondb-core = { path = "../trondb-core" }
+trondb-tql = { path = "../trondb-tql" }
+rustyline.workspace = true
+comfy-table.workspace = true
