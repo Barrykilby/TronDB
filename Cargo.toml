@@ -4,6 +4,7 @@ members = [
     "crates/trondb-core",
     "crates/trondb-tql",
     "crates/trondb-cli",
+    "crates/trondb-wal",
 ]
 
 [workspace.dependencies]
@@ -17,6 +18,10 @@ logos = "0.15"
 thiserror = "2"
 comfy-table = "7"
 rustyline = "15"
+fjall = "2"
+rmp-serde = "1"
+crc32fast = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "time", "io-util", "macros"] }
 
 [profile.release]
 lto = true
