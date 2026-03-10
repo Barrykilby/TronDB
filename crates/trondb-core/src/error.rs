@@ -1,4 +1,5 @@
 use thiserror::Error;
+use trondb_wal::WalError;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -17,6 +18,12 @@ pub enum EngineError {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
+    #[error("WAL error: {0}")]
+    Wal(#[from] WalError),
+
     #[error("storage error: {0}")]
     Storage(String),
+
+    #[error("unsupported operation: {0}")]
+    UnsupportedOperation(String),
 }
