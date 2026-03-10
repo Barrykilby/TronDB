@@ -175,40 +175,52 @@ mod tests {
 
     #[tokio::test]
     async fn recover_discards_uncommitted() {
+        use crate::segment::{segment_filename, WalSegment};
+
         let dir = TempDir::new().unwrap();
         let config = WalConfig {
             wal_dir: dir.path().join("wal"),
             ..Default::default()
         };
+        tokio::fs::create_dir_all(&config.wal_dir).await.unwrap();
 
-        // Write committed tx
-        {
-            let writer = WalWriter::open(config.clone()).await.unwrap();
-            let tx1 = writer.next_tx_id();
-            writer.append(RecordType::TxBegin, "venues", tx1, 1, vec![]);
-            writer.append(
-                RecordType::EntityWrite,
-                "venues",
-                tx1,
-                1,
-                b"committed".to_vec(),
-            );
-            writer.commit(tx1).await.unwrap();
+        // Write directly to segment to simulate crash with uncommitted tx on disk
+        let seg_path = config.wal_dir.join(segment_filename(1));
+        let mut seg = WalSegment::create(&seg_path, 1).await.unwrap();
 
-            // Write uncommitted tx (simulating crash before commit)
-            let tx2 = writer.next_tx_id();
-            writer.append(RecordType::TxBegin, "venues", tx2, 1, vec![]);
-            writer.append(
-                RecordType::EntityWrite,
-                "venues",
-                tx2,
-                1,
-                b"uncommitted".to_vec(),
-            );
-            // No commit — simulate crash by flushing buffer manually
-            // Actually, these are in the buffer and won't be on disk without commit
-            // So they naturally disappear. Let's test with direct segment write instead.
-        }
+        let make_record = |lsn: u64, tx_id: u64, record_type: RecordType, payload: Vec<u8>| {
+            WalRecord {
+                lsn,
+                ts: 0,
+                tx_id,
+                record_type,
+                schema_ver: 1,
+                collection: "venues".into(),
+                payload,
+            }
+        };
+
+        // Tx1: committed
+        seg.append(&make_record(1, 1, RecordType::TxBegin, vec![]))
+            .await
+            .unwrap();
+        seg.append(&make_record(2, 1, RecordType::EntityWrite, b"committed".to_vec()))
+            .await
+            .unwrap();
+        seg.append(&make_record(3, 1, RecordType::TxCommit, vec![]))
+            .await
+            .unwrap();
+
+        // Tx2: on disk but never committed (simulates crash mid-transaction)
+        seg.append(&make_record(4, 2, RecordType::TxBegin, vec![]))
+            .await
+            .unwrap();
+        seg.append(&make_record(5, 2, RecordType::EntityWrite, b"uncommitted".to_vec()))
+            .await
+            .unwrap();
+        // No TxCommit — crash happened here
+
+        seg.sync().await.unwrap();
 
         let committed = WalRecovery::recover(&config.wal_dir).await.unwrap();
         let entity_writes: Vec<_> = committed

@@ -11,7 +11,7 @@ use error::EngineError;
 use executor::Executor;
 use result::QueryResult;
 use store::FjallStore;
-use trondb_wal::{WalConfig, WalWriter};
+use trondb_wal::{WalConfig, WalRecovery, WalWriter};
 
 // ---------------------------------------------------------------------------
 // Engine — public API
@@ -30,8 +30,17 @@ pub struct Engine {
 impl Engine {
     pub async fn open(config: EngineConfig) -> Result<Self, EngineError> {
         let store = FjallStore::open(&config.data_dir)?;
+
+        // Replay committed WAL records into Fjall before accepting queries
+        let recovery = WalRecovery::recover(&config.wal.wal_dir).await?;
         let wal = WalWriter::open(config.wal).await?;
         let executor = Executor::new(store, wal);
+
+        let replayed = executor.replay_wal_records(&recovery.records)?;
+        if replayed > 0 {
+            eprintln!("WAL recovery: replayed {replayed} records");
+        }
+
         Ok(Self { executor })
     }
 
@@ -134,6 +143,79 @@ mod tests {
         assert_eq!(
             mode_row.values.get("value"),
             Some(&Value::String("Deterministic".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_replay_recovers_data() {
+        let dir = TempDir::new().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let data_dir = dir.path().join("data");
+
+        // Write data via WAL only (simulate crash before Fjall persist by
+        // writing WAL records directly, then opening a fresh Fjall store)
+        {
+            // Create WAL records for a collection + entity
+            tokio::fs::create_dir_all(&wal_dir).await.unwrap();
+            let wal_config = trondb_wal::WalConfig {
+                wal_dir: wal_dir.clone(),
+                ..Default::default()
+            };
+            let writer = trondb_wal::WalWriter::open(wal_config).await.unwrap();
+
+            // Tx1: create collection
+            let tx1 = writer.next_tx_id();
+            writer.append(trondb_wal::RecordType::TxBegin, "venues", tx1, 1, vec![]);
+            let coll_payload = rmp_serde::to_vec_named(&serde_json::json!({
+                "name": "venues",
+                "dimensions": 3
+            }))
+            .unwrap();
+            writer.append(
+                trondb_wal::RecordType::SchemaCreateColl,
+                "venues",
+                tx1,
+                1,
+                coll_payload,
+            );
+            writer.commit(tx1).await.unwrap();
+
+            // Tx2: insert entity
+            let tx2 = writer.next_tx_id();
+            writer.append(trondb_wal::RecordType::TxBegin, "venues", tx2, 1, vec![]);
+            let entity = crate::types::Entity::new(crate::types::LogicalId::from_string("v1"))
+                .with_metadata("name", Value::String("Recovered Venue".into()));
+            let entity_payload = rmp_serde::to_vec_named(&entity).unwrap();
+            writer.append(
+                trondb_wal::RecordType::EntityWrite,
+                "venues",
+                tx2,
+                1,
+                entity_payload,
+            );
+            writer.commit(tx2).await.unwrap();
+        }
+
+        // Now open engine — Fjall store is empty, WAL has committed records.
+        // Engine::open should replay WAL into Fjall.
+        let config = EngineConfig {
+            data_dir,
+            wal: trondb_wal::WalConfig {
+                wal_dir,
+                ..Default::default()
+            },
+        };
+        let engine = Engine::open(config).await.unwrap();
+
+        // Verify the replayed data is queryable
+        let result = engine
+            .execute_tql("FETCH * FROM venues WHERE id = 'v1';")
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Recovered Venue".into()))
         );
     }
 

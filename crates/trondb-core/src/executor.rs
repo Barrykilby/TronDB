@@ -7,7 +7,7 @@ use crate::result::{QueryMode, QueryResult, QueryStats, Row};
 use crate::store::FjallStore;
 use crate::types::{Entity, LogicalId, ReprState, ReprType, Representation, Value};
 use trondb_tql::{FieldList, Literal, WhereClause};
-use trondb_wal::{RecordType, WalWriter};
+use trondb_wal::{RecordType, WalRecord, WalWriter};
 
 // ---------------------------------------------------------------------------
 // Executor
@@ -21,6 +21,54 @@ pub struct Executor {
 impl Executor {
     pub fn new(store: FjallStore, wal: WalWriter) -> Self {
         Self { store, wal }
+    }
+
+    /// Replay committed WAL records into the Fjall store.
+    /// Called during engine startup to close the durability gap.
+    pub fn replay_wal_records(&self, records: &[WalRecord]) -> Result<usize, EngineError> {
+        let mut replayed = 0;
+
+        for record in records {
+            match record.record_type {
+                RecordType::SchemaCreateColl => {
+                    #[derive(serde::Deserialize)]
+                    struct CreateCollPayload {
+                        name: String,
+                        dimensions: usize,
+                    }
+                    let payload: CreateCollPayload = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+                    // Idempotent: skip if collection already exists
+                    if !self.store.has_collection(&payload.name) {
+                        self.store.create_collection(&payload.name, payload.dimensions)?;
+                        replayed += 1;
+                    }
+                }
+                RecordType::EntityWrite => {
+                    let entity: Entity = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+                    // Idempotent: overwrite with WAL version (WAL is authoritative)
+                    if self.store.has_collection(&record.collection) {
+                        self.store.insert(&record.collection, entity)?;
+                        replayed += 1;
+                    }
+                }
+                RecordType::EntityDelete => {
+                    // Phase 2 doesn't support DELETE yet, but handle for completeness
+                }
+                _ => {
+                    // Other record types (ReprWrite, EdgeWrite, etc.) are future phases
+                }
+            }
+        }
+
+        if replayed > 0 {
+            self.store.persist()?;
+        }
+
+        Ok(replayed)
     }
 
     pub async fn execute(&self, plan: &Plan) -> Result<QueryResult, EngineError> {
@@ -110,8 +158,9 @@ impl Executor {
                 self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, entity_payload);
                 self.wal.commit(tx_id).await?;
 
-                // Apply to Fjall
+                // Apply to Fjall and persist
                 self.store.insert(&p.collection, entity)?;
+                self.store.persist()?;
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
