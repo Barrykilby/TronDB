@@ -1,0 +1,15 @@
+-- TronDB PoC smoke test
+CREATE COLLECTION venues WITH DIMENSIONS 3;
+
+INSERT INTO venues (id, name, city) VALUES ('v1', 'The Jazz Cafe', 'London') VECTOR [1.0, 0.0, 0.0];
+INSERT INTO venues (id, name, city) VALUES ('v2', 'Blues Kitchen', 'London') VECTOR [0.9, 0.1, 0.0];
+INSERT INTO venues (id, name, city) VALUES ('v3', 'Rock City', 'Nottingham') VECTOR [0.0, 1.0, 0.0];
+INSERT INTO venues (id, name, city) VALUES ('v4', 'The Cavern Club', 'Liverpool') VECTOR [0.1, 0.9, 0.1];
+
+FETCH * FROM venues WHERE city = 'London';
+
+SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] CONFIDENCE > 0.5 LIMIT 3;
+
+EXPLAIN SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] CONFIDENCE > 0.7;
+
+FETCH name, city FROM venues LIMIT 2;
