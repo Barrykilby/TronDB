@@ -10,4 +10,4 @@ pub use config::WalConfig;
 pub use error::WalError;
 pub use record::{RecordType, WalRecord};
 pub use writer::WalWriter;
-pub use recovery::WalRecovery;
+pub use recovery::{RecoveryResult, WalRecovery};
