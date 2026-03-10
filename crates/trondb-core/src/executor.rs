@@ -7,6 +7,7 @@ use crate::result::{QueryMode, QueryResult, QueryStats, Row};
 use crate::store::FjallStore;
 use crate::types::{Entity, LogicalId, ReprState, ReprType, Representation, Value};
 use trondb_tql::{FieldList, Literal, WhereClause};
+use trondb_wal::{RecordType, WalWriter};
 
 // ---------------------------------------------------------------------------
 // Executor
@@ -14,18 +15,33 @@ use trondb_tql::{FieldList, Literal, WhereClause};
 
 pub struct Executor {
     store: FjallStore,
+    wal: WalWriter,
 }
 
 impl Executor {
-    pub fn new(store: FjallStore) -> Self {
-        Self { store }
+    pub fn new(store: FjallStore, wal: WalWriter) -> Self {
+        Self { store, wal }
     }
 
-    pub fn execute(&self, plan: &Plan) -> Result<QueryResult, EngineError> {
+    pub async fn execute(&self, plan: &Plan) -> Result<QueryResult, EngineError> {
         let start = Instant::now();
 
         match plan {
             Plan::CreateCollection(p) => {
+                // WAL: TX_BEGIN → SCHEMA_CREATE_COLL → commit
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.name, tx_id, 1, vec![]);
+
+                let payload = rmp_serde::to_vec_named(&serde_json::json!({
+                    "name": p.name,
+                    "dimensions": p.dimensions,
+                }))
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+                self.wal.append(RecordType::SchemaCreateColl, &p.name, tx_id, 1, payload);
+                self.wal.commit(tx_id).await?;
+
+                // Apply to Fjall
                 self.store.create_collection(&p.name, p.dimensions)?;
 
                 Ok(QueryResult {
@@ -44,7 +60,7 @@ impl Executor {
                         elapsed: start.elapsed(),
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
-                        tier: "RAM",
+                        tier: "Fjall",
                     },
                 })
             }
@@ -85,6 +101,16 @@ impl Executor {
                     entity.representations.push(repr);
                 }
 
+                // WAL: TX_BEGIN → ENTITY_WRITE → commit
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+
+                let entity_payload = rmp_serde::to_vec_named(&entity)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, entity_payload);
+                self.wal.commit(tx_id).await?;
+
+                // Apply to Fjall
                 self.store.insert(&p.collection, entity)?;
 
                 Ok(QueryResult {
@@ -100,12 +126,13 @@ impl Executor {
                         elapsed: start.elapsed(),
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
-                        tier: "RAM",
+                        tier: "Fjall",
                     },
                 })
             }
 
             Plan::Fetch(p) => {
+                // Read directly from Fjall — no WAL involvement
                 let entities = self.store.scan(&p.collection)?;
                 let scanned = entities.len();
 
@@ -135,7 +162,7 @@ impl Executor {
                         elapsed: start.elapsed(),
                         entities_scanned: scanned,
                         mode: QueryMode::Deterministic,
-                        tier: "RAM",
+                        tier: "Fjall",
                     },
                 })
             }
@@ -153,7 +180,7 @@ impl Executor {
                         elapsed: start.elapsed(),
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
-                        tier: "RAM",
+                        tier: "Fjall",
                     },
                 })
             }
@@ -315,7 +342,7 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("mode", "Deterministic".into()));
             props.push(("verb", "FETCH".into()));
             props.push(("collection", p.collection.clone()));
-            props.push(("tier", "RAM".into()));
+            props.push(("tier", "Fjall".into()));
             props.push(("strategy", "FullScan".into()));
             if let Some(limit) = p.limit {
                 props.push(("limit", limit.to_string()));
@@ -325,7 +352,7 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("mode", "Probabilistic".into()));
             props.push(("verb", "SEARCH".into()));
             props.push(("collection", p.collection.clone()));
-            props.push(("tier", "RAM".into()));
+            props.push(("tier", "Fjall".into()));
             props.push(("encoding", "Float32".into()));
             props.push(("strategy", "BruteForce".into()));
             props.push(("k", p.k.to_string()));
@@ -335,7 +362,7 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("mode", "Deterministic".into()));
             props.push(("verb", "INSERT".into()));
             props.push(("collection", p.collection.clone()));
-            props.push(("tier", "RAM".into()));
+            props.push(("tier", "Fjall".into()));
         }
         Plan::CreateCollection(p) => {
             props.push(("mode", "Deterministic".into()));
@@ -370,22 +397,29 @@ mod tests {
     use super::*;
     use crate::planner::{CreateCollectionPlan, FetchPlan, InsertPlan};
     use trondb_tql::Literal;
+    use trondb_wal::WalConfig;
 
-    fn setup_executor() -> (Executor, tempfile::TempDir) {
+    async fn setup_executor() -> (Executor, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = FjallStore::open(dir.path()).unwrap();
-        (Executor::new(store), dir)
+        let store = FjallStore::open(&dir.path().join("store")).unwrap();
+        let wal_config = WalConfig {
+            wal_dir: dir.path().join("wal"),
+            ..Default::default()
+        };
+        let wal = WalWriter::open(wal_config).await.unwrap();
+        (Executor::new(store, wal), dir)
     }
 
-    fn create_collection(exec: &Executor, name: &str, dims: usize) {
+    async fn create_collection(exec: &Executor, name: &str, dims: usize) {
         exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
             name: name.into(),
             dimensions: dims,
         }))
+        .await
         .unwrap();
     }
 
-    fn insert_entity(
+    async fn insert_entity(
         exec: &Executor,
         collection: &str,
         id: &str,
@@ -404,13 +438,14 @@ mod tests {
             values,
             vector,
         }))
+        .await
         .unwrap();
     }
 
-    #[test]
-    fn execute_fetch_all() {
-        let (exec, _dir) = setup_executor();
-        create_collection(&exec, "venues", 3);
+    #[tokio::test]
+    async fn execute_fetch_all() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
 
         insert_entity(
             &exec,
@@ -418,14 +453,16 @@ mod tests {
             "v1",
             vec![("name", Literal::String("Venue A".into()))],
             None,
-        );
+        )
+        .await;
         insert_entity(
             &exec,
             "venues",
             "v2",
             vec![("name", Literal::String("Venue B".into()))],
             None,
-        );
+        )
+        .await;
 
         let result = exec
             .execute(&Plan::Fetch(FetchPlan {
@@ -434,15 +471,16 @@ mod tests {
                 filter: None,
                 limit: None,
             }))
+            .await
             .unwrap();
 
         assert_eq!(result.rows.len(), 2);
     }
 
-    #[test]
-    fn execute_fetch_with_filter() {
-        let (exec, _dir) = setup_executor();
-        create_collection(&exec, "venues", 3);
+    #[tokio::test]
+    async fn execute_fetch_with_filter() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
 
         insert_entity(
             &exec,
@@ -453,7 +491,8 @@ mod tests {
                 ("city", Literal::String("London".into())),
             ],
             None,
-        );
+        )
+        .await;
         insert_entity(
             &exec,
             "venues",
@@ -463,7 +502,8 @@ mod tests {
                 ("city", Literal::String("Manchester".into())),
             ],
             None,
-        );
+        )
+        .await;
 
         let result = exec
             .execute(&Plan::Fetch(FetchPlan {
@@ -475,6 +515,7 @@ mod tests {
                 )),
                 limit: None,
             }))
+            .await
             .unwrap();
 
         assert_eq!(result.rows.len(), 1);
@@ -484,9 +525,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn execute_explain() {
-        let (exec, _dir) = setup_executor();
+    #[tokio::test]
+    async fn execute_explain() {
+        let (exec, _dir) = setup_executor().await;
 
         let fetch_plan = Plan::Fetch(FetchPlan {
             collection: "venues".into(),
@@ -497,6 +538,7 @@ mod tests {
 
         let result = exec
             .execute(&Plan::Explain(Box::new(fetch_plan)))
+            .await
             .unwrap();
 
         // Should have property rows
