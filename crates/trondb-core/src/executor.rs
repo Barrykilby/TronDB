@@ -7,7 +7,7 @@ use crate::error::EngineError;
 use crate::index::VectorIndex;
 use crate::planner::{Plan, SearchPlan};
 use crate::result::{QueryMode, QueryResult, QueryStats, Row};
-use crate::store::Store;
+use crate::store::FjallStore;
 use crate::types::{Entity, LogicalId, ReprState, ReprType, Representation, Value};
 use trondb_tql::{FieldList, Literal, WhereClause};
 
@@ -16,12 +16,12 @@ use trondb_tql::{FieldList, Literal, WhereClause};
 // ---------------------------------------------------------------------------
 
 pub struct Executor {
-    store: Store,
+    store: FjallStore,
     indexes: DashMap<String, VectorIndex>,
 }
 
 impl Executor {
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: FjallStore) -> Self {
         Self {
             store,
             indexes: DashMap::new(),
@@ -424,8 +424,10 @@ mod tests {
     use crate::planner::{CreateCollectionPlan, FetchPlan, InsertPlan};
     use trondb_tql::Literal;
 
-    fn setup_executor() -> Executor {
-        Executor::new(Store::new())
+    fn setup_executor() -> (Executor, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        (Executor::new(store), dir)
     }
 
     fn create_collection(exec: &Executor, name: &str, dims: usize) {
@@ -460,7 +462,7 @@ mod tests {
 
     #[test]
     fn execute_fetch_all() {
-        let exec = setup_executor();
+        let (exec, _dir) = setup_executor();
         create_collection(&exec, "venues", 3);
 
         insert_entity(
@@ -492,7 +494,7 @@ mod tests {
 
     #[test]
     fn execute_fetch_with_filter() {
-        let exec = setup_executor();
+        let (exec, _dir) = setup_executor();
         create_collection(&exec, "venues", 3);
 
         insert_entity(
@@ -537,7 +539,7 @@ mod tests {
 
     #[test]
     fn execute_search() {
-        let exec = setup_executor();
+        let (exec, _dir) = setup_executor();
         create_collection(&exec, "venues", 3);
 
         insert_entity(
@@ -584,7 +586,7 @@ mod tests {
 
     #[test]
     fn execute_search_with_confidence_filter() {
-        let exec = setup_executor();
+        let (exec, _dir) = setup_executor();
         create_collection(&exec, "venues", 3);
 
         insert_entity(
@@ -627,7 +629,7 @@ mod tests {
 
     #[test]
     fn execute_explain() {
-        let exec = setup_executor();
+        let (exec, _dir) = setup_executor();
 
         let search_plan = Plan::Search(SearchPlan {
             collection: "venues".into(),

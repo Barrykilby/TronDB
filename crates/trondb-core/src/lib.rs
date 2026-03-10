@@ -9,7 +9,7 @@ pub mod types;
 use error::EngineError;
 use executor::Executor;
 use result::QueryResult;
-use store::Store;
+use store::FjallStore;
 
 // ---------------------------------------------------------------------------
 // Engine — public API
@@ -20,10 +20,27 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Create an engine backed by a fresh temporary directory.
+    /// Used for testing and ephemeral use cases.
     pub fn new() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let data_dir = std::env::temp_dir().join(format!("trondb_engine_{ts}"));
+        std::fs::create_dir_all(&data_dir).expect("failed to create temp data dir");
+        let store = FjallStore::open(&data_dir).expect("failed to open FjallStore");
         Self {
-            executor: Executor::new(Store::new()),
+            executor: Executor::new(store),
         }
+    }
+
+    pub fn open(data_dir: &std::path::Path) -> Result<Self, error::EngineError> {
+        let store = FjallStore::open(data_dir)?;
+        Ok(Self {
+            executor: Executor::new(store),
+        })
     }
 
     pub fn execute_tql(&self, input: &str) -> Result<QueryResult, EngineError> {

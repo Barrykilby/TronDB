@@ -16,4 +16,7 @@ pub enum EngineError {
 
     #[error("invalid query: {0}")]
     InvalidQuery(String),
+
+    #[error("storage error: {0}")]
+    Storage(String),
 }
