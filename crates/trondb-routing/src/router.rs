@@ -15,6 +15,7 @@ use crate::affinity::AffinityIndex;
 use crate::config::RouterConfig;
 use crate::error::RouterError;
 use crate::health::{compute_load_score, HealthCache, HealthSignal, NodeStatus};
+use crate::migrator::TierMigrator;
 use crate::node::{AffinityGroupId, EntityId, NodeHandle, NodeId, QueryVerb, RoutingStrategy};
 
 // ---------------------------------------------------------------------------
@@ -166,6 +167,7 @@ pub struct SemanticRouter {
     shutdown_tx: watch::Sender<bool>,
     _poll_handle: JoinHandle<()>,
     last_decision: Arc<std::sync::Mutex<Option<RoutingDecision>>>,
+    migrator: Option<Arc<TierMigrator>>,
 }
 
 impl SemanticRouter {
@@ -210,7 +212,12 @@ impl SemanticRouter {
             shutdown_tx,
             _poll_handle: poll_handle,
             last_decision: Arc::new(std::sync::Mutex::new(None)),
+            migrator: None,
         }
+    }
+
+    pub fn set_migrator(&mut self, migrator: Arc<TierMigrator>) {
+        self.migrator = Some(migrator);
     }
 
     pub fn health_cache(&self) -> &Arc<HealthCache> {
@@ -273,6 +280,80 @@ impl SemanticRouter {
                     self.affinity.remove_from_group(&entity_id);
                 }
                 return Ok(ok_result("Affinity dropped"));
+            }
+            Plan::Demote(ref d) => {
+                let entity_id = EntityId::from_string(&d.entity_id);
+                let target_tier = match d.target_tier {
+                    trondb_tql::ast::TierTarget::Warm => trondb_core::location::Tier::NVMe,
+                    trondb_tql::ast::TierTarget::Archive => trondb_core::location::Tier::Archive,
+                };
+                let from_tier = match target_tier {
+                    trondb_core::location::Tier::NVMe => trondb_core::location::Tier::Fjall,
+                    trondb_core::location::Tier::Archive => trondb_core::location::Tier::NVMe,
+                    _ => trondb_core::location::Tier::Fjall,
+                };
+
+                if let Some(migrator) = &self.migrator {
+                    migrator
+                        .demote_single(&d.collection, &entity_id, from_tier, target_tier)
+                        .await?;
+                }
+
+                let start = std::time::Instant::now();
+                return Ok(trondb_core::result::QueryResult {
+                    columns: vec!["status".to_string()],
+                    rows: vec![trondb_core::result::Row {
+                        values: HashMap::from([
+                            ("status".into(), trondb_core::types::Value::String("OK".into())),
+                        ]),
+                        score: None,
+                    }],
+                    stats: trondb_core::result::QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: trondb_core::result::QueryMode::Deterministic,
+                        tier: "Routing".into(),
+                    },
+                });
+            }
+            Plan::Promote(ref p) => {
+                let entity_id = EntityId::from_string(&p.entity_id);
+
+                if let Some(migrator) = &self.migrator {
+                    let warm_data = migrator.engine.read_tiered(
+                        &p.collection,
+                        &entity_id,
+                        trondb_core::location::Tier::NVMe,
+                    ).map_err(RouterError::Engine)?;
+
+                    if let Some(data) = warm_data {
+                        let int8 = trondb_core::quantise::QuantisedInt8::from_bytes(&data)
+                            .map_err(RouterError::Engine)?;
+                        let vector = trondb_core::quantise::dequantise_int8(&int8);
+                        migrator.promote_to_hot(&p.collection, &entity_id, vector).await?;
+                    } else {
+                        return Err(RouterError::Engine(trondb_core::error::EngineError::EntityNotFound(
+                            p.entity_id.clone(),
+                        )));
+                    }
+                }
+
+                let start = std::time::Instant::now();
+                return Ok(trondb_core::result::QueryResult {
+                    columns: vec!["status".to_string()],
+                    rows: vec![trondb_core::result::Row {
+                        values: HashMap::from([
+                            ("status".into(), trondb_core::types::Value::String("OK".into())),
+                        ]),
+                        score: None,
+                    }],
+                    stats: trondb_core::result::QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: trondb_core::result::QueryMode::Deterministic,
+                        tier: "Routing".into(),
+                    },
+                });
             }
             _ => {}
         }
