@@ -26,4 +26,13 @@ pub enum EngineError {
 
     #[error("unsupported operation: {0}")]
     UnsupportedOperation(String),
+
+    #[error("invalid state transition: {from:?} → {to:?}")]
+    InvalidStateTransition {
+        from: crate::location::LocState,
+        to: crate::location::LocState,
+    },
+
+    #[error("location not found: {0}")]
+    LocationNotFound(String),
 }
