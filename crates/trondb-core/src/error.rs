@@ -35,4 +35,10 @@ pub enum EngineError {
 
     #[error("location not found: {0}")]
     LocationNotFound(String),
+
+    #[error("edge type not found: {0}")]
+    EdgeTypeNotFound(String),
+
+    #[error("edge type already exists: {0}")]
+    EdgeTypeAlreadyExists(String),
 }

@@ -8,6 +8,8 @@ use crate::types::{Collection, Entity, LogicalId};
 const META_PARTITION: &str = "_meta";
 const COLLECTION_PREFIX: &str = "collection:";
 const ENTITY_PREFIX: &str = "entity:";
+const EDGE_TYPE_PREFIX: &str = "edge_type:";
+const EDGE_PREFIX: &str = "edge:";
 
 pub struct FjallStore {
     keyspace: Keyspace,
@@ -145,6 +147,103 @@ impl FjallStore {
             .collect();
 
         Ok(entities)
+    }
+
+    // --- Edge Type methods ---
+
+    pub fn create_edge_type(&self, edge_type: &crate::edge::EdgeType) -> Result<(), EngineError> {
+        let key = format!("{EDGE_TYPE_PREFIX}{}", edge_type.name);
+        if self.meta.get(&key)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?
+            .is_some()
+        {
+            return Err(EngineError::EdgeTypeAlreadyExists(edge_type.name.clone()));
+        }
+
+        let bytes = rmp_serde::to_vec_named(edge_type)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+        self.meta.insert(&key, bytes)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?;
+
+        // Create partition for this edge type's edges
+        let partition_name = format!("edges:{}", edge_type.name);
+        self.keyspace
+            .open_partition(&partition_name, PartitionCreateOptions::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        self.keyspace.persist(PersistMode::SyncAll)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub fn get_edge_type(&self, name: &str) -> Result<crate::edge::EdgeType, EngineError> {
+        let key = format!("{EDGE_TYPE_PREFIX}{name}");
+        let bytes = self.meta.get(&key)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?
+            .ok_or_else(|| EngineError::EdgeTypeNotFound(name.to_owned()))?;
+        rmp_serde::from_slice(&bytes).map_err(|e| EngineError::Storage(e.to_string()))
+    }
+
+    pub fn has_edge_type(&self, name: &str) -> bool {
+        let key = format!("{EDGE_TYPE_PREFIX}{name}");
+        self.meta.get(&key).ok().flatten().is_some()
+    }
+
+    pub fn list_edge_types(&self) -> Vec<crate::edge::EdgeType> {
+        self.meta
+            .prefix(EDGE_TYPE_PREFIX)
+            .filter_map(|kv| {
+                let (_k, v) = kv.ok()?;
+                rmp_serde::from_slice(&v).ok()
+            })
+            .collect()
+    }
+
+    // --- Edge methods ---
+
+    pub fn insert_edge(&self, edge: &crate::edge::Edge) -> Result<(), EngineError> {
+        let partition_name = format!("edges:{}", edge.edge_type);
+        let partition = self.keyspace
+            .open_partition(&partition_name, PartitionCreateOptions::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let key = format!("{EDGE_PREFIX}{}:{}", edge.from_id, edge.to_id);
+        let bytes = rmp_serde::to_vec_named(edge)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        partition.insert(&key, bytes)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn delete_edge(&self, edge_type: &str, from_id: &str, to_id: &str) -> Result<(), EngineError> {
+        let partition_name = format!("edges:{edge_type}");
+        let partition = self.keyspace
+            .open_partition(&partition_name, PartitionCreateOptions::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let key = format!("{EDGE_PREFIX}{from_id}:{to_id}");
+        partition.remove(&key)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn scan_edges(&self, edge_type: &str) -> Result<Vec<crate::edge::Edge>, EngineError> {
+        let partition_name = format!("edges:{edge_type}");
+        let partition = self.keyspace
+            .open_partition(&partition_name, PartitionCreateOptions::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let edges: Vec<crate::edge::Edge> = partition
+            .prefix(EDGE_PREFIX)
+            .filter_map(|kv| {
+                let (_k, v) = kv.ok()?;
+                rmp_serde::from_slice(&v).ok()
+            })
+            .collect();
+
+        Ok(edges)
     }
 
     pub fn persist(&self) -> Result<(), EngineError> {
