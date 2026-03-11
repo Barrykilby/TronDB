@@ -220,6 +220,8 @@ fn first_field_in_clause(clause: &WhereClause) -> String {
         WhereClause::Eq(field, _) => field.clone(),
         WhereClause::Gt(field, _) => field.clone(),
         WhereClause::Lt(field, _) => field.clone(),
+        WhereClause::Gte(field, _) => field.clone(),
+        WhereClause::Lte(field, _) => field.clone(),
         WhereClause::And(left, _) => first_field_in_clause(left),
         WhereClause::Or(left, _) => first_field_in_clause(left),
     }

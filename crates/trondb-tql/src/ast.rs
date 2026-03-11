@@ -119,6 +119,8 @@ pub enum WhereClause {
     Eq(String, Literal),
     Gt(String, Literal),
     Lt(String, Literal),
+    Gte(String, Literal),
+    Lte(String, Literal),
     And(Box<WhereClause>, Box<WhereClause>),
     Or(Box<WhereClause>, Box<WhereClause>),
 }

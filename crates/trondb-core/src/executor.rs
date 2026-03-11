@@ -1141,6 +1141,22 @@ fn entity_matches(entity: &Entity, clause: &WhereClause) -> bool {
                 .map(|v| value_lt(v, &threshold))
                 .unwrap_or(false)
         }
+        WhereClause::Gte(field, lit) => {
+            let threshold = literal_to_value(lit);
+            entity
+                .metadata
+                .get(field)
+                .map(|v| value_gt(v, &threshold) || v == &threshold)
+                .unwrap_or(false)
+        }
+        WhereClause::Lte(field, lit) => {
+            let threshold = literal_to_value(lit);
+            entity
+                .metadata
+                .get(field)
+                .map(|v| value_lt(v, &threshold) || v == &threshold)
+                .unwrap_or(false)
+        }
         WhereClause::And(a, b) => entity_matches(entity, a) && entity_matches(entity, b),
         WhereClause::Or(a, b) => entity_matches(entity, a) || entity_matches(entity, b),
     }

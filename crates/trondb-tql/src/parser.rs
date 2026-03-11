@@ -736,9 +736,11 @@ impl Parser {
             Some((Token::Eq, _)) => Ok(WhereClause::Eq(field, self.parse_literal()?)),
             Some((Token::Gt, _)) => Ok(WhereClause::Gt(field, self.parse_literal()?)),
             Some((Token::Lt, _)) => Ok(WhereClause::Lt(field, self.parse_literal()?)),
+            Some((Token::Gte, _)) => Ok(WhereClause::Gte(field, self.parse_literal()?)),
+            Some((Token::Lte, _)) => Ok(WhereClause::Lte(field, self.parse_literal()?)),
             Some((tok, pos)) => Err(ParseError::UnexpectedToken {
                 pos,
-                expected: "comparison operator (=, >, <)".to_string(),
+                expected: "comparison operator (=, >, <, >=, <=)".to_string(),
                 got: format!("{tok:?}"),
             }),
             None => Err(ParseError::UnexpectedEof(
@@ -1210,6 +1212,43 @@ mod tests {
                 assert_eq!(e.collection, "venues");
             }
             _ => panic!("expected ExplainTiers"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_gte_filter() {
+        let stmt = parse("FETCH * FROM venues WHERE score >= 80;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.filter, Some(WhereClause::Gte("score".into(), Literal::Int(80))));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_lte_filter() {
+        let stmt = parse("FETCH * FROM venues WHERE score <= 20;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.filter, Some(WhereClause::Lte("score".into(), Literal::Int(20))));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_range_and() {
+        let stmt = parse("FETCH * FROM venues WHERE score >= 10 AND score <= 90;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => match f.filter {
+                Some(WhereClause::And(left, right)) => {
+                    assert!(matches!(*left, WhereClause::Gte(..)));
+                    assert!(matches!(*right, WhereClause::Lte(..)));
+                }
+                _ => panic!("expected And(Gte, Lte)"),
+            },
+            _ => panic!("expected Fetch"),
         }
     }
 }
