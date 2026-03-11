@@ -11,19 +11,77 @@ pub enum Statement {
     Traverse(TraverseStmt),
 }
 
+// --- CREATE COLLECTION (expanded) ---
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateCollectionStmt {
     pub name: String,
-    pub dimensions: usize,
+    pub representations: Vec<RepresentationDecl>,
+    pub fields: Vec<FieldDecl>,
+    pub indexes: Vec<IndexDecl>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepresentationDecl {
+    pub name: String,
+    pub model: Option<String>,
+    pub dimensions: Option<usize>,
+    pub metric: Metric,
+    pub sparse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Metric {
+    Cosine,
+    InnerProduct,
+}
+
+impl Default for Metric {
+    fn default() -> Self {
+        Metric::Cosine
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldDecl {
+    pub name: String,
+    pub field_type: FieldType,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldType {
+    Text,
+    DateTime,
+    Bool,
+    Int,
+    Float,
+    EntityRef(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexDecl {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub partial_condition: Option<WhereClause>,
+}
+
+// --- INSERT (expanded with named representations) ---
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStmt {
     pub collection: String,
     pub fields: Vec<String>,
     pub values: Vec<Literal>,
-    pub vector: Option<Vec<f64>>,
+    pub vectors: Vec<(String, VectorLiteral)>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VectorLiteral {
+    Dense(Vec<f64>),
+    Sparse(Vec<(u32, f32)>),
+}
+
+// --- FETCH (unchanged) ---
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchStmt {
@@ -33,14 +91,20 @@ pub struct FetchStmt {
     pub limit: Option<usize>,
 }
 
+// --- SEARCH (expanded) ---
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchStmt {
     pub collection: String,
     pub fields: FieldList,
-    pub near: Vec<f64>,
+    pub dense_vector: Option<Vec<f64>>,
+    pub sparse_vector: Option<Vec<(u32, f32)>>,
+    pub filter: Option<WhereClause>,
     pub confidence: Option<f64>,
     pub limit: Option<usize>,
 }
+
+// --- Common types ---
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldList {
@@ -65,6 +129,8 @@ pub enum Literal {
     Bool(bool),
     Null,
 }
+
+// --- Edge types (unchanged from Phase 5) ---
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateEdgeTypeStmt {
