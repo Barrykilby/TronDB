@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use anndists::dist::DistCosine;
+use hnsw_rs::hnswio::HnswIo;
 use hnsw_rs::prelude::AnnT;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -104,6 +106,100 @@ pub fn save_snapshot(
     Ok(())
 }
 
+/// Load an HNSW index snapshot from disk.
+/// Returns None if snapshot files don't exist.
+/// Returns Err on corruption or parameter mismatch.
+pub fn load_snapshot(
+    dir: &Path,
+    collection: &str,
+    repr_name: &str,
+) -> Result<Option<(HnswIndex, HnswSnapshotMeta)>, String> {
+    let basename = format!("{collection}_{repr_name}");
+
+    let meta_path = dir.join(format!("{basename}.hnsw.meta"));
+    let idmap_path = dir.join(format!("{basename}.hnsw.idmap"));
+    let graph_path = dir.join(format!("{basename}.hnsw.graph"));
+    let data_path = dir.join(format!("{basename}.hnsw.data"));
+
+    // Check if all files exist
+    if !meta_path.exists() || !idmap_path.exists() || !graph_path.exists() || !data_path.exists() {
+        return Ok(None);
+    }
+
+    // Load meta
+    let meta_json =
+        std::fs::read_to_string(&meta_path).map_err(|e| format!("meta read failed: {e}"))?;
+    let meta: HnswSnapshotMeta =
+        serde_json::from_str(&meta_json).map_err(|e| format!("meta parse failed: {e}"))?;
+
+    // Version check
+    if meta.version != 1 {
+        return Err(format!("unsupported snapshot version: {}", meta.version));
+    }
+
+    // Parameter compatibility check
+    if meta.max_nb_connection != index::MAX_NB_CONNECTION
+        || meta.max_elements != index::MAX_ELEMENTS
+        || meta.ef_construction != index::EF_CONSTRUCTION
+    {
+        return Err(format!(
+            "HNSW parameter mismatch: snapshot({},{},{}) != current({},{},{})",
+            meta.max_nb_connection,
+            meta.max_elements,
+            meta.ef_construction,
+            index::MAX_NB_CONNECTION,
+            index::MAX_ELEMENTS,
+            index::EF_CONSTRUCTION,
+        ));
+    }
+
+    // Verify checksum before loading graph
+    let graph_bytes =
+        std::fs::read(&graph_path).map_err(|e| format!("checksum read graph: {e}"))?;
+    let data_bytes =
+        std::fs::read(&data_path).map_err(|e| format!("checksum read data: {e}"))?;
+    let idmap_bytes = std::fs::read(&idmap_path).map_err(|e| format!("idmap read failed: {e}"))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&graph_bytes);
+    hasher.update(&data_bytes);
+    hasher.update(&idmap_bytes);
+    let computed = format!("sha256:{:x}", hasher.finalize());
+    if computed != meta.checksum {
+        return Err(format!(
+            "checksum mismatch: computed {computed} != stored {}",
+            meta.checksum
+        ));
+    }
+
+    // Load hnsw_rs graph
+    // IMPORTANT: HnswIo::load_hnsw() returns Hnsw<'b> where 'a: 'b — the HnswIo
+    // must outlive the Hnsw. Since HnswIndex stores Hnsw<'static>, we Box::leak
+    // the HnswIo to get a 'static reference. This is safe because HnswIo stores
+    // owned data (PathBuf, String, DataMap) — verified in hnsw_rs 0.3.4 hnswio.rs:302.
+    // Leaks a small struct per snapshot load, acceptable for a one-time cost.
+    let hnsw_io = Box::leak(Box::new(HnswIo::new(dir, &basename)));
+    let hnsw: hnsw_rs::hnsw::Hnsw<'static, f32, DistCosine> = hnsw_io
+        .load_hnsw()
+        .map_err(|e| format!("hnsw load failed: {e}"))?;
+
+    // Deserialise idmap (already read above for checksum)
+    let idmap: HnswIdMap =
+        bincode::deserialize(&idmap_bytes).map_err(|e| format!("idmap deserialise failed: {e}"))?;
+
+    // Reconstruct HnswIndex
+    let index = HnswIndex::from_snapshot(
+        hnsw,
+        meta.dimensions,
+        idmap.id_to_idx,
+        idmap.idx_to_id,
+        idmap.next_idx,
+        idmap.tombstones,
+    );
+
+    Ok(Some((index, meta)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +264,42 @@ mod tests {
         assert!(idmap.tombstones.is_empty());
         assert!(idmap.id_to_idx.contains_key("e1"));
         assert!(idmap.id_to_idx.contains_key("e2"));
+    }
+
+    #[test]
+    fn snapshot_save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = HnswIndex::new(3);
+        index.insert(&make_id("e1"), &[1.0, 0.0, 0.0]);
+        index.insert(&make_id("e2"), &[0.0, 1.0, 0.0]);
+        index.insert(&make_id("e3"), &[0.5, 0.5, 0.0]);
+        index.remove(&make_id("e2")); // tombstone
+
+        save_snapshot(dir.path(), "venues", "default", &index, 42).unwrap();
+
+        let loaded = load_snapshot(dir.path(), "venues", "default").unwrap();
+        assert!(loaded.is_some(), "load should succeed");
+        let (restored_index, meta) = loaded.unwrap();
+
+        // Verify meta
+        assert_eq!(meta.lsn, 42);
+        assert_eq!(meta.version, 1);
+
+        // Verify search works — e1 should be findable, e2 should be tombstoned
+        let results = restored_index.search(&[1.0, 0.0, 0.0], 5);
+        assert!(!results.is_empty(), "search should return results");
+        assert!(
+            results.iter().all(|(id, _)| id != &make_id("e2")),
+            "tombstoned entity should not appear in results"
+        );
+        assert!(
+            results.iter().any(|(id, _)| id == &make_id("e1")),
+            "e1 should be in results"
+        );
+
+        // Verify len accounts for tombstone
+        assert_eq!(restored_index.len(), 2);
+        assert_eq!(restored_index.tombstone_count(), 1);
     }
 
     #[test]

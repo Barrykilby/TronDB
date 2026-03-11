@@ -55,6 +55,40 @@ impl HnswIndex {
         }
     }
 
+    /// Restore an HnswIndex from a loaded hnsw_rs graph and saved ID maps.
+    pub fn from_snapshot(
+        hnsw: Hnsw<'static, f32, DistCosine>,
+        dimensions: usize,
+        id_to_idx_map: std::collections::HashMap<String, usize>,
+        idx_to_id_map: std::collections::HashMap<usize, String>,
+        next_idx_val: usize,
+        tombstone_list: Vec<String>,
+    ) -> Self {
+        let id_to_idx = DashMap::new();
+        for (k, v) in id_to_idx_map {
+            id_to_idx.insert(LogicalId::from_string(&k), v);
+        }
+        let idx_to_id = DashMap::new();
+        for (k, v) in idx_to_id_map {
+            idx_to_id.insert(k, LogicalId::from_string(&v));
+        }
+        let tombstones = DashMap::new();
+        let tombstone_count = tombstone_list.len();
+        for id in tombstone_list {
+            tombstones.insert(LogicalId::from_string(&id), ());
+        }
+
+        Self {
+            inner: Mutex::new(hnsw),
+            dimensions,
+            id_to_idx,
+            idx_to_id,
+            next_idx: AtomicUsize::new(next_idx_val),
+            tombstones,
+            tombstone_count: AtomicUsize::new(tombstone_count),
+        }
+    }
+
     /// Insert a vector for an entity. Idempotent: skips if already indexed.
     pub fn insert(&self, id: &LogicalId, vector: &[f32]) {
         // Idempotent — skip if already in the index
