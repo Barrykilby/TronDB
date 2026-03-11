@@ -7,6 +7,7 @@ pub mod location;
 pub mod types;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use error::EngineError;
 use executor::Executor;
@@ -27,6 +28,7 @@ pub struct EngineConfig {
 
 pub struct Engine {
     executor: Executor,
+    _snapshot_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Engine {
@@ -48,7 +50,8 @@ impl Engine {
         // Replay committed WAL records
         let recovery = WalRecovery::recover(&config.wal.wal_dir).await?;
         let wal = WalWriter::open(config.wal).await?;
-        let executor = Executor::new(store, wal, location);
+        let location = Arc::new(location);
+        let executor = Executor::new(store, wal, Arc::clone(&location));
 
         // Filter records to only replay those after snapshot LSN
         let records_to_replay: Vec<_> = recovery
@@ -63,7 +66,39 @@ impl Engine {
             eprintln!("WAL recovery: replayed {replayed} records");
         }
 
-        Ok(Self { executor })
+        // Spawn background snapshot task
+        let snapshot_handle = if config.snapshot_interval_secs > 0 {
+            let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
+            let snap_path = config.data_dir.join("location_table.snap");
+            let location_arc = Arc::clone(&location);
+            let wal_head = executor.wal_head_lsn();
+
+            Some(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.tick().await; // skip first immediate tick
+                loop {
+                    ticker.tick().await;
+                    let lsn = wal_head; // In Phase 3, WAL head at startup is sufficient
+                    match location_arc.snapshot(lsn) {
+                        Ok(bytes) => {
+                            if let Err(e) = tokio::fs::write(&snap_path, &bytes).await {
+                                eprintln!("Location Table snapshot failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Location Table snapshot failed: {e}");
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            executor,
+            _snapshot_handle: snapshot_handle,
+        })
     }
 
     pub async fn execute_tql(&self, input: &str) -> Result<QueryResult, EngineError> {
@@ -79,6 +114,10 @@ impl Engine {
 
     pub fn location(&self) -> &location::LocationTable {
         self.executor.location()
+    }
+
+    pub fn wal_head_lsn(&self) -> u64 {
+        self.executor.wal_head_lsn()
     }
 }
 

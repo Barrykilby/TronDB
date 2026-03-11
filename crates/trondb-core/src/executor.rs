@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::error::EngineError;
@@ -19,11 +20,11 @@ use trondb_wal::{RecordType, WalRecord, WalWriter};
 pub struct Executor {
     store: FjallStore,
     wal: WalWriter,
-    location: LocationTable,
+    location: Arc<LocationTable>,
 }
 
 impl Executor {
-    pub fn new(store: FjallStore, wal: WalWriter, location: LocationTable) -> Self {
+    pub fn new(store: FjallStore, wal: WalWriter, location: Arc<LocationTable>) -> Self {
         Self { store, wal, location }
     }
 
@@ -291,6 +292,10 @@ impl Executor {
         &self.location
     }
 
+    pub fn location_arc(&self) -> Arc<LocationTable> {
+        Arc::clone(&self.location)
+    }
+
     pub fn wal_head_lsn(&self) -> u64 {
         self.wal.head_lsn()
     }
@@ -499,6 +504,7 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::location::LocationTable;
     use crate::planner::{CreateCollectionPlan, FetchPlan, InsertPlan};
     use trondb_tql::Literal;
@@ -512,7 +518,7 @@ mod tests {
             ..Default::default()
         };
         let wal = WalWriter::open(wal_config).await.unwrap();
-        (Executor::new(store, wal, LocationTable::new()), dir)
+        (Executor::new(store, wal, Arc::new(LocationTable::new())), dir)
     }
 
     async fn create_collection(exec: &Executor, name: &str, dims: usize) {
