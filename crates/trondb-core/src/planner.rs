@@ -287,6 +287,11 @@ pub fn plan(
             let inner_plan = plan(inner, schemas)?;
             Ok(Plan::Explain(Box::new(inner_plan)))
         }
+
+        // Routing statements — planning handled in Task 9
+        Statement::CreateAffinityGroup(_) | Statement::AlterEntityDropAffinity(_) => {
+            Err(EngineError::UnsupportedOperation("routing statements not yet planned".into()))
+        }
     }
 }
 

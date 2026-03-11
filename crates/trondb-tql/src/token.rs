@@ -133,6 +133,24 @@ pub enum Token {
     #[token("COSINE", priority = 10, ignore(ascii_case))]
     Cosine,
 
+    #[token("COLLOCATE", priority = 10, ignore(ascii_case))]
+    Collocate,
+
+    #[token("AFFINITY", priority = 10, ignore(ascii_case))]
+    Affinity,
+
+    #[token("GROUP", priority = 10, ignore(ascii_case))]
+    Group,
+
+    #[token("ALTER", priority = 10, ignore(ascii_case))]
+    Alter,
+
+    #[token("DROP", priority = 10, ignore(ascii_case))]
+    Drop,
+
+    #[token("ENTITY", priority = 10, ignore(ascii_case))]
+    Entity,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),

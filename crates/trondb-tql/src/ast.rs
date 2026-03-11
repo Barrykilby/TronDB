@@ -9,6 +9,8 @@ pub enum Statement {
     InsertEdge(InsertEdgeStmt),
     DeleteEdge(DeleteEdgeStmt),
     Traverse(TraverseStmt),
+    CreateAffinityGroup(CreateAffinityGroupStmt),
+    AlterEntityDropAffinity(AlterEntityDropAffinityStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -68,6 +70,8 @@ pub struct InsertStmt {
     pub fields: Vec<String>,
     pub values: Vec<Literal>,
     pub vectors: Vec<(String, VectorLiteral)>,
+    pub collocate_with: Option<Vec<String>>,
+    pub affinity_group: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,4 +159,14 @@ pub struct TraverseStmt {
     pub from_id: String,
     pub depth: usize,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateAffinityGroupStmt {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterEntityDropAffinityStmt {
+    pub entity_id: String,
 }

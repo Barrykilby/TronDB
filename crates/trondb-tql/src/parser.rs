@@ -107,6 +107,16 @@ impl Parser {
             Some(Token::Fetch) => self.parse_fetch(),
             Some(Token::Search) => self.parse_search(),
             Some(Token::Explain) => self.parse_explain(),
+            Some(Token::Alter) => {
+                self.advance(); // ALTER
+                self.expect(&Token::Entity)?;
+                let entity_id = self.expect_string_lit()?;
+                self.expect(&Token::Drop)?;
+                self.expect(&Token::Affinity)?;
+                self.expect(&Token::Group)?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::AlterEntityDropAffinity(AlterEntityDropAffinityStmt { entity_id }))
+            }
             Some(Token::Delete) => self.parse_delete(),
             Some(Token::Traverse) => self.parse_traverse(),
             Some(tok) => {
@@ -129,16 +139,23 @@ impl Parser {
         match self.peek() {
             Some(Token::Collection) => self.parse_create_collection(),
             Some(Token::Edge) => self.parse_create_edge(),
+            Some(Token::Affinity) => {
+                self.advance(); // AFFINITY
+                self.expect(&Token::Group)?;
+                let name = self.expect_string_lit()?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::CreateAffinityGroup(CreateAffinityGroupStmt { name }))
+            }
             Some(tok) => {
                 let tok_str = format!("{tok:?}");
                 let pos = self.tokens[self.pos].1.start;
                 Err(ParseError::UnexpectedToken {
                     pos,
-                    expected: "COLLECTION or EDGE".to_string(),
+                    expected: "COLLECTION, EDGE, or AFFINITY".to_string(),
                     got: tok_str,
                 })
             }
-            None => Err(ParseError::UnexpectedEof("expected COLLECTION or EDGE".to_string())),
+            None => Err(ParseError::UnexpectedEof("expected COLLECTION, EDGE, or AFFINITY".to_string())),
         }
     }
 
@@ -373,12 +390,39 @@ impl Parser {
             }
         }
 
+        // Parse optional colocation clauses
+        let mut collocate_with = None;
+        let mut affinity_group = None;
+        if self.peek() == Some(&Token::Collocate) {
+            self.advance(); // COLLOCATE
+            self.expect(&Token::With)?; // WITH
+            self.expect(&Token::LParen)?;
+            let mut ids = vec![];
+            loop {
+                let id = self.expect_string_lit()?;
+                ids.push(id);
+                if self.peek() != Some(&Token::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            self.expect(&Token::RParen)?;
+            collocate_with = Some(ids);
+        } else if self.peek() == Some(&Token::Affinity) {
+            self.advance(); // AFFINITY
+            self.expect(&Token::Group)?; // GROUP
+            let name = self.expect_string_lit()?;
+            affinity_group = Some(name);
+        }
+
         self.expect(&Token::Semicolon)?;
         Ok(Statement::Insert(InsertStmt {
             collection,
             fields,
             values,
             vectors,
+            collocate_with,
+            affinity_group,
         }))
     }
 
@@ -1025,6 +1069,52 @@ mod tests {
                 assert_eq!(t.limit, Some(10));
             }
             _ => panic!("expected Traverse"),
+        }
+    }
+
+    #[test]
+    fn parse_create_affinity_group() {
+        let stmt = parse("CREATE AFFINITY GROUP 'festival_cluster';").unwrap();
+        match stmt {
+            Statement::CreateAffinityGroup(s) => {
+                assert_eq!(s.name, "festival_cluster");
+            }
+            _ => panic!("expected CreateAffinityGroup"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_with_collocate_with() {
+        let stmt = parse("INSERT INTO venues (id, name) VALUES ('v1', 'Glastonbury') COLLOCATE WITH ('v2', 'v3');").unwrap();
+        match stmt {
+            Statement::Insert(s) => {
+                assert_eq!(s.collocate_with, Some(vec!["v2".into(), "v3".into()]));
+                assert_eq!(s.affinity_group, None);
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_with_affinity_group() {
+        let stmt = parse("INSERT INTO venues (id, name) VALUES ('v1', 'Glastonbury') AFFINITY GROUP 'festival_cluster';").unwrap();
+        match stmt {
+            Statement::Insert(s) => {
+                assert_eq!(s.collocate_with, None);
+                assert_eq!(s.affinity_group, Some("festival_cluster".into()));
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_entity_drop_affinity() {
+        let stmt = parse("ALTER ENTITY 'v1' DROP AFFINITY GROUP;").unwrap();
+        match stmt {
+            Statement::AlterEntityDropAffinity(s) => {
+                assert_eq!(s.entity_id, "v1");
+            }
+            _ => panic!("expected AlterEntityDropAffinity"),
         }
     }
 }
