@@ -2,6 +2,7 @@ pub mod error;
 pub mod executor;
 pub mod hybrid;
 pub mod planner;
+pub mod quantise;
 pub mod result;
 pub mod store;
 pub mod edge;
