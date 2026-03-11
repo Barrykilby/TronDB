@@ -3204,4 +3204,159 @@ mod tests {
             .await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn delete_entity_removes_from_hnsw() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert two entities with dense vectors
+        insert_entity(
+            &exec,
+            "venues",
+            "v1",
+            vec![("name", Literal::String("Alpha".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        )
+        .await;
+        insert_entity(
+            &exec,
+            "venues",
+            "v2",
+            vec![("name", Literal::String("Beta".into()))],
+            Some(vec![0.9, 0.1, 0.0]),
+        )
+        .await;
+
+        // SEARCH should return both (query near v1)
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: Some(vec![1.0, 0.0, 0.0]),
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::Hnsw,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        // Delete v1
+        exec.execute(&Plan::DeleteEntity(DeleteEntityPlan {
+            entity_id: "v1".into(),
+            collection: "venues".into(),
+        }))
+        .await
+        .unwrap();
+
+        // SEARCH should now return only v2
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: Some(vec![1.0, 0.0, 0.0]),
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::Hnsw,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v2".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_entity_removes_from_field_index() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection_with_field_index(&exec, "venues", 3).await;
+
+        // Insert two entities with city field
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![
+                Literal::String("v1".into()),
+                Literal::String("London".into()),
+            ],
+            vectors: vec![(
+                "default".to_string(),
+                VectorLiteral::Dense(vec![1.0, 0.0, 0.0]),
+            )],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![
+                Literal::String("v2".into()),
+                Literal::String("London".into()),
+            ],
+            vectors: vec![(
+                "default".to_string(),
+                VectorLiteral::Dense(vec![0.0, 1.0, 0.0]),
+            )],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+
+        // FETCH via field index should find both London entities
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::Eq(
+                    "city".into(),
+                    Literal::String("London".into()),
+                )),
+                limit: None,
+                strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        // Delete v1
+        exec.execute(&Plan::DeleteEntity(DeleteEntityPlan {
+            entity_id: "v1".into(),
+            collection: "venues".into(),
+        }))
+        .await
+        .unwrap();
+
+        // FETCH via field index should now find only v2
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::Eq(
+                    "city".into(),
+                    Literal::String("London".into()),
+                )),
+                limit: None,
+                strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v2".into()))
+        );
+    }
 }
