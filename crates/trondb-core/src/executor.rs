@@ -11,7 +11,7 @@ use crate::index::HnswIndex;
 use crate::location::{
     Encoding, LocState, LocationDescriptor, LocationTable, NodeAddress, ReprKey, Tier,
 };
-use crate::planner::{Plan, SearchStrategy};
+use crate::planner::{FetchStrategy, Plan, SearchStrategy};
 use crate::result::{QueryMode, QueryResult, QueryStats, Row};
 use crate::sparse_index::SparseIndex;
 use crate::store::FjallStore;
@@ -455,39 +455,81 @@ impl Executor {
             }
 
             Plan::Fetch(p) => {
-                // Read directly from Fjall — no WAL involvement
-                let entities = self.store.scan(&p.collection)?;
-                let scanned = entities.len();
+                match &p.strategy {
+                    FetchStrategy::FieldIndexLookup(index_name) => {
+                        // Look up via FieldIndex
+                        let fidx_key = format!("{}:{}", p.collection, index_name);
+                        let fidx = self.field_indexes.get(&fidx_key)
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                format!("field index '{}' not found", index_name),
+                            ))?;
 
-                let filtered: Vec<&Entity> = entities
-                    .iter()
-                    .filter(|e| match &p.filter {
-                        Some(clause) => entity_matches(e, clause),
-                        None => true,
-                    })
-                    .collect();
+                        let entity_ids = if let Some(WhereClause::Eq(_, lit)) = &p.filter {
+                            let value = literal_to_value(lit);
+                            fidx.lookup_eq(&[value])?
+                        } else {
+                            return Err(EngineError::InvalidQuery(
+                                "FieldIndexLookup requires Eq filter".into(),
+                            ));
+                        };
 
-                let mut rows: Vec<Row> = filtered
-                    .iter()
-                    .map(|e| entity_to_row(e, &p.fields))
-                    .collect();
+                        let mut rows = Vec::new();
+                        for eid in &entity_ids {
+                            if let Ok(entity) = self.store.get(&p.collection, eid) {
+                                rows.push(entity_to_row(&entity, &p.fields));
+                            }
+                        }
+                        if let Some(limit) = p.limit {
+                            rows.truncate(limit);
+                        }
+                        let columns = build_columns(&rows, &p.fields);
+                        Ok(QueryResult {
+                            columns,
+                            rows,
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: entity_ids.len(),
+                                mode: QueryMode::Deterministic,
+                                tier: "FieldIndex".into(),
+                            },
+                        })
+                    }
+                    FetchStrategy::FullScan => {
+                        // Read directly from Fjall — no WAL involvement
+                        let entities = self.store.scan(&p.collection)?;
+                        let scanned = entities.len();
 
-                if let Some(limit) = p.limit {
-                    rows.truncate(limit);
+                        let filtered: Vec<&Entity> = entities
+                            .iter()
+                            .filter(|e| match &p.filter {
+                                Some(clause) => entity_matches(e, clause),
+                                None => true,
+                            })
+                            .collect();
+
+                        let mut rows: Vec<Row> = filtered
+                            .iter()
+                            .map(|e| entity_to_row(e, &p.fields))
+                            .collect();
+
+                        if let Some(limit) = p.limit {
+                            rows.truncate(limit);
+                        }
+
+                        let columns = build_columns(&rows, &p.fields);
+
+                        Ok(QueryResult {
+                            columns,
+                            rows,
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: scanned,
+                                mode: QueryMode::Deterministic,
+                                tier: "Fjall".into(),
+                            },
+                        })
+                    }
                 }
-
-                let columns = build_columns(&rows, &p.fields);
-
-                Ok(QueryResult {
-                    columns,
-                    rows,
-                    stats: QueryStats {
-                        elapsed: start.elapsed(),
-                        entities_scanned: scanned,
-                        mode: QueryMode::Deterministic,
-                        tier: "Fjall".into(),
-                    },
-                })
             }
 
             Plan::Search(p) => {
@@ -496,66 +538,133 @@ impl Executor {
                     return Err(EngineError::CollectionNotFound(p.collection.clone()));
                 }
 
-                match &p.strategy {
+                // Step 1: Pre-filter — resolve candidate IDs from FieldIndex if present
+                let pre_filter_ids: Option<HashSet<LogicalId>> = if let Some(pf) = &p.pre_filter {
+                    let fidx_key = format!("{}:{}", p.collection, pf.index_name);
+                    let fidx = self.field_indexes.get(&fidx_key)
+                        .ok_or_else(|| EngineError::InvalidQuery(
+                            format!("pre-filter index '{}' not found", pf.index_name),
+                        ))?;
+                    let value = match &pf.clause {
+                        WhereClause::Eq(_, lit) => literal_to_value(lit),
+                        _ => return Err(EngineError::InvalidQuery(
+                            "pre-filter only supports Eq".into(),
+                        )),
+                    };
+                    let ids = fidx.lookup_eq(&[value])?;
+                    Some(ids.into_iter().collect())
+                } else {
+                    None
+                };
+
+                // Step 2: Over-fetch when pre-filtering
+                let fetch_k = if pre_filter_ids.is_some() { p.k * 4 } else { p.k };
+
+                // Step 3: Execute strategy
+                let results: Vec<(LogicalId, f32)> = match &p.strategy {
                     SearchStrategy::Hnsw => {
-                        let query_f64 = p.dense_vector.as_ref()
-                            .ok_or_else(|| EngineError::InvalidQuery("HNSW requires dense vector".into()))?;
-                        let query_f32: Vec<f32> = query_f64.iter().map(|v| *v as f32).collect();
-
-                        // Search HNSW index using repr-scoped keys
-                        // Find the first HNSW index for this collection
-                        let candidates = {
-                            let mut found = Vec::new();
-                            let prefix = format!("{}:", p.collection);
-                            for entry in self.indexes.iter() {
-                                if entry.key().starts_with(&prefix) {
-                                    found = entry.search(&query_f32, p.k);
-                                    break;
-                                }
-                            }
-                            found
-                        };
-
-                        // Filter by confidence threshold and resolve entities
-                        let mut rows = Vec::new();
-                        let mut scanned = 0;
-                        for (id, similarity) in candidates {
-                            if (similarity as f64) < p.confidence_threshold {
-                                continue;
-                            }
-                            scanned += 1;
-
-                            if let Ok(entities) = self.store.scan(&p.collection) {
-                                if let Some(entity) = entities.iter().find(|e| e.id == id) {
-                                    let mut row = entity_to_row(entity, &p.fields);
-                                    row.score = Some(similarity);
-                                    rows.push(row);
-                                }
-                            }
+                        let query = p.dense_vector.as_ref()
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "HNSW requires dense vector".into(),
+                            ))?;
+                        let prefix = format!("{}:", p.collection);
+                        let hnsw_key = self.indexes.iter()
+                            .find(|e| e.key().starts_with(&prefix))
+                            .map(|e| e.key().clone())
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "no HNSW index for collection".into(),
+                            ))?;
+                        let hnsw = self.indexes.get(&hnsw_key).unwrap();
+                        let query_f32: Vec<f32> = query.iter().map(|x| *x as f32).collect();
+                        let mut raw = hnsw.search(&query_f32, fetch_k);
+                        // Confidence threshold only for HNSW (cosine similarity is meaningful)
+                        if p.confidence_threshold > 0.0 {
+                            raw.retain(|(_, score)| (*score as f64) >= p.confidence_threshold);
                         }
-
-                        Ok(QueryResult {
-                            columns: build_columns(&rows, &p.fields),
-                            rows,
-                            stats: QueryStats {
-                                elapsed: start.elapsed(),
-                                entities_scanned: scanned,
-                                mode: QueryMode::Probabilistic,
-                                tier: "Ram".into(),
-                            },
-                        })
+                        raw
                     }
                     SearchStrategy::Sparse => {
-                        Err(EngineError::UnsupportedOperation(
-                            "Sparse-only SEARCH not yet implemented (Task 10)".into(),
-                        ))
+                        let query = p.sparse_vector.as_ref()
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "Sparse requires sparse vector".into(),
+                            ))?;
+                        let prefix = format!("{}:", p.collection);
+                        let sparse_key = self.sparse_indexes.iter()
+                            .find(|e| e.key().starts_with(&prefix))
+                            .map(|e| e.key().clone())
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "no SparseIndex for collection".into(),
+                            ))?;
+                        let sidx = self.sparse_indexes.get(&sparse_key).unwrap();
+                        // No confidence threshold for sparse (dot product scores)
+                        sidx.search(query, fetch_k)
                     }
                     SearchStrategy::Hybrid => {
-                        Err(EngineError::UnsupportedOperation(
-                            "Hybrid SEARCH not yet implemented (Task 10)".into(),
-                        ))
+                        let dense_query = p.dense_vector.as_ref()
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "Hybrid requires dense vector".into(),
+                            ))?;
+                        let sparse_query = p.sparse_vector.as_ref()
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "Hybrid requires sparse vector".into(),
+                            ))?;
+
+                        let prefix = format!("{}:", p.collection);
+                        let hnsw_key = self.indexes.iter()
+                            .find(|e| e.key().starts_with(&prefix))
+                            .map(|e| e.key().clone())
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "no HNSW index for collection".into(),
+                            ))?;
+                        let hnsw = self.indexes.get(&hnsw_key).unwrap();
+                        let query_f32: Vec<f32> = dense_query.iter().map(|x| *x as f32).collect();
+                        let dense_results = hnsw.search(&query_f32, fetch_k);
+
+                        let sparse_key = self.sparse_indexes.iter()
+                            .find(|e| e.key().starts_with(&prefix))
+                            .map(|e| e.key().clone())
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "no SparseIndex for collection".into(),
+                            ))?;
+                        let sidx = self.sparse_indexes.get(&sparse_key).unwrap();
+                        let sparse_results = sidx.search(sparse_query, fetch_k);
+
+                        // RRF merge — no confidence threshold (RRF scores are relative ranking)
+                        crate::hybrid::merge_rrf(&dense_results, &sparse_results, crate::hybrid::default_rrf_k())
+                    }
+                };
+
+                // Step 4: Post-filter on pre-filter candidates
+                let filtered = if let Some(ref allowed) = pre_filter_ids {
+                    results.into_iter().filter(|(id, _)| allowed.contains(id)).collect::<Vec<_>>()
+                } else {
+                    results
+                };
+
+                // Step 5: Trim to k
+                let final_results: Vec<(LogicalId, f32)> = filtered.into_iter().take(p.k).collect();
+
+                // Step 6: Resolve entities using store.get() (not scan!)
+                let mut rows = Vec::new();
+                for (id, score) in &final_results {
+                    if let Ok(entity) = self.store.get(&p.collection, id) {
+                        let mut row = entity_to_row(&entity, &p.fields);
+                        row.score = Some(*score);
+                        rows.push(row);
                     }
                 }
+
+                let columns = build_columns(&rows, &p.fields);
+                Ok(QueryResult {
+                    columns,
+                    rows,
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: final_results.len(),
+                        mode: QueryMode::Probabilistic,
+                        tier: "Ram".into(),
+                    },
+                })
             }
 
             Plan::Explain(inner) => {
@@ -1033,8 +1142,16 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("mode", "Deterministic".into()));
             props.push(("verb", "FETCH".into()));
             props.push(("collection", p.collection.clone()));
-            props.push(("tier", "Fjall".into()));
-            props.push(("strategy", format!("{:?}", p.strategy)));
+            match &p.strategy {
+                FetchStrategy::FullScan => {
+                    props.push(("strategy", "FullScan".into()));
+                    props.push(("tier", "Fjall".into()));
+                }
+                FetchStrategy::FieldIndexLookup(index_name) => {
+                    props.push(("strategy", format!("FieldIndexLookup ({})", index_name)));
+                    props.push(("tier", "FieldIndex".into()));
+                }
+            }
             if let Some(limit) = p.limit {
                 props.push(("limit", limit.to_string()));
             }
@@ -1044,15 +1161,17 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("verb", "SEARCH".into()));
             props.push(("collection", p.collection.clone()));
             props.push(("tier", "Ram".into()));
-            props.push(("encoding", "Float32".into()));
-            let strategy_name = match &p.strategy {
-                SearchStrategy::Hnsw => "HNSW",
-                SearchStrategy::Sparse => "Sparse",
-                SearchStrategy::Hybrid => "Hybrid",
+            let strategy_str = match &p.strategy {
+                SearchStrategy::Hnsw => "HnswSearch",
+                SearchStrategy::Sparse => "SparseSearch",
+                SearchStrategy::Hybrid => "HybridSearch",
             };
-            props.push(("strategy", strategy_name.into()));
+            props.push(("strategy", strategy_str.into()));
             props.push(("k", p.k.to_string()));
             props.push(("confidence_threshold", p.confidence_threshold.to_string()));
+            if let Some(pf) = &p.pre_filter {
+                props.push(("pre_filter", format!("ScalarPreFilter ({})", pf.index_name)));
+            }
         }
         Plan::Insert(p) => {
             props.push(("mode", "Deterministic".into()));
@@ -1122,7 +1241,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{CreateCollectionPlan, FetchPlan, FetchStrategy, InsertPlan};
+    use crate::planner::{CreateCollectionPlan, FetchPlan, FetchStrategy, InsertPlan, PreFilter, SearchPlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -1545,5 +1664,361 @@ mod tests {
         let results = fidx.lookup_eq(&[Value::String("London".into())]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], LogicalId::from_string("v1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 10 tests: FETCH FieldIndex, SEARCH sparse/hybrid/prefilter, EXPLAIN
+    // -----------------------------------------------------------------------
+
+    /// Helper: create collection with field+index+dense repr for Task 10 tests.
+    async fn create_collection_with_field_index(exec: &Executor, name: &str, dims: usize) {
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: name.into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(dims),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "city".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_city".into(),
+                fields: vec!["city".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_via_field_index() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection_with_field_index(&exec, "venues", 3).await;
+
+        // Insert two entities with different cities
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("London".into())],
+            vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+        })).await.unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![Literal::String("v2".into()), Literal::String("Paris".into())],
+            vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.4, 0.5, 0.6]))],
+        })).await.unwrap();
+
+        // FETCH with FieldIndexLookup strategy
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values.get("city"), Some(&Value::String("London".into())));
+        assert_eq!(result.rows[0].values.get("id"), Some(&Value::String("v1".into())));
+        assert_eq!(result.stats.tier, "FieldIndex");
+    }
+
+    #[tokio::test]
+    async fn search_sparse_returns_ranked() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with sparse representation
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "docs".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "keywords".into(),
+                model: None,
+                dimensions: None,
+                metric: trondb_tql::Metric::Cosine,
+                sparse: true,
+            }],
+            fields: vec![],
+            indexes: vec![],
+        })).await.unwrap();
+
+        // Insert entities with sparse vectors
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "docs".into(),
+            fields: vec!["id".into()],
+            values: vec![Literal::String("d1".into())],
+            vectors: vec![("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.8), (42, 0.5)]))],
+        })).await.unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "docs".into(),
+            fields: vec!["id".into()],
+            values: vec![Literal::String("d2".into())],
+            vectors: vec![("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.3), (99, 0.9)]))],
+        })).await.unwrap();
+
+        // SEARCH Sparse
+        let result = exec.execute(&Plan::Search(SearchPlan {
+            collection: "docs".into(),
+            fields: FieldList::All,
+            dense_vector: None,
+            sparse_vector: Some(vec![(1, 1.0)]),
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Sparse,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        // d1 should rank higher (dimension 1 weight 0.8 > d2's 0.3)
+        assert_eq!(result.rows[0].values.get("id"), Some(&Value::String("d1".into())));
+        assert!(result.rows[0].score.unwrap() > result.rows[1].score.unwrap());
+        assert_eq!(result.stats.mode, QueryMode::Probabilistic);
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_merges_dense_sparse() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with both dense + sparse representations
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "docs".into(),
+            representations: vec![
+                trondb_tql::RepresentationDecl {
+                    name: "embed".into(),
+                    model: None,
+                    dimensions: Some(3),
+                    metric: trondb_tql::Metric::Cosine,
+                    sparse: false,
+                },
+                trondb_tql::RepresentationDecl {
+                    name: "keywords".into(),
+                    model: None,
+                    dimensions: None,
+                    metric: trondb_tql::Metric::Cosine,
+                    sparse: true,
+                },
+            ],
+            fields: vec![],
+            indexes: vec![],
+        })).await.unwrap();
+
+        // Insert entities with both dense and sparse vectors
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "docs".into(),
+            fields: vec!["id".into()],
+            values: vec![Literal::String("d1".into())],
+            vectors: vec![
+                ("embed".to_string(), VectorLiteral::Dense(vec![1.0, 0.0, 0.0])),
+                ("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.9)])),
+            ],
+        })).await.unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "docs".into(),
+            fields: vec!["id".into()],
+            values: vec![Literal::String("d2".into())],
+            vectors: vec![
+                ("embed".to_string(), VectorLiteral::Dense(vec![0.0, 1.0, 0.0])),
+                ("keywords".to_string(), VectorLiteral::Sparse(vec![(2, 0.9)])),
+            ],
+        })).await.unwrap();
+
+        // SEARCH Hybrid
+        let result = exec.execute(&Plan::Search(SearchPlan {
+            collection: "docs".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: Some(vec![(1, 1.0)]),
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hybrid,
+        })).await.unwrap();
+
+        // Both entities should appear, d1 should rank higher (matches both dense and sparse)
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values.get("id"), Some(&Value::String("d1".into())));
+        assert!(result.rows[0].score.is_some());
+    }
+
+    #[tokio::test]
+    async fn search_with_prefilter_narrows_results() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with dense repr + field index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "venues".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "city".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_city".into(),
+                fields: vec!["city".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities in different cities
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("London".into())],
+            vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+        })).await.unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![Literal::String("v2".into()), Literal::String("Paris".into())],
+            vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.9, 0.1, 0.0]))],
+        })).await.unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![Literal::String("v3".into()), Literal::String("London".into())],
+            vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.8, 0.2, 0.0]))],
+        })).await.unwrap();
+
+        // SEARCH with pre-filter on city=London
+        let result = exec.execute(&Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            pre_filter: Some(PreFilter {
+                index_name: "idx_city".into(),
+                clause: WhereClause::Eq("city".into(), Literal::String("London".into())),
+            }),
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+        })).await.unwrap();
+
+        // Only London entities should be returned
+        assert_eq!(result.rows.len(), 2);
+        for row in &result.rows {
+            assert_eq!(row.values.get("city"), Some(&Value::String("London".into())));
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_shows_search_strategy() {
+        let (exec, _dir) = setup_executor().await;
+
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 5,
+            confidence_threshold: 0.8,
+            strategy: SearchStrategy::Hnsw,
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(search_plan)))
+            .await
+            .unwrap();
+
+        // Find strategy property
+        let strategy_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("strategy".into())))
+            .expect("should have 'strategy' property");
+        assert_eq!(strategy_row.values.get("value"), Some(&Value::String("HnswSearch".into())));
+
+        // Verify mode
+        let mode_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("mode".into())))
+            .expect("should have 'mode' property");
+        assert_eq!(mode_row.values.get("value"), Some(&Value::String("Probabilistic".into())));
+
+        // Verify k
+        let k_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("k".into())))
+            .expect("should have 'k' property");
+        assert_eq!(k_row.values.get("value"), Some(&Value::String("5".into())));
+    }
+
+    #[tokio::test]
+    async fn explain_shows_fetch_field_index_strategy() {
+        let (exec, _dir) = setup_executor().await;
+
+        let fetch_plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(fetch_plan)))
+            .await
+            .unwrap();
+
+        let strategy_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("strategy".into())))
+            .expect("should have 'strategy' property");
+        assert_eq!(
+            strategy_row.values.get("value"),
+            Some(&Value::String("FieldIndexLookup (idx_city)".into()))
+        );
+
+        let tier_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("tier".into())))
+            .expect("should have 'tier' property");
+        assert_eq!(tier_row.values.get("value"), Some(&Value::String("FieldIndex".into())));
+    }
+
+    #[tokio::test]
+    async fn explain_shows_prefilter() {
+        let (exec, _dir) = setup_executor().await;
+
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            pre_filter: Some(PreFilter {
+                index_name: "idx_city".into(),
+                clause: WhereClause::Eq("city".into(), Literal::String("London".into())),
+            }),
+            k: 5,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(search_plan)))
+            .await
+            .unwrap();
+
+        let pf_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("pre_filter".into())))
+            .expect("should have 'pre_filter' property");
+        assert_eq!(
+            pf_row.values.get("value"),
+            Some(&Value::String("ScalarPreFilter (idx_city)".into()))
+        );
     }
 }

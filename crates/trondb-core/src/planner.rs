@@ -129,12 +129,20 @@ fn select_search_strategy(
     }
 }
 
-/// Determine the fetch strategy. For now, always FullScan (field index lookup
-/// will be added in Tasks 9-10).
+/// Determine the fetch strategy.
+/// Returns `FieldIndexLookup` when there is an `Eq` filter on a field covered
+/// by a declared index; otherwise falls back to `FullScan`.
 fn select_fetch_strategy(
-    _filter: &Option<WhereClause>,
-    _schema: Option<&CollectionSchema>,
+    filter: &Option<WhereClause>,
+    schema: Option<&CollectionSchema>,
 ) -> FetchStrategy {
+    if let (Some(WhereClause::Eq(field, _)), Some(schema)) = (filter, schema) {
+        for idx in &schema.indexes {
+            if idx.fields.contains(field) {
+                return FetchStrategy::FieldIndexLookup(idx.name.clone());
+            }
+        }
+    }
     FetchStrategy::FullScan
 }
 
@@ -477,6 +485,47 @@ mod tests {
         match result.unwrap_err() {
             EngineError::FieldNotIndexed(f) => assert_eq!(f, "city"),
             other => panic!("expected FieldNotIndexed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_fetch_with_indexed_field() {
+        use crate::types::{Metric, StoredField, StoredIndex, StoredRepresentation, FieldType};
+
+        let schemas = DashMap::new();
+        schemas.insert("venues".into(), CollectionSchema {
+            name: "venues".into(),
+            representations: vec![StoredRepresentation {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![StoredField {
+                name: "city".into(),
+                field_type: FieldType::Text,
+            }],
+            indexes: vec![StoredIndex {
+                name: "idx_city".into(),
+                fields: vec!["city".into()],
+                partial_condition: None,
+            }],
+        });
+
+        let stmt = Statement::Fetch(FetchStmt {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            limit: Some(10),
+        });
+        let p = plan(&stmt, &schemas).unwrap();
+        match p {
+            Plan::Fetch(fp) => {
+                assert_eq!(fp.strategy, FetchStrategy::FieldIndexLookup("idx_city".into()));
+                assert_eq!(fp.collection, "venues");
+            }
+            _ => panic!("expected FetchPlan"),
         }
     }
 }

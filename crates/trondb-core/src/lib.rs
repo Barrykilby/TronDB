@@ -388,7 +388,7 @@ mod tests {
 
         assert_eq!(
             strategy_row.values.get("value"),
-            Some(&Value::String("HNSW".into()))
+            Some(&Value::String("HnswSearch".into()))
         );
 
         let mode_row = result
