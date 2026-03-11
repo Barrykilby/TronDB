@@ -6,6 +6,8 @@ use std::sync::Arc;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use trondb_core::{Engine, EngineConfig};
+use trondb_routing::config::TierConfig;
+use trondb_routing::migrator::TierMigrator;
 use trondb_routing::node::{LocalNode, NodeId};
 use trondb_routing::router::SemanticRouter;
 use trondb_routing::RouterConfig;
@@ -43,7 +45,17 @@ async fn main() {
     let wal = engine.wal_writer();
     let local_node = Arc::new(LocalNode::new(engine.clone(), NodeId::from_string("local")))
         as Arc<dyn trondb_routing::NodeHandle>;
-    let router = SemanticRouter::with_wal(vec![local_node], RouterConfig::default(), Some(wal));
+    let mut router = SemanticRouter::with_wal(vec![local_node], RouterConfig::default(), Some(wal));
+
+    let lru = Arc::new(std::sync::Mutex::new(trondb_routing::eviction::LruTracker::new()));
+    let tier_config = TierConfig::default();
+    let migrator = Arc::new(TierMigrator::new(
+        tier_config,
+        engine.clone(),
+        lru,
+        router.affinity_index().clone(),
+    ));
+    router.set_migrator(migrator);
 
     let mut rl = DefaultEditor::new().expect("failed to create editor");
     let mut buffer = String::new();
