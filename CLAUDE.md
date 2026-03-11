@@ -1,11 +1,11 @@
 # TronDB
 
-Inference-first storage engine. Phase 2: Fjall persistence + WAL.
+Inference-first storage engine. Phase 3: Location Table (control fabric).
 
 ## Project Structure
 
 - `crates/trondb-wal/` — Write-Ahead Log: record types (MessagePack), segment files, buffer, async writer, crash recovery
-- `crates/trondb-core/` — Engine: types, Fjall-backed store, planner, async executor. Depends on trondb-wal + trondb-tql.
+- `crates/trondb-core/` — Engine: types, Fjall-backed store, Location Table (DashMap), planner, async executor. Depends on trondb-wal + trondb-tql.
 - `crates/trondb-tql/` — TQL parser (logos lexer + recursive descent). No engine dependency.
 - `crates/trondb-cli/` — Interactive REPL binary (Tokio + rustyline). Depends on all crates.
 
@@ -20,5 +20,11 @@ Inference-first storage engine. Phase 2: Fjall persistence + WAL.
 - LogicalId is a String wrapper (user-provided or UUID v4)
 - Persistence: Fjall (LSM-based). Data dir default: ./trondb_data
 - WAL: MessagePack records, CRC32 verified, segment files. Dir: {data_dir}/wal/
-- Write path: WAL append → flush+fsync → apply to Fjall → ack
+- Write path: WAL append → flush+fsync → apply to Fjall + Location Table → ack
+- Location Table: DashMap-backed control fabric, always in RAM
+  - Tracks LocationDescriptor per representation (tier, state, encoding, node address)
+  - WAL-logged via RecordType::LocationUpdate (0x40)
+  - Periodically snapshotted to {data_dir}/location_table.snap
+  - Restored from snapshot + WAL replay on startup
+  - State machine: Clean → Dirty → Recomputing → Clean; Clean → Migrating → Clean
 - SEARCH is gated (returns UnsupportedOperation) until Phase 4
