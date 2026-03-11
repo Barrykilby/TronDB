@@ -42,6 +42,8 @@ pub enum Plan {
     InsertEdge(InsertEdgePlan),
     DeleteEdge(DeleteEdgePlan),
     Traverse(TraversePlan),
+    CreateAffinityGroup(CreateAffinityGroupPlan),
+    AlterEntityDropAffinity(AlterEntityDropAffinityPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,8 @@ pub struct InsertPlan {
     pub fields: Vec<String>,
     pub values: Vec<Literal>,
     pub vectors: Vec<(String, VectorLiteral)>,
+    pub collocate_with: Option<Vec<String>>,
+    pub affinity_group: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +114,16 @@ pub struct TraversePlan {
     pub from_id: String,
     pub depth: usize,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateAffinityGroupPlan {
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterEntityDropAffinityPlan {
+    pub entity_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +225,8 @@ pub fn plan(
             fields: s.fields.clone(),
             values: s.values.clone(),
             vectors: s.vectors.clone(),
+            collocate_with: s.collocate_with.clone(),
+            affinity_group: s.affinity_group.clone(),
         })),
 
         Statement::Fetch(s) => {
@@ -288,10 +304,13 @@ pub fn plan(
             Ok(Plan::Explain(Box::new(inner_plan)))
         }
 
-        // Routing statements — planning handled in Task 9
-        Statement::CreateAffinityGroup(_) | Statement::AlterEntityDropAffinity(_) => {
-            Err(EngineError::UnsupportedOperation("routing statements not yet planned".into()))
-        }
+        Statement::CreateAffinityGroup(s) => Ok(Plan::CreateAffinityGroup(
+            CreateAffinityGroupPlan { name: s.name.clone() }
+        )),
+
+        Statement::AlterEntityDropAffinity(s) => Ok(Plan::AlterEntityDropAffinity(
+            AlterEntityDropAffinityPlan { entity_id: s.entity_id.clone() }
+        )),
     }
 }
 

@@ -856,6 +856,26 @@ impl Executor {
                     },
                 })
             }
+
+            Plan::CreateAffinityGroup(_) | Plan::AlterEntityDropAffinity(_) => {
+                // These are handled by the routing layer, not the core executor.
+                // Return a simple acknowledgment.
+                Ok(QueryResult {
+                    columns: vec!["status".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("status".to_owned(), crate::types::Value::String("OK".into())),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Routing".into(),
+                    },
+                })
+            }
         }
     }
 
@@ -1208,6 +1228,18 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("strategy", "AdjacencyIndex".into()));
             props.push(("depth", p.depth.to_string()));
         }
+        Plan::CreateAffinityGroup(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "CREATE AFFINITY GROUP".into()));
+            props.push(("name", p.name.clone()));
+            props.push(("tier", "Routing".into()));
+        }
+        Plan::AlterEntityDropAffinity(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "ALTER ENTITY DROP AFFINITY".into()));
+            props.push(("entity_id", p.entity_id.clone()));
+            props.push(("tier", "Routing".into()));
+        }
     }
 
     props
@@ -1285,6 +1317,8 @@ mod tests {
             fields,
             values,
             vectors,
+            collocate_with: None,
+            affinity_group: None,
         }))
         .await
         .unwrap();
@@ -1570,6 +1604,8 @@ mod tests {
             fields: vec!["id".into()],
             values: vec![Literal::String("v1".into())],
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![1.0, 2.0]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await;
 
         assert!(result.is_err());
@@ -1607,6 +1643,8 @@ mod tests {
             fields: vec!["id".into()],
             values: vec![Literal::String("d1".into())],
             vectors: vec![("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.8), (42, 0.5)]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         // Verify SparseIndex contains the entry
@@ -1647,6 +1685,8 @@ mod tests {
             fields: vec!["id".into(), "city".into()],
             values: vec![Literal::String("v1".into()), Literal::String("London".into())],
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         // Verify FieldIndex contains the entry
@@ -1694,6 +1734,8 @@ mod tests {
             fields: vec!["id".into(), "city".into()],
             values: vec![Literal::String("v1".into()), Literal::String("London".into())],
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -1701,6 +1743,8 @@ mod tests {
             fields: vec!["id".into(), "city".into()],
             values: vec![Literal::String("v2".into()), Literal::String("Paris".into())],
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.4, 0.5, 0.6]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         // FETCH with FieldIndexLookup strategy
@@ -1742,6 +1786,8 @@ mod tests {
             fields: vec!["id".into()],
             values: vec![Literal::String("d1".into())],
             vectors: vec![("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.8), (42, 0.5)]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -1749,6 +1795,8 @@ mod tests {
             fields: vec!["id".into()],
             values: vec![Literal::String("d2".into())],
             vectors: vec![("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.3), (99, 0.9)]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         // SEARCH Sparse
@@ -1807,6 +1855,8 @@ mod tests {
                 ("embed".to_string(), VectorLiteral::Dense(vec![1.0, 0.0, 0.0])),
                 ("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.9)])),
             ],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -1817,6 +1867,8 @@ mod tests {
                 ("embed".to_string(), VectorLiteral::Dense(vec![0.0, 1.0, 0.0])),
                 ("keywords".to_string(), VectorLiteral::Sparse(vec![(2, 0.9)])),
             ],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         // SEARCH Hybrid
@@ -1869,6 +1921,8 @@ mod tests {
             fields: vec!["id".into(), "city".into()],
             values: vec![Literal::String("v1".into()), Literal::String("London".into())],
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -1876,6 +1930,8 @@ mod tests {
             fields: vec!["id".into(), "city".into()],
             values: vec![Literal::String("v2".into()), Literal::String("Paris".into())],
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.9, 0.1, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -1883,6 +1939,8 @@ mod tests {
             fields: vec!["id".into(), "city".into()],
             values: vec![Literal::String("v3".into()), Literal::String("London".into())],
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.8, 0.2, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
         })).await.unwrap();
 
         // SEARCH with pre-filter on city=London
