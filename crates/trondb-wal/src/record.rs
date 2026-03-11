@@ -22,6 +22,7 @@ pub enum RecordType {
     AffinityGroupCreate  = 0x60,
     AffinityGroupMember  = 0x61,
     AffinityGroupRemove  = 0x62,
+    TierMigration        = 0x70,
     Checkpoint           = 0xFF,
 }
 
