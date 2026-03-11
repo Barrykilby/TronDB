@@ -41,4 +41,45 @@ pub enum EngineError {
 
     #[error("edge type already exists: {0}")]
     EdgeTypeAlreadyExists(String),
+
+    #[error("duplicate index: {0}")]
+    DuplicateIndex(String),
+
+    #[error("duplicate representation: {0}")]
+    DuplicateRepresentation(String),
+
+    #[error("duplicate field: {0}")]
+    DuplicateField(String),
+
+    #[error("field not indexed (ScalarPreFilter requires index): {0}")]
+    FieldNotIndexed(String),
+
+    #[error("sparse vector required but collection has no sparse representation: {0}")]
+    SparseVectorRequired(String),
+
+    #[error("invalid field type for {field}: expected {expected}, got {got}")]
+    InvalidFieldType {
+        field: String,
+        expected: String,
+        got: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_display_messages() {
+        assert!(EngineError::DuplicateIndex("idx1".into()).to_string().contains("idx1"));
+        assert!(EngineError::DuplicateRepresentation("identity".into()).to_string().contains("identity"));
+        assert!(EngineError::DuplicateField("status".into()).to_string().contains("status"));
+        assert!(EngineError::FieldNotIndexed("city".into()).to_string().contains("city"));
+        assert!(EngineError::SparseVectorRequired("venues".into()).to_string().contains("venues"));
+        assert!(EngineError::InvalidFieldType {
+            field: "age".into(),
+            expected: "Int".into(),
+            got: "String".into(),
+        }.to_string().contains("age"));
+    }
 }
