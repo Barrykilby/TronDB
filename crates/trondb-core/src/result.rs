@@ -21,7 +21,7 @@ pub struct QueryStats {
     pub elapsed: Duration,
     pub entities_scanned: usize,
     pub mode: QueryMode,
-    pub tier: &'static str,
+    pub tier: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

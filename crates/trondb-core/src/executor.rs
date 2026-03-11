@@ -119,7 +119,7 @@ impl Executor {
                         elapsed: start.elapsed(),
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
-                        tier: "Fjall",
+                        tier: "Fjall".into(),
                     },
                 })
             }
@@ -222,7 +222,7 @@ impl Executor {
                         elapsed: start.elapsed(),
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
-                        tier: "Fjall",
+                        tier: "Fjall".into(),
                     },
                 })
             }
@@ -258,7 +258,7 @@ impl Executor {
                         elapsed: start.elapsed(),
                         entities_scanned: scanned,
                         mode: QueryMode::Deterministic,
-                        tier: "Fjall",
+                        tier: "Fjall".into(),
                     },
                 })
             }
@@ -276,7 +276,7 @@ impl Executor {
                         elapsed: start.elapsed(),
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
-                        tier: "Fjall",
+                        tier: "Fjall".into(),
                     },
                 })
             }
