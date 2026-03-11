@@ -138,7 +138,7 @@ fn select_fetch_strategy(
 ) -> FetchStrategy {
     if let (Some(WhereClause::Eq(field, _)), Some(schema)) = (filter, schema) {
         for idx in &schema.indexes {
-            if idx.fields.contains(field) {
+            if idx.fields.first().map(|f| f == field).unwrap_or(false) {
                 return FetchStrategy::FieldIndexLookup(idx.name.clone());
             }
         }

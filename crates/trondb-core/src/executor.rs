@@ -775,11 +775,17 @@ impl Executor {
                 // WAL: TxBegin -> EdgeDelete -> commit
                 let tx_id = self.wal.next_tx_id();
                 self.wal.append(RecordType::TxBegin, &p.edge_type, tx_id, 1, vec![]);
-                let payload = rmp_serde::to_vec_named(&serde_json::json!({
-                    "edge_type": p.edge_type,
-                    "from_id": p.from_id,
-                    "to_id": p.to_id,
-                }))
+                #[derive(serde::Serialize)]
+                struct EdgeDeletePayload<'a> {
+                    edge_type: &'a str,
+                    from_id: &'a str,
+                    to_id: &'a str,
+                }
+                let payload = rmp_serde::to_vec_named(&EdgeDeletePayload {
+                    edge_type: &p.edge_type,
+                    from_id: &p.from_id,
+                    to_id: &p.to_id,
+                })
                 .map_err(|e| EngineError::Storage(e.to_string()))?;
                 self.wal.append(RecordType::EdgeDelete, &p.edge_type, tx_id, 1, payload);
                 self.wal.commit(tx_id).await?;
