@@ -226,3 +226,198 @@ impl LocationTable {
         self.mutation_counter.load(Ordering::SeqCst)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_key(entity: &str, idx: u32) -> ReprKey {
+        ReprKey {
+            entity_id: LogicalId::from_string(entity),
+            repr_index: idx,
+        }
+    }
+
+    fn make_descriptor() -> LocationDescriptor {
+        LocationDescriptor {
+            tier: Tier::Fjall,
+            node_address: NodeAddress::localhost(),
+            state: LocState::Clean,
+            version: 1,
+            encoding: Encoding::Float32,
+        }
+    }
+
+    #[test]
+    fn register_and_get() {
+        let lt = LocationTable::new();
+        let key = make_key("e1", 0);
+        lt.register(key.clone(), make_descriptor());
+
+        let desc = lt.get(&key).expect("should exist");
+        assert_eq!(desc.tier, Tier::Fjall);
+        assert_eq!(desc.state, LocState::Clean);
+        assert_eq!(lt.len(), 1);
+    }
+
+    #[test]
+    fn register_upsert_overwrites() {
+        let lt = LocationTable::new();
+        let key = make_key("e1", 0);
+        lt.register(key.clone(), make_descriptor());
+
+        let mut updated = make_descriptor();
+        updated.version = 2;
+        updated.tier = Tier::Ram;
+        lt.register(key.clone(), updated);
+
+        let desc = lt.get(&key).unwrap();
+        assert_eq!(desc.tier, Tier::Ram);
+        assert_eq!(desc.version, 2);
+        assert_eq!(lt.len(), 1);
+    }
+
+    #[test]
+    fn get_entity_returns_all_reprs() {
+        let lt = LocationTable::new();
+        let eid = LogicalId::from_string("e1");
+        lt.register(make_key("e1", 0), make_descriptor());
+        lt.register(make_key("e1", 1), make_descriptor());
+        lt.register(make_key("e2", 0), make_descriptor());
+
+        let loc = lt.get_entity(&eid);
+        assert_eq!(loc.representations.len(), 2);
+        assert!(loc.representations.contains_key(&0));
+        assert!(loc.representations.contains_key(&1));
+    }
+
+    #[test]
+    fn get_entity_empty_for_unknown() {
+        let lt = LocationTable::new();
+        let loc = lt.get_entity(&LogicalId::from_string("nope"));
+        assert!(loc.representations.is_empty());
+    }
+
+    #[test]
+    fn remove_entity_clears_all_reprs() {
+        let lt = LocationTable::new();
+        lt.register(make_key("e1", 0), make_descriptor());
+        lt.register(make_key("e1", 1), make_descriptor());
+        lt.register(make_key("e2", 0), make_descriptor());
+
+        lt.remove_entity(&LogicalId::from_string("e1"));
+
+        assert!(lt.get(&make_key("e1", 0)).is_none());
+        assert!(lt.get(&make_key("e1", 1)).is_none());
+        assert!(lt.get(&make_key("e2", 0)).is_some());
+        assert_eq!(lt.len(), 1);
+    }
+
+    #[test]
+    fn valid_state_transitions() {
+        let lt = LocationTable::new();
+        let key = make_key("e1", 0);
+        lt.register(key.clone(), make_descriptor());
+
+        // Clean → Dirty
+        lt.transition(&key, LocState::Dirty).unwrap();
+        assert_eq!(lt.get(&key).unwrap().state, LocState::Dirty);
+
+        // Dirty → Recomputing
+        lt.transition(&key, LocState::Recomputing).unwrap();
+        assert_eq!(lt.get(&key).unwrap().state, LocState::Recomputing);
+
+        // Recomputing → Clean
+        lt.transition(&key, LocState::Clean).unwrap();
+        assert_eq!(lt.get(&key).unwrap().state, LocState::Clean);
+
+        // Clean → Migrating
+        lt.transition(&key, LocState::Migrating).unwrap();
+        assert_eq!(lt.get(&key).unwrap().state, LocState::Migrating);
+
+        // Migrating → Clean
+        lt.transition(&key, LocState::Clean).unwrap();
+        assert_eq!(lt.get(&key).unwrap().state, LocState::Clean);
+    }
+
+    #[test]
+    fn invalid_state_transition_errors() {
+        let lt = LocationTable::new();
+        let key = make_key("e1", 0);
+        lt.register(key.clone(), make_descriptor());
+
+        // Clean → Recomputing (invalid)
+        assert!(lt.transition(&key, LocState::Recomputing).is_err());
+        // Clean → Clean (invalid — no self-transitions)
+        assert!(lt.transition(&key, LocState::Clean).is_err());
+    }
+
+    #[test]
+    fn transition_nonexistent_key_errors() {
+        let lt = LocationTable::new();
+        let key = make_key("nope", 0);
+        assert!(lt.transition(&key, LocState::Dirty).is_err());
+    }
+
+    #[test]
+    fn update_tier() {
+        let lt = LocationTable::new();
+        let key = make_key("e1", 0);
+        lt.register(key.clone(), make_descriptor());
+
+        lt.update_tier(&key, Tier::NVMe, Encoding::Int8).unwrap();
+        let desc = lt.get(&key).unwrap();
+        assert_eq!(desc.tier, Tier::NVMe);
+        assert_eq!(desc.encoding, Encoding::Int8);
+        assert_eq!(desc.version, 2);
+    }
+
+    #[test]
+    fn update_tier_nonexistent_errors() {
+        let lt = LocationTable::new();
+        assert!(lt
+            .update_tier(&make_key("nope", 0), Tier::Ram, Encoding::Float32)
+            .is_err());
+    }
+
+    #[test]
+    fn transition_increments_version() {
+        let lt = LocationTable::new();
+        let key = make_key("e1", 0);
+        lt.register(key.clone(), make_descriptor());
+
+        lt.transition(&key, LocState::Dirty).unwrap();
+        assert_eq!(lt.get(&key).unwrap().version, 2);
+
+        lt.transition(&key, LocState::Recomputing).unwrap();
+        assert_eq!(lt.get(&key).unwrap().version, 3);
+    }
+
+    #[test]
+    fn mutation_counter_tracks_changes() {
+        let lt = LocationTable::new();
+        assert_eq!(lt.mutation_counter(), 0);
+
+        lt.register(make_key("e1", 0), make_descriptor());
+        assert!(lt.mutation_counter() > 0);
+
+        let before = lt.mutation_counter();
+        lt.transition(&make_key("e1", 0), LocState::Dirty).unwrap();
+        assert!(lt.mutation_counter() > before);
+    }
+
+    #[test]
+    fn node_address_localhost() {
+        let addr = NodeAddress::localhost();
+        assert_eq!(addr.host, "localhost");
+        assert_eq!(addr.port, 0);
+    }
+
+    #[test]
+    fn tier_as_str() {
+        assert_eq!(Tier::Fjall.as_str(), "Fjall");
+        assert_eq!(Tier::Ram.as_str(), "Ram");
+        assert_eq!(Tier::NVMe.as_str(), "NVMe");
+        assert_eq!(Tier::Archive.as_str(), "Archive");
+    }
+}
