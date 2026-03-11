@@ -302,6 +302,14 @@ impl Engine {
             idx.insert(entity_id, vector);
         }
     }
+
+    pub fn list_edge_types(&self) -> Vec<crate::edge::EdgeType> {
+        self.executor.list_edge_types()
+    }
+
+    pub fn scan_edges(&self, edge_type: &str) -> Result<Vec<crate::edge::Edge>, EngineError> {
+        self.executor.scan_edges(edge_type)
+    }
 }
 
 // ---------------------------------------------------------------------------

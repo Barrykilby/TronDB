@@ -6,6 +6,7 @@ pub mod health;
 pub mod migrator;
 pub mod node;
 pub mod router;
+pub mod sweeper;
 
 pub use affinity::{AffinityGroup, AffinityIndex, AffinitySource};
 pub use config::{ColocationConfig, HealthConfig, RouterConfig};
