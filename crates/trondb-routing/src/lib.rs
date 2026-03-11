@@ -4,6 +4,7 @@ pub mod error;
 pub mod eviction;
 pub mod health;
 pub mod node;
+pub mod router;
 
 pub use affinity::{AffinityGroup, AffinityIndex, AffinitySource};
 pub use config::{ColocationConfig, HealthConfig, RouterConfig};
@@ -13,4 +14,9 @@ pub use health::{compute_load_score, HealthCache, HealthSignal, NodeStatus};
 pub use node::{
     AffinityGroupId, EntityId, LocalNode, NodeHandle, NodeId, NodeRole,
     QueryVerb, RoutingStrategy, SimulatedNode,
+};
+pub use router::{
+    AnnotatedPlan, RoutingDecision, ScoredCandidate,
+    estimate_acu, entity_affinity_score, plan_verb, plan_targets,
+    routing_score, verb_fit_score,
 };
