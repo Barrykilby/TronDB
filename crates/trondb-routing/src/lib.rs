@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod eviction;
 pub mod health;
+pub mod migrator;
 pub mod node;
 pub mod router;
 
