@@ -2695,4 +2695,273 @@ mod tests {
 
         assert_eq!(result.rows.len(), 3); // b, c, d
     }
+
+    #[tokio::test]
+    async fn traverse_cycle_detection() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a "name" TEXT field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Insert 3 people: a, b, c
+        for (id, name) in [("a", "Alice"), ("b", "Bob"), ("c", "Carol")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        // Create edge type
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Build cycle: a→b→c→a
+        for (from, to) in [("a", "b"), ("b", "c"), ("c", "a")] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "knows".into(),
+                from_id: from.into(),
+                to_id: to.into(),
+                metadata: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Traverse from a with DEPTH 10 — should not loop, start node excluded
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 10,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2); // b, c — no infinite loop, a excluded
+    }
+
+    #[tokio::test]
+    async fn traverse_depth_1_single_hop() {
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Insert chain: a→b→c
+        for (id, name) in [("a", "Alice"), ("b", "Bob"), ("c", "Carol")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+        }))
+        .await
+        .unwrap();
+
+        for (from, to) in [("a", "b"), ("b", "c")] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "knows".into(),
+                from_id: from.into(),
+                to_id: to.into(),
+                metadata: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Traverse from a with DEPTH 1 — should return only b
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 1,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1); // b only
+    }
+
+    #[tokio::test]
+    async fn traverse_with_limit() {
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Fan-out: a→b, a→c, a→d
+        for (id, name) in [("a", "Alice"), ("b", "Bob"), ("c", "Carol"), ("d", "Dave")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+        }))
+        .await
+        .unwrap();
+
+        for to in ["b", "c", "d"] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                to_id: to.into(),
+                metadata: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Traverse from a with DEPTH 1 LIMIT 2 — should return exactly 2
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 1,
+                limit: Some(2),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn traverse_depth_exceeds_graph() {
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Only a→b, no further edges
+        for (id, name) in [("a", "Alice"), ("b", "Bob")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "a".into(),
+            to_id: "b".into(),
+            metadata: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Traverse from a with DEPTH 10 — should return just b, no error
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 10,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1); // just b
+    }
 }
