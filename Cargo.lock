@@ -1359,6 +1359,7 @@ dependencies = [
  "rustyline",
  "tokio",
  "trondb-core",
+ "trondb-routing",
  "trondb-tql",
  "trondb-wal",
 ]
@@ -1389,6 +1390,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dashmap",
+ "rmp-serde",
  "serde",
  "tempfile",
  "thiserror 2.0.18",

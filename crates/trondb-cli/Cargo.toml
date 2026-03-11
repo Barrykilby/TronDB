@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 trondb-core = { path = "../trondb-core" }
+trondb-routing = { path = "../trondb-routing" }
 trondb-tql = { path = "../trondb-tql" }
 trondb-wal = { path = "../trondb-wal" }
 comfy-table.workspace = true

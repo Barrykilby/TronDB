@@ -1,10 +1,14 @@
 mod display;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use trondb_core::{Engine, EngineConfig};
+use trondb_routing::node::{LocalNode, NodeId};
+use trondb_routing::router::SemanticRouter;
+use trondb_routing::RouterConfig;
 use trondb_wal::WalConfig;
 
 #[tokio::main]
@@ -29,12 +33,16 @@ async fn main() {
     println!("Type .help for commands, or enter TQL statements ending with ;\n");
 
     let engine = match Engine::open(config).await {
-        Ok(e) => e,
+        Ok(e) => Arc::new(e),
         Err(e) => {
             eprintln!("Failed to open engine: {e}");
             std::process::exit(1);
         }
     };
+
+    let local_node = Arc::new(LocalNode::new(engine.clone(), NodeId::from_string("local")))
+        as Arc<dyn trondb_routing::NodeHandle>;
+    let router = SemanticRouter::new(vec![local_node], RouterConfig::default());
 
     let mut rl = DefaultEditor::new().expect("failed to create editor");
     let mut buffer = String::new();
@@ -67,8 +75,11 @@ async fn main() {
 
                 let _ = rl.add_history_entry(&input);
 
-                match engine.execute_tql(&input).await {
-                    Ok(result) => println!("{}", display::format_result(&result)),
+                match engine.parse_and_plan(&input) {
+                    Ok(plan) => match router.route_and_execute(&plan).await {
+                        Ok(result) => println!("{}", display::format_result(&result)),
+                        Err(e) => eprintln!("Error: {e}"),
+                    },
                     Err(e) => eprintln!("Error: {e}"),
                 }
             }
