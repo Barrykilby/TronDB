@@ -163,6 +163,7 @@ impl Engine {
                         &edge.edge_type,
                         &edge.to_id,
                         edge.confidence,
+                        edge.created_at,
                     );
                 }
             }

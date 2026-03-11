@@ -16,6 +16,8 @@ pub struct Edge {
     pub edge_type: String,
     pub confidence: f32,
     pub metadata: HashMap<String, Value>,
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +56,7 @@ pub enum DecayFn {
 pub struct AdjEntry {
     pub to_id: LogicalId,
     pub confidence: f32,
+    pub created_at: u64,
 }
 
 pub struct AdjacencyIndex {
@@ -69,11 +72,12 @@ impl AdjacencyIndex {
         }
     }
 
-    pub fn insert(&self, from_id: &LogicalId, edge_type: &str, to_id: &LogicalId, confidence: f32) {
+    pub fn insert(&self, from_id: &LogicalId, edge_type: &str, to_id: &LogicalId, confidence: f32, created_at: u64) {
         let key = (from_id.clone(), edge_type.to_string());
         let entry = AdjEntry {
             to_id: to_id.clone(),
             confidence,
+            created_at,
         };
         self.forward
             .entry(key)
@@ -187,8 +191,8 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
-        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0);
 
         let results = idx.get(&make_id("v1"), "knows");
         assert_eq!(results.len(), 2);
@@ -204,8 +208,8 @@ mod tests {
     #[test]
     fn remove_edge() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
-        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0);
 
         idx.remove(&make_id("v1"), "knows", &make_id("v2"));
         let results = idx.get(&make_id("v1"), "knows");
@@ -216,7 +220,7 @@ mod tests {
     #[test]
     fn remove_last_edge_cleans_key() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
         idx.remove(&make_id("v1"), "knows", &make_id("v2"));
         assert!(idx.is_empty());
     }
@@ -224,8 +228,8 @@ mod tests {
     #[test]
     fn different_edge_types_separate() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
-        idx.insert(&make_id("v1"), "likes", &make_id("v3"), 0.8);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
+        idx.insert(&make_id("v1"), "likes", &make_id("v3"), 0.8, 0);
 
         assert_eq!(idx.get(&make_id("v1"), "knows").len(), 1);
         assert_eq!(idx.get(&make_id("v1"), "likes").len(), 1);
@@ -234,16 +238,16 @@ mod tests {
     #[test]
     fn len_counts_all_edges() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
-        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0);
-        idx.insert(&make_id("v2"), "likes", &make_id("v1"), 0.5);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0);
+        idx.insert(&make_id("v2"), "likes", &make_id("v1"), 0.5, 0);
         assert_eq!(idx.len(), 3);
     }
 
     #[test]
     fn backward_index_populated_on_insert() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
         let backwards = idx.get_backward(&make_id("v2"), "knows");
         assert_eq!(backwards.len(), 1);
         assert_eq!(backwards[0], make_id("v1"));
@@ -252,7 +256,7 @@ mod tests {
     #[test]
     fn backward_index_remove() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
         idx.remove(&make_id("v1"), "knows", &make_id("v2"));
         let backwards = idx.get_backward(&make_id("v2"), "knows");
         assert!(backwards.is_empty());
@@ -261,12 +265,60 @@ mod tests {
     #[test]
     fn edges_involving_entity() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
-        idx.insert(&make_id("v3"), "knows", &make_id("v1"), 1.0);
-        idx.insert(&make_id("v1"), "likes", &make_id("v4"), 1.0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
+        idx.insert(&make_id("v3"), "knows", &make_id("v1"), 1.0, 0);
+        idx.insert(&make_id("v1"), "likes", &make_id("v4"), 1.0, 0);
 
         let (forward, backward) = idx.edges_involving(&make_id("v1"));
         assert_eq!(forward.len(), 2); // knows->v2, likes->v4
         assert_eq!(backward.len(), 1); // v3->knows->v1
+    }
+
+    #[test]
+    fn edge_created_at_default_zero() {
+        let edge = Edge {
+            from_id: make_id("a"),
+            to_id: make_id("b"),
+            edge_type: "knows".into(),
+            confidence: 1.0,
+            metadata: HashMap::new(),
+            created_at: 0,
+        };
+        let bytes = rmp_serde::to_vec_named(&edge).unwrap();
+        let restored: Edge = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.created_at, 0);
+    }
+
+    #[test]
+    fn edge_deserialize_without_created_at() {
+        // Simulate an old edge without created_at by serializing a struct
+        // that lacks the field, then deserializing as Edge
+        #[derive(Serialize)]
+        struct OldEdge {
+            from_id: LogicalId,
+            to_id: LogicalId,
+            edge_type: String,
+            confidence: f32,
+            metadata: HashMap<String, Value>,
+        }
+        let old = OldEdge {
+            from_id: make_id("a"),
+            to_id: make_id("b"),
+            edge_type: "knows".into(),
+            confidence: 1.0,
+            metadata: HashMap::new(),
+        };
+        let bytes = rmp_serde::to_vec_named(&old).unwrap();
+        let restored: Edge = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.created_at, 0);
+    }
+
+    #[test]
+    fn adj_entry_stores_created_at() {
+        let idx = AdjacencyIndex::new();
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 42);
+        let results = idx.get(&make_id("v1"), "knows");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].created_at, 42);
     }
 }

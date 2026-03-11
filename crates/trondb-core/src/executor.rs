@@ -770,12 +770,18 @@ impl Executor {
                     metadata.insert(key.clone(), literal_to_value(lit));
                 }
 
+                let now_millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
                 let edge = Edge {
                     from_id: from_id.clone(),
                     to_id: to_id.clone(),
                     edge_type: p.edge_type.clone(),
                     confidence: 1.0,
                     metadata,
+                    created_at: now_millis,
                 };
 
                 // WAL: TxBegin -> EdgeWrite -> commit
@@ -791,7 +797,7 @@ impl Executor {
                 self.store.persist()?;
 
                 // Apply to AdjacencyIndex
-                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0);
+                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0, now_millis);
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
