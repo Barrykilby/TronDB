@@ -898,6 +898,30 @@ impl Executor {
                             if visited.contains(&entry.to_id) {
                                 continue;
                             }
+
+                            // Apply edge decay if edge type has decay config
+                            let effective_conf = if entry.created_at > 0 {
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as u64;
+                                let elapsed = now_ms.saturating_sub(entry.created_at);
+                                crate::edge::effective_confidence(
+                                    entry.confidence,
+                                    elapsed,
+                                    &edge_type.decay_config,
+                                )
+                            } else {
+                                entry.confidence
+                            };
+
+                            // Skip edges below prune threshold
+                            if let Some(prune) = edge_type.decay_config.prune_threshold {
+                                if effective_conf < prune as f32 {
+                                    continue;
+                                }
+                            }
+
                             visited.insert(entry.to_id.clone());
 
                             if let Ok(entity) = self.store.get(&edge_type.to_collection, &entry.to_id) {

@@ -49,6 +49,38 @@ pub enum DecayFn {
 }
 
 // ---------------------------------------------------------------------------
+// Decay computation
+// ---------------------------------------------------------------------------
+
+/// Compute effective confidence after decay.
+/// `base_confidence`: original confidence (typically 1.0)
+/// `elapsed_millis`: time since edge creation in milliseconds
+/// `config`: the edge type's decay configuration
+pub fn effective_confidence(base_confidence: f32, elapsed_millis: u64, config: &DecayConfig) -> f32 {
+    if elapsed_millis == 0 || config.decay_fn.is_none() {
+        return base_confidence;
+    }
+
+    let elapsed_secs = elapsed_millis as f64 / 1000.0;
+    let rate = config.decay_rate.unwrap_or(0.0);
+    let floor = config.floor.unwrap_or(0.0);
+
+    let decayed = match config.decay_fn.as_ref().unwrap() {
+        DecayFn::Exponential => (base_confidence as f64) * (-rate * elapsed_secs).exp(),
+        DecayFn::Linear => (base_confidence as f64) * (1.0 - rate * elapsed_secs),
+        DecayFn::Step => {
+            if elapsed_secs > rate {
+                floor
+            } else {
+                base_confidence as f64
+            }
+        }
+    };
+
+    decayed.max(floor).min(1.0) as f32
+}
+
+// ---------------------------------------------------------------------------
 // AdjacencyIndex — RAM index for fast TRAVERSE
 // ---------------------------------------------------------------------------
 
@@ -320,5 +352,83 @@ mod tests {
         let results = idx.get(&make_id("v1"), "knows");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].created_at, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Decay function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exponential_decay() {
+        let config = DecayConfig {
+            decay_fn: Some(DecayFn::Exponential),
+            decay_rate: Some(0.001),
+            floor: Some(0.1),
+            promote_threshold: None,
+            prune_threshold: Some(0.05),
+        };
+        // After 1000 seconds: e^(-0.001 * 1000) = e^(-1) ≈ 0.368
+        let result = effective_confidence(1.0, 1_000_000, &config);
+        assert!((result - 0.368).abs() < 0.01);
+    }
+
+    #[test]
+    fn linear_decay() {
+        let config = DecayConfig {
+            decay_fn: Some(DecayFn::Linear),
+            decay_rate: Some(0.001),
+            floor: Some(0.1),
+            promote_threshold: None,
+            prune_threshold: None,
+        };
+        // After 500 seconds: 1.0 * (1 - 0.001 * 500) = 0.5
+        let result = effective_confidence(1.0, 500_000, &config);
+        assert!((result - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn linear_decay_respects_floor() {
+        let config = DecayConfig {
+            decay_fn: Some(DecayFn::Linear),
+            decay_rate: Some(0.01),
+            floor: Some(0.2),
+            promote_threshold: None,
+            prune_threshold: None,
+        };
+        let result = effective_confidence(1.0, 1_000_000, &config);
+        assert!((result - 0.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn step_decay() {
+        let config = DecayConfig {
+            decay_fn: Some(DecayFn::Step),
+            decay_rate: Some(3600.0), // threshold: 3600 seconds
+            floor: Some(0.1),
+            promote_threshold: None,
+            prune_threshold: None,
+        };
+        assert!((effective_confidence(1.0, 1_000_000, &config) - 1.0).abs() < 0.01); // Before threshold
+        assert!((effective_confidence(1.0, 5_000_000, &config) - 0.1).abs() < 0.01); // After threshold
+    }
+
+    #[test]
+    fn no_decay_config_returns_original() {
+        let config = DecayConfig::default();
+        let result = effective_confidence(1.0, 999_999_999, &config);
+        assert!((result - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn zero_elapsed_no_decay() {
+        let config = DecayConfig {
+            decay_fn: Some(DecayFn::Exponential),
+            decay_rate: Some(0.1),
+            floor: Some(0.0),
+            promote_threshold: None,
+            prune_threshold: None,
+        };
+        let result = effective_confidence(1.0, 0, &config);
+        assert!((result - 1.0).abs() < 0.001);
     }
 }
