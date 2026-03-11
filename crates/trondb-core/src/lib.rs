@@ -1228,4 +1228,37 @@ mod tests {
         let result = engine.execute_tql("UPDATE 'nonexistent' IN venues SET name = 'X';").await;
         assert!(result.is_err(), "updating nonexistent entity should error");
     }
+
+    #[tokio::test]
+    async fn wal_replay_entity_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        // Insert then delete
+        {
+            let engine = Engine::open(config.clone()).await.unwrap();
+            engine.execute_tql(
+                "CREATE COLLECTION venues (\
+                    REPRESENTATION default DIMENSIONS 3 METRIC COSINE\
+                );"
+            ).await.unwrap();
+            engine.execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'Test') \
+                 REPRESENTATION default VECTOR [1.0, 0.0, 0.0];"
+            ).await.unwrap();
+            engine.execute_tql("DELETE 'v1' FROM venues;").await.unwrap();
+        }
+
+        // Reopen — WAL replay should process the EntityDelete
+        let engine = Engine::open(config).await.unwrap();
+        let result = engine.execute_tql("FETCH * FROM venues;").await.unwrap();
+        assert_eq!(result.rows.len(), 0, "entity should not exist after WAL replay of delete");
+    }
 }

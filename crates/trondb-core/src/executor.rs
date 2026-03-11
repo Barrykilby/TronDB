@@ -83,7 +83,25 @@ impl Executor {
                     }
                 }
                 RecordType::EntityDelete => {
-                    // Phase 2 doesn't support DELETE yet, but handle for completeness
+                    #[derive(serde::Deserialize)]
+                    struct EntityDeletePayload {
+                        entity_id: String,
+                        collection: String,
+                    }
+                    let payload: EntityDeletePayload = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    let entity_id = LogicalId::from_string(&payload.entity_id);
+
+                    // Delete from main Fjall partition
+                    if self.store.has_collection(&payload.collection) {
+                        let _ = self.store.delete_entity(&payload.collection, &entity_id);
+                    }
+                    // Clean up tiered storage partitions
+                    let _ = self.store.delete_from_tier(&payload.collection, &entity_id, Tier::NVMe);
+                    let _ = self.store.delete_from_tier(&payload.collection, &entity_id, Tier::Archive);
+                    // Location table cleanup
+                    self.location.remove_entity(&entity_id);
+                    replayed += 1;
                 }
                 RecordType::LocationUpdate => {
                     let (key, desc): (ReprKey, LocationDescriptor) =
