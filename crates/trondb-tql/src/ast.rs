@@ -7,6 +7,7 @@ pub enum Statement {
     Explain(Box<Statement>),
     CreateEdgeType(CreateEdgeTypeStmt),
     InsertEdge(InsertEdgeStmt),
+    Delete(DeleteStmt),
     DeleteEdge(DeleteEdgeStmt),
     Traverse(TraverseStmt),
     CreateAffinityGroup(CreateAffinityGroupStmt),
@@ -149,6 +150,12 @@ pub struct InsertEdgeStmt {
     pub from_id: String,
     pub to_id: String,
     pub metadata: Vec<(String, Literal)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStmt {
+    pub entity_id: String,
+    pub collection: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

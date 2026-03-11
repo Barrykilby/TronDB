@@ -41,6 +41,7 @@ pub enum Plan {
     Explain(Box<Plan>),
     CreateEdgeType(CreateEdgeTypePlan),
     InsertEdge(InsertEdgePlan),
+    DeleteEntity(DeleteEntityPlan),
     DeleteEdge(DeleteEdgePlan),
     Traverse(TraversePlan),
     CreateAffinityGroup(CreateAffinityGroupPlan),
@@ -103,6 +104,12 @@ pub struct InsertEdgePlan {
     pub from_id: String,
     pub to_id: String,
     pub metadata: Vec<(String, trondb_tql::Literal)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteEntityPlan {
+    pub entity_id: String,
+    pub collection: String,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +322,11 @@ pub fn plan(
             from_id: s.from_id.clone(),
             to_id: s.to_id.clone(),
             metadata: s.metadata.clone(),
+        })),
+
+        Statement::Delete(s) => Ok(Plan::DeleteEntity(DeleteEntityPlan {
+            entity_id: s.entity_id.clone(),
+            collection: s.collection.clone(),
         })),
 
         Statement::DeleteEdge(s) => Ok(Plan::DeleteEdge(DeleteEdgePlan {

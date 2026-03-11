@@ -962,6 +962,11 @@ impl Executor {
                 })
             }
 
+            Plan::DeleteEntity(_) => {
+                // TODO(task-10): implement entity deletion in executor
+                Err(EngineError::UnsupportedOperation("DELETE entity not yet implemented".into()))
+            }
+
             Plan::ExplainTiers(ref p) => {
                 let start = std::time::Instant::now();
                 let hot = self.store.tier_entity_count(&p.collection, Tier::Fjall).unwrap_or(0);
@@ -1427,6 +1432,12 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
         Plan::Promote(_) => {
             props.push(("operation", "Promote".into()));
             props.push(("tier", "Routing".into()));
+        }
+        Plan::DeleteEntity(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "DELETE".into()));
+            props.push(("collection", p.collection.clone()));
+            props.push(("tier", "Fjall".into()));
         }
         Plan::ExplainTiers(_) => {
             props.push(("operation", "ExplainTiers".into()));

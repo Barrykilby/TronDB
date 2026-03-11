@@ -455,7 +455,15 @@ impl Parser {
 
     fn parse_delete(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // DELETE
-        self.expect(&Token::Edge)?;
+        if self.peek() == Some(&Token::Edge) {
+            self.parse_delete_edge()
+        } else {
+            self.parse_delete_entity()
+        }
+    }
+
+    fn parse_delete_edge(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // EDGE
         let edge_type = self.expect_ident()?;
         self.expect(&Token::From)?;
         let from_id = self.expect_string_lit()?;
@@ -466,6 +474,17 @@ impl Parser {
             edge_type,
             from_id,
             to_id,
+        }))
+    }
+
+    fn parse_delete_entity(&mut self) -> Result<Statement, ParseError> {
+        let entity_id = self.expect_string_lit()?;
+        self.expect(&Token::From)?;
+        let collection = self.expect_ident()?;
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::Delete(DeleteStmt {
+            entity_id,
+            collection,
         }))
     }
 
@@ -1094,6 +1113,18 @@ mod tests {
                 to_id: "v2".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn parse_delete_entity() {
+        let stmt = parse("DELETE 'e1' FROM venues;").unwrap();
+        match stmt {
+            Statement::Delete(d) => {
+                assert_eq!(d.entity_id, "e1");
+                assert_eq!(d.collection, "venues");
+            }
+            _ => panic!("expected Delete"),
+        }
     }
 
     #[test]
