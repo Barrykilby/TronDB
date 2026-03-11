@@ -14,3 +14,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+trondb-wal = { path = "../trondb-wal" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

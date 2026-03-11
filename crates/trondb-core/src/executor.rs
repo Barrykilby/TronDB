@@ -859,6 +859,14 @@ impl Executor {
         }
     }
 
+    pub fn entity_count(&self) -> usize {
+        self.store.entity_count()
+    }
+
+    pub fn collection_count(&self) -> usize {
+        self.schemas.len()
+    }
+
     pub fn collections(&self) -> Vec<String> {
         self.store.list_collections()
     }

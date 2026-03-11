@@ -6,4 +6,7 @@ pub mod node;
 pub use config::{ColocationConfig, HealthConfig, RouterConfig};
 pub use error::RouterError;
 pub use health::{compute_load_score, HealthCache, HealthSignal, NodeStatus};
-pub use node::{AffinityGroupId, EntityId, NodeId, NodeRole, QueryVerb, RoutingStrategy};
+pub use node::{
+    AffinityGroupId, EntityId, LocalNode, NodeHandle, NodeId, NodeRole,
+    QueryVerb, RoutingStrategy, SimulatedNode,
+};

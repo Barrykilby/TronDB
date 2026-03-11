@@ -201,6 +201,26 @@ impl Engine {
         })
     }
 
+    pub fn entity_count(&self) -> usize {
+        self.executor.entity_count()
+    }
+
+    pub fn collection_count(&self) -> usize {
+        self.executor.collection_count()
+    }
+
+    /// Execute a pre-planned query. Used by the routing layer.
+    pub async fn execute(&self, plan: &planner::Plan) -> Result<QueryResult, EngineError> {
+        self.executor.execute(plan).await
+    }
+
+    /// Parse TQL and produce a Plan without executing.
+    pub fn parse_and_plan(&self, tql: &str) -> Result<planner::Plan, EngineError> {
+        let stmt = trondb_tql::parse(tql)
+            .map_err(|e| EngineError::InvalidQuery(e.to_string()))?;
+        planner::plan(&stmt, self.executor.schemas())
+    }
+
     pub async fn execute_tql(&self, input: &str) -> Result<QueryResult, EngineError> {
         let stmt =
             trondb_tql::parse(input).map_err(|e| EngineError::InvalidQuery(e.to_string()))?;

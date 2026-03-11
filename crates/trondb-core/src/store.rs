@@ -279,6 +279,20 @@ impl FjallStore {
             .persist(PersistMode::SyncAll)
             .map_err(|e| EngineError::Storage(e.to_string()))
     }
+
+    /// Returns the total number of entities across all collections.
+    pub fn entity_count(&self) -> usize {
+        let mut count = 0;
+        for name in self.list_collections() {
+            if let Ok(partition) = self
+                .keyspace
+                .open_partition(&name, PartitionCreateOptions::default())
+            {
+                count += partition.prefix(ENTITY_PREFIX).count();
+            }
+        }
+        count
+    }
 }
 
 #[cfg(test)]
