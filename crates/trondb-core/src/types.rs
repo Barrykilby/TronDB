@@ -154,7 +154,7 @@ impl Entity {
 // VectorData — dense or sparse vector payload
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum VectorData {
     Dense(Vec<f32>),
     Sparse(Vec<(u32, f32)>),
@@ -164,21 +164,15 @@ pub enum VectorData {
 // Schema types — Phase 5a collection schema
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Metric {
+    #[default]
     Cosine,
     InnerProduct,
 }
 
-impl Default for Metric {
-    fn default() -> Self {
-        Metric::Cosine
-    }
-}
-
-/// Field type for schema declarations. Uses the canonical name `FieldType`
-/// from the spec. The old `FieldType` in types.rs is renamed to `LegacyFieldType`
-/// in this same task to avoid collision. `LegacyFieldType` is removed in Task 8.
+/// Field type for schema declarations (Phase 5a).
+/// Replaces the legacy `LegacyFieldType` enum, which is removed in Task 8.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldType {
     Text,
