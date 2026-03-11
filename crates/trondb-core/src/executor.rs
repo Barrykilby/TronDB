@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::error::EngineError;
+use crate::location::{
+    Encoding, LocState, LocationDescriptor, LocationTable, NodeAddress, ReprKey, Tier,
+};
 use crate::planner::Plan;
 use crate::result::{QueryMode, QueryResult, QueryStats, Row};
 use crate::store::FjallStore;
@@ -16,11 +19,12 @@ use trondb_wal::{RecordType, WalRecord, WalWriter};
 pub struct Executor {
     store: FjallStore,
     wal: WalWriter,
+    location: LocationTable,
 }
 
 impl Executor {
-    pub fn new(store: FjallStore, wal: WalWriter) -> Self {
-        Self { store, wal }
+    pub fn new(store: FjallStore, wal: WalWriter, location: LocationTable) -> Self {
+        Self { store, wal, location }
     }
 
     /// Replay committed WAL records into the Fjall store.
@@ -57,6 +61,13 @@ impl Executor {
                 }
                 RecordType::EntityDelete => {
                     // Phase 2 doesn't support DELETE yet, but handle for completeness
+                }
+                RecordType::LocationUpdate => {
+                    let (key, desc): (ReprKey, LocationDescriptor) =
+                        rmp_serde::from_slice(&record.payload)
+                            .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    self.location.register(key, desc);
+                    replayed += 1;
                 }
                 _ => {
                     // Other record types (ReprWrite, EdgeWrite, etc.) are future phases
@@ -149,18 +160,54 @@ impl Executor {
                     entity.representations.push(repr);
                 }
 
-                // WAL: TX_BEGIN → ENTITY_WRITE → commit
+                // WAL: TX_BEGIN → ENTITY_WRITE → LOCATION_UPDATE(s) → commit
                 let tx_id = self.wal.next_tx_id();
                 self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
 
                 let entity_payload = rmp_serde::to_vec_named(&entity)
                     .map_err(|e| EngineError::Storage(e.to_string()))?;
                 self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, entity_payload);
+
+                // LocationUpdate for each representation
+                for (idx, _repr) in entity.representations.iter().enumerate() {
+                    let loc_key = ReprKey {
+                        entity_id: id.clone(),
+                        repr_index: idx as u32,
+                    };
+                    let loc_desc = LocationDescriptor {
+                        tier: Tier::Fjall,
+                        node_address: NodeAddress::localhost(),
+                        state: LocState::Clean,
+                        version: 1,
+                        encoding: Encoding::Float32,
+                    };
+                    let loc_payload = rmp_serde::to_vec_named(&(&loc_key, &loc_desc))
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    self.wal.append(RecordType::LocationUpdate, &p.collection, tx_id, 1, loc_payload);
+                }
+
                 self.wal.commit(tx_id).await?;
 
-                // Apply to Fjall and persist
-                self.store.insert(&p.collection, entity)?;
+                // Apply to Fjall
+                self.store.insert(&p.collection, entity.clone())?;
                 self.store.persist()?;
+
+                // Apply to Location Table
+                for (idx, _repr) in entity.representations.iter().enumerate() {
+                    self.location.register(
+                        ReprKey {
+                            entity_id: id.clone(),
+                            repr_index: idx as u32,
+                        },
+                        LocationDescriptor {
+                            tier: Tier::Fjall,
+                            node_address: NodeAddress::localhost(),
+                            state: LocState::Clean,
+                            version: 1,
+                            encoding: Encoding::Float32,
+                        },
+                    );
+                }
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
@@ -238,6 +285,14 @@ impl Executor {
 
     pub fn collections(&self) -> Vec<String> {
         self.store.list_collections()
+    }
+
+    pub fn location(&self) -> &LocationTable {
+        &self.location
+    }
+
+    pub fn wal_head_lsn(&self) -> u64 {
+        self.wal.head_lsn()
     }
 }
 
@@ -444,6 +499,7 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::location::LocationTable;
     use crate::planner::{CreateCollectionPlan, FetchPlan, InsertPlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
@@ -456,7 +512,7 @@ mod tests {
             ..Default::default()
         };
         let wal = WalWriter::open(wal_config).await.unwrap();
-        (Executor::new(store, wal), dir)
+        (Executor::new(store, wal, LocationTable::new()), dir)
     }
 
     async fn create_collection(exec: &Executor, name: &str, dims: usize) {

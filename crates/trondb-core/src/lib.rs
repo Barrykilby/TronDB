@@ -32,12 +32,32 @@ impl Engine {
     pub async fn open(config: EngineConfig) -> Result<Self, EngineError> {
         let store = FjallStore::open(&config.data_dir)?;
 
-        // Replay committed WAL records into Fjall before accepting queries
+        // Load Location Table from snapshot if available
+        let snap_path = config.data_dir.join("location_table.snap");
+        let (location, snap_lsn) = if snap_path.exists() {
+            let bytes = tokio::fs::read(&snap_path).await
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+            let (lt, lsn) = location::LocationTable::restore(&bytes)?;
+            eprintln!("Location Table: restored {} entries from snapshot (LSN {lsn})", lt.len());
+            (lt, lsn)
+        } else {
+            (location::LocationTable::new(), 0)
+        };
+
+        // Replay committed WAL records
         let recovery = WalRecovery::recover(&config.wal.wal_dir).await?;
         let wal = WalWriter::open(config.wal).await?;
-        let executor = Executor::new(store, wal);
+        let executor = Executor::new(store, wal, location);
 
-        let replayed = executor.replay_wal_records(&recovery.records)?;
+        // Filter records to only replay those after snapshot LSN
+        let records_to_replay: Vec<_> = recovery
+            .records
+            .iter()
+            .filter(|r| r.lsn > snap_lsn)
+            .cloned()
+            .collect();
+
+        let replayed = executor.replay_wal_records(&records_to_replay)?;
         if replayed > 0 {
             eprintln!("WAL recovery: replayed {replayed} records");
         }
@@ -54,6 +74,10 @@ impl Engine {
 
     pub fn collections(&self) -> Vec<String> {
         self.executor.collections()
+    }
+
+    pub fn location(&self) -> &location::LocationTable {
+        self.executor.location()
     }
 }
 
