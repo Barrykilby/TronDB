@@ -96,6 +96,7 @@ pub struct CreateEdgeTypePlan {
     pub name: String,
     pub from_collection: String,
     pub to_collection: String,
+    pub decay_config: Option<trondb_tql::DecayConfigDecl>,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +316,7 @@ pub fn plan(
             name: s.name.clone(),
             from_collection: s.from_collection.clone(),
             to_collection: s.to_collection.clone(),
+            decay_config: s.decay_config.clone(),
         })),
 
         Statement::InsertEdge(s) => Ok(Plan::InsertEdge(InsertEdgePlan {

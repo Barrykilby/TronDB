@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
-use crate::edge::{AdjacencyIndex, Edge, EdgeType, DecayConfig};
+use crate::edge::{AdjacencyIndex, Edge, EdgeType};
 use crate::error::EngineError;
 use crate::field_index::FieldIndex;
 use crate::index::HnswIndex;
@@ -712,11 +712,25 @@ impl Executor {
                     return Err(EngineError::CollectionNotFound(p.to_collection.clone()));
                 }
 
+                let decay_config = p.decay_config.as_ref().map(|dc| {
+                    crate::edge::DecayConfig {
+                        decay_fn: dc.decay_fn.as_ref().map(|f| match f {
+                            trondb_tql::DecayFnDecl::Exponential => crate::edge::DecayFn::Exponential,
+                            trondb_tql::DecayFnDecl::Linear => crate::edge::DecayFn::Linear,
+                            trondb_tql::DecayFnDecl::Step => crate::edge::DecayFn::Step,
+                        }),
+                        decay_rate: dc.decay_rate,
+                        floor: dc.floor,
+                        promote_threshold: dc.promote_threshold,
+                        prune_threshold: dc.prune_threshold,
+                    }
+                }).unwrap_or_default();
+
                 let edge_type = EdgeType {
                     name: p.name.clone(),
                     from_collection: p.from_collection.clone(),
                     to_collection: p.to_collection.clone(),
-                    decay_config: DecayConfig::default(),
+                    decay_config,
                 };
 
                 // WAL: TxBegin -> SchemaCreateEdgeType -> commit
@@ -2797,6 +2811,7 @@ mod tests {
             name: "knows".into(),
             from_collection: "people".into(),
             to_collection: "people".into(),
+            decay_config: None,
         }))
         .await
         .unwrap();
@@ -2867,6 +2882,7 @@ mod tests {
             name: "knows".into(),
             from_collection: "people".into(),
             to_collection: "people".into(),
+            decay_config: None,
         }))
         .await
         .unwrap();
@@ -2935,6 +2951,7 @@ mod tests {
             name: "knows".into(),
             from_collection: "people".into(),
             to_collection: "people".into(),
+            decay_config: None,
         }))
         .await
         .unwrap();
@@ -3002,6 +3019,7 @@ mod tests {
             name: "knows".into(),
             from_collection: "people".into(),
             to_collection: "people".into(),
+            decay_config: None,
         }))
         .await
         .unwrap();
@@ -3069,6 +3087,7 @@ mod tests {
             name: "knows".into(),
             from_collection: "people".into(),
             to_collection: "people".into(),
+            decay_config: None,
         }))
         .await
         .unwrap();
@@ -3178,6 +3197,7 @@ mod tests {
             name: "knows".into(),
             from_collection: "people".into(),
             to_collection: "people".into(),
+            decay_config: None,
         }))
         .await
         .unwrap();

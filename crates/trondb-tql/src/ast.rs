@@ -135,13 +135,32 @@ pub enum Literal {
     Null,
 }
 
-// --- Edge types (unchanged from Phase 5) ---
+// --- Decay declarations (parser-side, no core dependency) ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecayFnDecl {
+    Exponential,
+    Linear,
+    Step,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecayConfigDecl {
+    pub decay_fn: Option<DecayFnDecl>,
+    pub decay_rate: Option<f64>,
+    pub floor: Option<f64>,
+    pub promote_threshold: Option<f64>,
+    pub prune_threshold: Option<f64>,
+}
+
+// --- Edge types ---
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateEdgeTypeStmt {
     pub name: String,
     pub from_collection: String,
     pub to_collection: String,
+    pub decay_config: Option<DecayConfigDecl>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

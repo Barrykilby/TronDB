@@ -166,6 +166,27 @@ pub enum Token {
     #[token("ARCHIVE", priority = 10, ignore(ascii_case))]
     Archive,
 
+    #[token("DECAY", priority = 10, ignore(ascii_case))]
+    Decay,
+
+    #[token("RATE", priority = 10, ignore(ascii_case))]
+    Rate,
+
+    #[token("FLOOR", priority = 10, ignore(ascii_case))]
+    TokenFloor,
+
+    #[token("PRUNE", priority = 10, ignore(ascii_case))]
+    Prune,
+
+    #[token("EXPONENTIAL", priority = 10, ignore(ascii_case))]
+    Exponential,
+
+    #[token("LINEAR", priority = 10, ignore(ascii_case))]
+    Linear,
+
+    #[token("STEP", priority = 10, ignore(ascii_case))]
+    Step,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
