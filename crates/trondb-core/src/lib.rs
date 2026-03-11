@@ -3,6 +3,7 @@ pub mod executor;
 pub mod planner;
 pub mod result;
 pub mod store;
+pub mod index;
 pub mod location;
 pub mod types;
 
