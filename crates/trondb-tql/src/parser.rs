@@ -107,6 +107,8 @@ impl Parser {
             Some(Token::Fetch) => self.parse_fetch(),
             Some(Token::Search) => self.parse_search(),
             Some(Token::Explain) => self.parse_explain(),
+            Some(Token::Demote) => self.parse_demote(),
+            Some(Token::Promote) => self.parse_promote(),
             Some(Token::Alter) => {
                 self.advance(); // ALTER
                 self.expect(&Token::Entity)?;
@@ -644,8 +646,54 @@ impl Parser {
 
     fn parse_explain(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // EXPLAIN
-        let inner = self.parse_statement()?;
-        Ok(Statement::Explain(Box::new(inner)))
+        if self.peek() == Some(&Token::Tiers) {
+            self.advance(); // TIERS
+            let collection = self.expect_ident()?;
+            self.expect(&Token::Semicolon)?;
+            Ok(Statement::ExplainTiers(ExplainTiersStmt { collection }))
+        } else {
+            let inner = self.parse_statement()?;
+            Ok(Statement::Explain(Box::new(inner)))
+        }
+    }
+
+    fn parse_demote(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // DEMOTE
+        let entity_id = self.expect_string_lit()?;
+        self.expect(&Token::From)?;
+        let collection = self.expect_ident()?;
+        self.expect(&Token::To)?;
+
+        let target_tier = match self.peek() {
+            Some(Token::Warm) => {
+                self.advance();
+                TierTarget::Warm
+            }
+            Some(Token::Archive) => {
+                self.advance();
+                TierTarget::Archive
+            }
+            _ => return Err(ParseError::InvalidSyntax("expected WARM or ARCHIVE".into())),
+        };
+
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::Demote(DemoteStmt {
+            entity_id,
+            collection,
+            target_tier,
+        }))
+    }
+
+    fn parse_promote(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // PROMOTE
+        let entity_id = self.expect_string_lit()?;
+        self.expect(&Token::From)?;
+        let collection = self.expect_ident()?;
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::Promote(PromoteStmt {
+            entity_id,
+            collection,
+        }))
     }
 
     fn parse_field_list(&mut self) -> Result<FieldList, ParseError> {
@@ -1115,6 +1163,53 @@ mod tests {
                 assert_eq!(s.entity_id, "v1");
             }
             _ => panic!("expected AlterEntityDropAffinity"),
+        }
+    }
+
+    #[test]
+    fn parse_demote_warm() {
+        let stmt = parse("DEMOTE 'entity1' FROM venues TO WARM;").unwrap();
+        match stmt {
+            Statement::Demote(d) => {
+                assert_eq!(d.entity_id, "entity1");
+                assert_eq!(d.collection, "venues");
+                assert_eq!(d.target_tier, TierTarget::Warm);
+            }
+            _ => panic!("expected Demote"),
+        }
+    }
+
+    #[test]
+    fn parse_demote_archive() {
+        let stmt = parse("DEMOTE 'entity1' FROM venues TO ARCHIVE;").unwrap();
+        match stmt {
+            Statement::Demote(d) => {
+                assert_eq!(d.target_tier, TierTarget::Archive);
+            }
+            _ => panic!("expected Demote"),
+        }
+    }
+
+    #[test]
+    fn parse_promote() {
+        let stmt = parse("PROMOTE 'entity1' FROM venues;").unwrap();
+        match stmt {
+            Statement::Promote(p) => {
+                assert_eq!(p.entity_id, "entity1");
+                assert_eq!(p.collection, "venues");
+            }
+            _ => panic!("expected Promote"),
+        }
+    }
+
+    #[test]
+    fn parse_explain_tiers() {
+        let stmt = parse("EXPLAIN TIERS venues;").unwrap();
+        match stmt {
+            Statement::ExplainTiers(e) => {
+                assert_eq!(e.collection, "venues");
+            }
+            _ => panic!("expected ExplainTiers"),
         }
     }
 }

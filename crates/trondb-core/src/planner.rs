@@ -44,6 +44,9 @@ pub enum Plan {
     Traverse(TraversePlan),
     CreateAffinityGroup(CreateAffinityGroupPlan),
     AlterEntityDropAffinity(AlterEntityDropAffinityPlan),
+    Demote(DemotePlan),
+    Promote(PromotePlan),
+    ExplainTiers(ExplainTiersPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +127,24 @@ pub struct CreateAffinityGroupPlan {
 #[derive(Debug, Clone)]
 pub struct AlterEntityDropAffinityPlan {
     pub entity_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DemotePlan {
+    pub entity_id: String,
+    pub collection: String,
+    pub target_tier: trondb_tql::ast::TierTarget,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromotePlan {
+    pub entity_id: String,
+    pub collection: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplainTiersPlan {
+    pub collection: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +332,19 @@ pub fn plan(
         Statement::AlterEntityDropAffinity(s) => Ok(Plan::AlterEntityDropAffinity(
             AlterEntityDropAffinityPlan { entity_id: s.entity_id.clone() }
         )),
+
+        Statement::Demote(d) => Ok(Plan::Demote(DemotePlan {
+            entity_id: d.entity_id.clone(),
+            collection: d.collection.clone(),
+            target_tier: d.target_tier.clone(),
+        })),
+        Statement::Promote(p) => Ok(Plan::Promote(PromotePlan {
+            entity_id: p.entity_id.clone(),
+            collection: p.collection.clone(),
+        })),
+        Statement::ExplainTiers(e) => Ok(Plan::ExplainTiers(ExplainTiersPlan {
+            collection: e.collection.clone(),
+        })),
     }
 }
 

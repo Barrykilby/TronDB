@@ -36,6 +36,8 @@ pub struct HealthSignal {
     pub replica_lag_ms:   Option<u64>,
     pub load_score:       f32,
     pub status:           NodeStatus,
+    pub warm_entity_count: u64,
+    pub archive_entity_count: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +161,8 @@ mod tests {
             replica_lag_ms: None,
             load_score: 0.0,
             status: NodeStatus::Healthy,
+            warm_entity_count: 0,
+            archive_entity_count: 0,
         }
     }
 

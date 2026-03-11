@@ -160,6 +160,8 @@ impl NodeHandle for LocalNode {
             replica_lag_ms: None,
             load_score: 0.0,
             status: NodeStatus::Healthy,
+            warm_entity_count: 0,
+            archive_entity_count: 0,
         }
     }
 }
@@ -192,6 +194,8 @@ impl SimulatedNode {
             replica_lag_ms: None,
             load_score: 0.0,
             status: NodeStatus::Healthy,
+            warm_entity_count: 0,
+            archive_entity_count: 0,
         };
         Self {
             engine,

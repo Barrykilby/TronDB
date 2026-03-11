@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod eviction;
 pub mod health;
+pub mod migrator;
 pub mod node;
 pub mod router;
 
@@ -59,6 +60,8 @@ mod tests {
             replica_lag_ms: None,
             load_score,
             status: health::NodeStatus::Healthy,
+            warm_entity_count: 0,
+            archive_entity_count: 0,
         }
     }
 
@@ -351,5 +354,341 @@ mod tests {
             "adding to full group should return AffinityGroupFull, got {:?}",
             err
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: set up engine + router + migrator for tier integration tests
+    // -----------------------------------------------------------------------
+
+    async fn make_tier_test_setup(
+        dir: &std::path::Path,
+    ) -> (
+        std::sync::Arc<trondb_core::Engine>,
+        router::SemanticRouter,
+    ) {
+        let engine = make_engine(dir).await;
+
+        let node = std::sync::Arc::new(
+            node::LocalNode::new(engine.clone(), node::NodeId::from_string("local"))
+        ) as std::sync::Arc<dyn node::NodeHandle>;
+
+        let lru = std::sync::Arc::new(std::sync::Mutex::new(eviction::LruTracker::new()));
+        let mut router = router::SemanticRouter::new(
+            vec![node],
+            config::RouterConfig::default(),
+        );
+
+        let migrator = std::sync::Arc::new(migrator::TierMigrator::new(
+            config::TierConfig::default(),
+            engine.clone(),
+            lru,
+            router.affinity_index().clone(),
+        ));
+        router.set_migrator(migrator);
+
+        // Let health poll populate the cache
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        (engine, router)
+    }
+
+    /// Write a vector to the hot-tier partition so the migrator can read it.
+    /// The regular INSERT stores the full Entity struct, but the migrator
+    /// reads/writes raw vector data via write_tiered/read_tiered.
+    fn seed_hot_tier_vector(
+        engine: &trondb_core::Engine,
+        collection: &str,
+        entity_id: &str,
+        vector: &[f32],
+    ) {
+        let id = trondb_core::types::LogicalId::from_string(entity_id);
+        let data = rmp_serde::to_vec_named(&vector.to_vec()).unwrap();
+        engine
+            .write_tiered(collection, &id, trondb_core::location::Tier::Fjall, &data)
+            .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier integration test 1: EXPLAIN TIERS shows distribution
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn explain_tiers_shows_distribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, router) = make_tier_test_setup(dir.path()).await;
+
+        // Create collection and insert entities
+        engine
+            .execute_tql(
+                "CREATE COLLECTION venues (\
+                    REPRESENTATION default DIMENSIONS 4 METRIC COSINE\
+                );",
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'The Shard') \
+                 REPRESENTATION default VECTOR [1.0, 0.0, 0.0, 0.0];",
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v2', 'Big Ben') \
+                 REPRESENTATION default VECTOR [0.0, 1.0, 0.0, 0.0];",
+            )
+            .await
+            .unwrap();
+
+        // Run EXPLAIN TIERS via the router
+        let plan = engine.parse_and_plan("EXPLAIN TIERS venues;").unwrap();
+        let result = router.route_and_execute(&plan).await.unwrap();
+
+        // Should have 3 rows: Hot, Warm, Archive
+        assert_eq!(result.rows.len(), 3, "expected 3 tier rows, got {}", result.rows.len());
+
+        // Check tier names
+        let tier_names: Vec<String> = result
+            .rows
+            .iter()
+            .filter_map(|r| {
+                if let Some(trondb_core::types::Value::String(s)) = r.values.get("tier") {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(tier_names.contains(&"Hot".to_string()), "missing Hot tier");
+        assert!(tier_names.contains(&"Warm".to_string()), "missing Warm tier");
+        assert!(tier_names.contains(&"Archive".to_string()), "missing Archive tier");
+
+        // All entities should be in Hot initially
+        let hot_row = result.rows.iter().find(|r| {
+            r.values.get("tier") == Some(&trondb_core::types::Value::String("Hot".into()))
+        }).expect("Hot tier row");
+        assert_eq!(
+            hot_row.values.get("entity_count"),
+            Some(&trondb_core::types::Value::Int(2)),
+            "expected 2 entities in Hot tier"
+        );
+
+        let warm_row = result.rows.iter().find(|r| {
+            r.values.get("tier") == Some(&trondb_core::types::Value::String("Warm".into()))
+        }).expect("Warm tier row");
+        assert_eq!(
+            warm_row.values.get("entity_count"),
+            Some(&trondb_core::types::Value::Int(0)),
+            "expected 0 entities in Warm tier"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier integration test 2: DEMOTE moves entity to warm
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn demote_moves_entity_to_warm() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, router) = make_tier_test_setup(dir.path()).await;
+
+        engine
+            .execute_tql(
+                "CREATE COLLECTION venues (\
+                    REPRESENTATION default DIMENSIONS 4 METRIC COSINE\
+                );",
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'The Shard') \
+                 REPRESENTATION default VECTOR [1.0, 0.5, -0.5, -1.0];",
+            )
+            .await
+            .unwrap();
+
+        // Seed the hot-tier partition with the raw vector for the migrator
+        seed_hot_tier_vector(&engine, "venues", "v1", &[1.0, 0.5, -0.5, -1.0]);
+
+        // DEMOTE v1 to warm
+        let plan = engine.parse_and_plan("DEMOTE 'v1' FROM venues TO WARM;").unwrap();
+        let result = router.route_and_execute(&plan).await.unwrap();
+        assert_eq!(
+            result.rows[0].values.get("status"),
+            Some(&trondb_core::types::Value::String("OK".into())),
+            "DEMOTE should return OK"
+        );
+
+        // Verify via EXPLAIN TIERS
+        let plan = engine.parse_and_plan("EXPLAIN TIERS venues;").unwrap();
+        let result = router.route_and_execute(&plan).await.unwrap();
+
+        let hot_count = result.rows.iter().find(|r| {
+            r.values.get("tier") == Some(&trondb_core::types::Value::String("Hot".into()))
+        }).and_then(|r| {
+            if let Some(trondb_core::types::Value::Int(n)) = r.values.get("entity_count") {
+                Some(*n)
+            } else {
+                None
+            }
+        }).unwrap_or(-1);
+
+        let warm_count = result.rows.iter().find(|r| {
+            r.values.get("tier") == Some(&trondb_core::types::Value::String("Warm".into()))
+        }).and_then(|r| {
+            if let Some(trondb_core::types::Value::Int(n)) = r.values.get("entity_count") {
+                Some(*n)
+            } else {
+                None
+            }
+        }).unwrap_or(-1);
+
+        // The entity that was in the main store (insert) still counts as hot
+        // because tier_entity_count scans the partition. After demotion the
+        // migrator deletes from the hot-tier partition, but the entity written
+        // by insert() is also in the same partition. So hot_count depends on
+        // what delete_from_tier actually removed. The seeded vector entry was
+        // written with key "entity:v1" and so was the insert(). They share the
+        // same key, so delete_from_tier removes it.
+        assert_eq!(hot_count, 0, "hot tier should have 0 entities after demotion");
+        assert_eq!(warm_count, 1, "warm tier should have 1 entity after demotion");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier integration test 3: PROMOTE moves entity from warm to hot
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn promote_moves_entity_from_warm_to_hot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, router) = make_tier_test_setup(dir.path()).await;
+
+        engine
+            .execute_tql(
+                "CREATE COLLECTION venues (\
+                    REPRESENTATION default DIMENSIONS 4 METRIC COSINE\
+                );",
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'The Shard') \
+                 REPRESENTATION default VECTOR [1.0, 0.5, -0.5, -1.0];",
+            )
+            .await
+            .unwrap();
+
+        // Seed hot-tier vector data for the migrator to read
+        seed_hot_tier_vector(&engine, "venues", "v1", &[1.0, 0.5, -0.5, -1.0]);
+
+        // Demote to warm first
+        let plan = engine.parse_and_plan("DEMOTE 'v1' FROM venues TO WARM;").unwrap();
+        router.route_and_execute(&plan).await.unwrap();
+
+        // Promote back to hot
+        let plan = engine.parse_and_plan("PROMOTE 'v1' FROM venues;").unwrap();
+        let result = router.route_and_execute(&plan).await.unwrap();
+        assert_eq!(
+            result.rows[0].values.get("status"),
+            Some(&trondb_core::types::Value::String("OK".into())),
+            "PROMOTE should return OK"
+        );
+
+        // Verify via EXPLAIN TIERS
+        let plan = engine.parse_and_plan("EXPLAIN TIERS venues;").unwrap();
+        let result = router.route_and_execute(&plan).await.unwrap();
+
+        let hot_count = result.rows.iter().find(|r| {
+            r.values.get("tier") == Some(&trondb_core::types::Value::String("Hot".into()))
+        }).and_then(|r| {
+            if let Some(trondb_core::types::Value::Int(n)) = r.values.get("entity_count") {
+                Some(*n)
+            } else {
+                None
+            }
+        }).unwrap_or(-1);
+
+        let warm_count = result.rows.iter().find(|r| {
+            r.values.get("tier") == Some(&trondb_core::types::Value::String("Warm".into()))
+        }).and_then(|r| {
+            if let Some(trondb_core::types::Value::Int(n)) = r.values.get("entity_count") {
+                Some(*n)
+            } else {
+                None
+            }
+        }).unwrap_or(-1);
+
+        assert_eq!(hot_count, 1, "hot tier should have 1 entity after promotion");
+        assert_eq!(warm_count, 0, "warm tier should have 0 entities after promotion");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier integration test 4: quantisation roundtrip preserves vector approx.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn demote_promote_preserves_vector_approximately() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, router) = make_tier_test_setup(dir.path()).await;
+
+        engine
+            .execute_tql(
+                "CREATE COLLECTION venues (\
+                    REPRESENTATION default DIMENSIONS 4 METRIC COSINE\
+                );",
+            )
+            .await
+            .unwrap();
+
+        let original_vector: Vec<f32> = vec![1.0, 0.5, -0.5, -1.0];
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'Test') \
+                 REPRESENTATION default VECTOR [1.0, 0.5, -0.5, -1.0];",
+            )
+            .await
+            .unwrap();
+
+        // Seed hot-tier vector data
+        seed_hot_tier_vector(&engine, "venues", "v1", &original_vector);
+
+        // Demote to warm (Float32 -> Int8)
+        let plan = engine.parse_and_plan("DEMOTE 'v1' FROM venues TO WARM;").unwrap();
+        router.route_and_execute(&plan).await.unwrap();
+
+        // Promote back to hot (Int8 -> Float32)
+        let plan = engine.parse_and_plan("PROMOTE 'v1' FROM venues;").unwrap();
+        router.route_and_execute(&plan).await.unwrap();
+
+        // Read the vector back from the hot tier
+        let entity_id = trondb_core::types::LogicalId::from_string("v1");
+        let raw = engine
+            .read_tiered("venues", &entity_id, trondb_core::location::Tier::Fjall)
+            .unwrap()
+            .expect("entity should be back in hot tier");
+
+        let restored: Vec<f32> = rmp_serde::from_slice(&raw).unwrap();
+
+        // Int8 quantisation introduces some error but values should be close
+        assert_eq!(
+            restored.len(),
+            original_vector.len(),
+            "vector dimensions should be preserved"
+        );
+        for (orig, rest) in original_vector.iter().zip(restored.iter()) {
+            let diff = (orig - rest).abs();
+            assert!(
+                diff < 0.05,
+                "vector component diverged too much: original={orig}, restored={rest}, diff={diff}"
+            );
+        }
     }
 }

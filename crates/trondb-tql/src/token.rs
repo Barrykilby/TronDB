@@ -151,6 +151,21 @@ pub enum Token {
     #[token("ENTITY", priority = 10, ignore(ascii_case))]
     Entity,
 
+    #[token("DEMOTE", priority = 10, ignore(ascii_case))]
+    Demote,
+
+    #[token("PROMOTE", priority = 10, ignore(ascii_case))]
+    Promote,
+
+    #[token("TIERS", priority = 10, ignore(ascii_case))]
+    Tiers,
+
+    #[token("WARM", priority = 10, ignore(ascii_case))]
+    Warm,
+
+    #[token("ARCHIVE", priority = 10, ignore(ascii_case))]
+    Archive,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),

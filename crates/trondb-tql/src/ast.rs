@@ -11,6 +11,9 @@ pub enum Statement {
     Traverse(TraverseStmt),
     CreateAffinityGroup(CreateAffinityGroupStmt),
     AlterEntityDropAffinity(AlterEntityDropAffinityStmt),
+    Demote(DemoteStmt),
+    Promote(PromoteStmt),
+    ExplainTiers(ExplainTiersStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -169,4 +172,30 @@ pub struct CreateAffinityGroupStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlterEntityDropAffinityStmt {
     pub entity_id: String,
+}
+
+// --- Tier management ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TierTarget {
+    Warm,
+    Archive,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DemoteStmt {
+    pub entity_id: String,
+    pub collection: String,
+    pub target_tier: TierTarget,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromoteStmt {
+    pub entity_id: String,
+    pub collection: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainTiersStmt {
+    pub collection: String,
 }

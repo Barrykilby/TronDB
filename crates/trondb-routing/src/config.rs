@@ -75,6 +75,38 @@ impl Default for ColocationConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TierConfig {
+    /// Max entities in hot tier per collection (default: 100_000)
+    pub hot_capacity: usize,
+    /// Max entities in warm tier per collection (default: 1_000_000)
+    pub warm_capacity: usize,
+    /// Seconds idle before hot → warm demotion (default: 86400 = 24h)
+    pub demote_after_secs: u64,
+    /// Seconds idle in warm before warm → archive (default: 604800 = 7d)
+    pub archive_after_secs: u64,
+    /// Auto-promote warm → hot on FETCH (default: true)
+    pub promote_on_access: bool,
+    /// Max entities to migrate per cycle (default: 100)
+    pub migration_batch_size: usize,
+    /// Migration cycle interval in ms (default: 60_000)
+    pub migration_interval_ms: u64,
+}
+
+impl Default for TierConfig {
+    fn default() -> Self {
+        Self {
+            hot_capacity: 100_000,
+            warm_capacity: 1_000_000,
+            demote_after_secs: 86_400,
+            archive_after_secs: 604_800,
+            promote_on_access: true,
+            migration_batch_size: 100,
+            migration_interval_ms: 60_000,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

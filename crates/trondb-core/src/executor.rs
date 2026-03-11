@@ -347,6 +347,7 @@ impl Executor {
                         state: LocState::Clean,
                         version: 1,
                         encoding,
+                        last_accessed: 0,
                     };
                     let loc_payload = rmp_serde::to_vec_named(&(&loc_key, &loc_desc))
                         .map_err(|e| EngineError::Storage(e.to_string()))?;
@@ -376,6 +377,7 @@ impl Executor {
                             state: LocState::Clean,
                             version: 1,
                             encoding,
+                            last_accessed: 0,
                         },
                     );
                 }
@@ -876,6 +878,53 @@ impl Executor {
                     },
                 })
             }
+
+            Plan::Demote(_) | Plan::Promote(_) => {
+                // Handled by the routing layer (TierMigrator / SemanticRouter)
+                let start = std::time::Instant::now();
+                Ok(QueryResult {
+                    columns: vec!["status".to_string()],
+                    rows: vec![Row {
+                        values: HashMap::from([("status".into(), Value::String("OK".into()))]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Routing".into(),
+                    },
+                })
+            }
+
+            Plan::ExplainTiers(ref p) => {
+                let start = std::time::Instant::now();
+                let hot = self.store.tier_entity_count(&p.collection, Tier::Fjall).unwrap_or(0);
+                let warm = self.store.tier_entity_count(&p.collection, Tier::NVMe).unwrap_or(0);
+                let archive = self.store.tier_entity_count(&p.collection, Tier::Archive).unwrap_or(0);
+
+                let mut rows = Vec::new();
+                for (tier_name, count) in [("Hot", hot), ("Warm", warm), ("Archive", archive)] {
+                    rows.push(Row {
+                        values: HashMap::from([
+                            ("tier".into(), Value::String(tier_name.into())),
+                            ("entity_count".into(), Value::Int(count as i64)),
+                        ]),
+                        score: None,
+                    });
+                }
+
+                Ok(QueryResult {
+                    columns: vec!["tier".to_string(), "entity_count".to_string()],
+                    rows,
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                    },
+                })
+            }
         }
     }
 
@@ -1243,6 +1292,17 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("verb", "ALTER ENTITY DROP AFFINITY".into()));
             props.push(("entity_id", p.entity_id.clone()));
             props.push(("tier", "Routing".into()));
+        }
+        Plan::Demote(_) => {
+            props.push(("operation", "Demote".into()));
+            props.push(("tier", "Routing".into()));
+        }
+        Plan::Promote(_) => {
+            props.push(("operation", "Promote".into()));
+            props.push(("tier", "Routing".into()));
+        }
+        Plan::ExplainTiers(_) => {
+            props.push(("operation", "ExplainTiers".into()));
         }
     }
 

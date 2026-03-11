@@ -2,6 +2,7 @@ pub mod error;
 pub mod executor;
 pub mod hybrid;
 pub mod planner;
+pub mod quantise;
 pub mod result;
 pub mod store;
 pub mod edge;
@@ -16,9 +17,11 @@ use std::sync::Arc;
 
 use error::EngineError;
 use executor::Executor;
+use location::Tier;
 use result::QueryResult;
 use store::FjallStore;
 use trondb_wal::{WalConfig, WalRecovery, WalWriter};
+use types::LogicalId;
 
 // ---------------------------------------------------------------------------
 // Engine — public API
@@ -243,6 +246,60 @@ impl Engine {
     /// Expose the WAL writer for the routing layer to log affinity mutations.
     pub fn wal_writer(&self) -> std::sync::Arc<WalWriter> {
         self.executor.wal_writer()
+    }
+
+    /// Read entity data from a specific tier's partition.
+    pub fn read_tiered(
+        &self,
+        collection: &str,
+        entity_id: &LogicalId,
+        tier: Tier,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        self.executor.store().read_tiered(collection, entity_id, tier)
+    }
+
+    /// Write entity data to a specific tier's partition.
+    pub fn write_tiered(
+        &self,
+        collection: &str,
+        entity_id: &LogicalId,
+        tier: Tier,
+        data: &[u8],
+    ) -> Result<(), EngineError> {
+        self.executor.store().write_tiered(collection, entity_id, tier, data)
+    }
+
+    /// Delete entity from a specific tier's partition.
+    pub fn delete_from_tier(
+        &self,
+        collection: &str,
+        entity_id: &LogicalId,
+        tier: Tier,
+    ) -> Result<(), EngineError> {
+        self.executor.store().delete_from_tier(collection, entity_id, tier)
+    }
+
+    /// Count entities in a specific tier for a collection.
+    pub fn tier_entity_count(
+        &self,
+        collection: &str,
+        tier: Tier,
+    ) -> Result<usize, EngineError> {
+        self.executor.store().tier_entity_count(collection, tier)
+    }
+
+    /// Remove an entity from the HNSW index (tombstone).
+    pub fn remove_from_hnsw(&self, collection: &str, entity_id: &LogicalId) {
+        if let Some(idx) = self.executor.indexes().get(collection) {
+            idx.remove(entity_id);
+        }
+    }
+
+    /// Insert a vector into the HNSW index for a collection.
+    pub fn insert_into_hnsw(&self, collection: &str, entity_id: &LogicalId, vector: &[f32]) {
+        if let Some(idx) = self.executor.indexes().get(collection) {
+            idx.insert(entity_id, vector);
+        }
     }
 }
 
