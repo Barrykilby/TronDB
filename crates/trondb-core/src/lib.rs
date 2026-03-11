@@ -327,4 +327,92 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn insert_with_vector_creates_location_entry() {
+        let (engine, _dir) = test_engine().await;
+
+        engine
+            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'Test') VECTOR [0.1, 0.2, 0.3];",
+            )
+            .await
+            .unwrap();
+
+        // Check Location Table has an entry for v1 repr 0
+        let key = crate::location::ReprKey {
+            entity_id: crate::types::LogicalId::from_string("v1"),
+            repr_index: 0,
+        };
+        let desc = engine.location().get(&key).expect("should have location entry");
+        assert_eq!(desc.tier, crate::location::Tier::Fjall);
+        assert_eq!(desc.state, crate::location::LocState::Clean);
+        assert_eq!(desc.encoding, crate::location::Encoding::Float32);
+    }
+
+    #[tokio::test]
+    async fn insert_without_vector_has_no_location_entry() {
+        let (engine, _dir) = test_engine().await;
+
+        engine
+            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql("INSERT INTO venues (id, name) VALUES ('v1', 'Test');")
+            .await
+            .unwrap();
+
+        assert_eq!(engine.location().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn location_table_snapshot_and_restore() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        let config = EngineConfig {
+            data_dir: data_dir.clone(),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        // Insert data
+        {
+            let engine = Engine::open(config.clone()).await.unwrap();
+            engine
+                .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
+                .await
+                .unwrap();
+            engine
+                .execute_tql(
+                    "INSERT INTO venues (id, name) VALUES ('v1', 'Test') VECTOR [0.1, 0.2, 0.3];",
+                )
+                .await
+                .unwrap();
+
+            // Manually write snapshot
+            let snap_bytes = engine.location().snapshot(engine.wal_head_lsn()).unwrap();
+            std::fs::write(data_dir.join("location_table.snap"), &snap_bytes).unwrap();
+        }
+
+        // Reopen — should restore from snapshot
+        {
+            let engine = Engine::open(config).await.unwrap();
+            let key = crate::location::ReprKey {
+                entity_id: crate::types::LogicalId::from_string("v1"),
+                repr_index: 0,
+            };
+            let desc = engine.location().get(&key).expect("should have location entry after restore");
+            assert_eq!(desc.tier, crate::location::Tier::Fjall);
+        }
+    }
 }
