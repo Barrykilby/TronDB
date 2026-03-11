@@ -64,14 +64,15 @@ impl TierMigrator {
             return Ok(0);
         }
 
-        let lru_guard = self.lru.lock().unwrap();
-        let sorted = select_eviction_candidates(
-            &candidates,
-            candidates.len().min(self.config.migration_batch_size),
-            &self.affinity,
-            &lru_guard,
-        );
-        drop(lru_guard);
+        let sorted = {
+            let lru_guard = self.lru.lock().unwrap();
+            select_eviction_candidates(
+                &candidates,
+                candidates.len().min(self.config.migration_batch_size),
+                &self.affinity,
+                &lru_guard,
+            )
+        };
 
         let mut migrated = 0;
         for entity_id in sorted.iter().take(self.config.migration_batch_size) {

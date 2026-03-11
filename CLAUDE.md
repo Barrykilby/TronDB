@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 6: Routing Intelligence.
+Inference-first storage engine. Phase 7a: Tiered Storage + Vector Quantisation.
 
 ## Project Structure
 
@@ -18,6 +18,15 @@ Inference-first storage engine. Phase 6: Routing Intelligence.
   - Background tasks: health polling (200ms), implicit affinity promotion (30s)
   - TQL: COLLOCATE WITH, AFFINITY GROUP, CREATE AFFINITY GROUP, ALTER ENTITY DROP AFFINITY GROUP
   - EXPLAIN shows routing section (selected node, score breakdown, candidates)
+- Tiered Storage: warm (Int8) and archive (Binary) tiers with automatic migration
+  - Vector quantisation: Int8 scalar quantisation (~75% size reduction), Binary (~97%)
+  - Tier partitions: {collection} (hot), warm.{collection}, archive.{collection}
+  - TierMigrator: background demotion cycle (hot→warm→archive) based on access patterns
+  - Promotion on access: warm→hot auto-promotion on FETCH (dequantise + HNSW re-insert)
+  - HNSW tombstone removal + periodic rebuild (10% threshold)
+  - TQL: DEMOTE/PROMOTE entities, EXPLAIN TIERS for distribution
+  - WAL: TierMigration record (0x70) for crash recovery
+  - LocationDescriptor.last_accessed for durable access tracking
 
 ## Conventions
 
@@ -26,7 +35,6 @@ Inference-first storage engine. Phase 6: Routing Intelligence.
 - Run REPL: `cargo run -p trondb-cli`
 - Run REPL with custom data dir: `cargo run -p trondb-cli -- --data-dir /path/to/data`
 - TQL is case-insensitive for keywords, case-sensitive for identifiers
-- All vectors are Float32 (gated until Phase 7)
 - LogicalId is a String wrapper (user-provided or UUID v4)
 - Persistence: Fjall (LSM-based). Data dir default: ./trondb_data
 - WAL: MessagePack records, CRC32 verified, segment files. Dir: {data_dir}/wal/
