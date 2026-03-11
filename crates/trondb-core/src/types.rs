@@ -151,11 +151,80 @@ impl Entity {
 }
 
 // ---------------------------------------------------------------------------
-// FieldType / FieldDef / Collection
+// VectorData — dense or sparse vector payload
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VectorData {
+    Dense(Vec<f32>),
+    Sparse(Vec<(u32, f32)>),
+}
+
+// ---------------------------------------------------------------------------
+// Schema types — Phase 5a collection schema
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Metric {
+    Cosine,
+    InnerProduct,
+}
+
+impl Default for Metric {
+    fn default() -> Self {
+        Metric::Cosine
+    }
+}
+
+/// Field type for schema declarations. Uses the canonical name `FieldType`
+/// from the spec. The old `FieldType` in types.rs is renamed to `LegacyFieldType`
+/// in this same task to avoid collision. `LegacyFieldType` is removed in Task 8.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldType {
+    Text,
+    DateTime,
+    Bool,
+    Int,
+    Float,
+    EntityRef(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectionSchema {
+    pub name: String,
+    pub representations: Vec<StoredRepresentation>,
+    pub fields: Vec<StoredField>,
+    pub indexes: Vec<StoredIndex>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredRepresentation {
+    pub name: String,
+    pub model: Option<String>,
+    pub dimensions: Option<usize>,
+    pub metric: Metric,
+    pub sparse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredField {
+    pub name: String,
+    pub field_type: FieldType,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredIndex {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub partial_condition: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// LegacyFieldType / FieldDef / Collection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegacyFieldType {
     String,
     Int,
     Float,
@@ -165,7 +234,7 @@ pub enum FieldType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDef {
     pub name: String,
-    pub field_type: FieldType,
+    pub field_type: LegacyFieldType,
     pub indexed: bool,
 }
 
@@ -242,5 +311,71 @@ mod tests {
         assert!(Collection::new("test", 0).is_err());
         let col = Collection::new("test", 384).unwrap();
         assert_eq!(col.dimensions, 384);
+    }
+
+    #[test]
+    fn vector_data_dense() {
+        let v = VectorData::Dense(vec![1.0, 2.0, 3.0]);
+        match &v {
+            VectorData::Dense(d) => assert_eq!(d.len(), 3),
+            _ => panic!("expected Dense"),
+        }
+    }
+
+    #[test]
+    fn vector_data_sparse() {
+        let v = VectorData::Sparse(vec![(1, 0.8), (42, 0.5)]);
+        match &v {
+            VectorData::Sparse(s) => {
+                assert_eq!(s.len(), 2);
+                assert_eq!(s[0].0, 1);
+            }
+            _ => panic!("expected Sparse"),
+        }
+    }
+
+    #[test]
+    fn metric_default_is_cosine() {
+        let m = Metric::default();
+        assert_eq!(m, Metric::Cosine);
+    }
+
+    #[test]
+    fn collection_schema_round_trip() {
+        let schema = CollectionSchema {
+            name: "test".into(),
+            representations: vec![StoredRepresentation {
+                name: "identity".into(),
+                model: Some("jina-v4".into()),
+                dimensions: Some(1024),
+                metric: Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![StoredField {
+                name: "status".into(),
+                field_type: FieldType::Text,
+            }],
+            indexes: vec![StoredIndex {
+                name: "idx_status".into(),
+                fields: vec!["status".into()],
+                partial_condition: None,
+            }],
+        };
+        let bytes = rmp_serde::to_vec_named(&schema).unwrap();
+        let restored: CollectionSchema = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.name, "test");
+        assert_eq!(restored.representations.len(), 1);
+        assert_eq!(restored.fields.len(), 1);
+        assert_eq!(restored.indexes.len(), 1);
+    }
+
+    #[test]
+    fn schema_field_type_variants() {
+        assert_ne!(FieldType::Text, FieldType::Int);
+        assert_ne!(FieldType::DateTime, FieldType::Bool);
+        assert_eq!(
+            FieldType::EntityRef("venues".into()),
+            FieldType::EntityRef("venues".into())
+        );
     }
 }

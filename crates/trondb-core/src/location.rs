@@ -57,6 +57,7 @@ pub enum Encoding {
     Float32,
     Int8,
     Binary,
+    Sparse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
