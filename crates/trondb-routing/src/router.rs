@@ -1,10 +1,18 @@
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
 use trondb_core::planner::Plan;
+use trondb_core::result::QueryResult;
 use trondb_core::types::LogicalId;
 
 use crate::affinity::AffinityIndex;
 use crate::config::RouterConfig;
-use crate::health::{HealthCache, HealthSignal};
-use crate::node::{EntityId, NodeId, QueryVerb, RoutingStrategy};
+use crate::error::RouterError;
+use crate::health::{compute_load_score, HealthCache, HealthSignal, NodeStatus};
+use crate::node::{EntityId, NodeHandle, NodeId, QueryVerb, RoutingStrategy};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -139,6 +147,172 @@ pub fn plan_targets(plan: &Plan) -> Vec<EntityId> {
         }
         Plan::Explain(inner) => plan_targets(inner),
         _ => vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SemanticRouter
+// ---------------------------------------------------------------------------
+
+pub struct SemanticRouter {
+    health: Arc<HealthCache>,
+    affinity: Arc<AffinityIndex>,
+    nodes: Arc<DashMap<NodeId, Arc<dyn NodeHandle>>>,
+    config: RouterConfig,
+    shutdown_tx: watch::Sender<bool>,
+    _poll_handle: JoinHandle<()>,
+}
+
+impl SemanticRouter {
+    pub fn new(
+        nodes: Vec<Arc<dyn NodeHandle>>,
+        config: RouterConfig,
+    ) -> Self {
+        let health = Arc::new(HealthCache::new(
+            config.health.push_interval_ms,
+            config.health.stale_multiplier,
+        ));
+        let affinity = Arc::new(AffinityIndex::new());
+        let node_map: Arc<DashMap<NodeId, Arc<dyn NodeHandle>>> = Arc::new(DashMap::new());
+        for node in &nodes {
+            node_map.insert(node.node_id().clone(), Arc::clone(node));
+        }
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let poll_nodes = Arc::clone(&node_map);
+        let poll_health = Arc::clone(&health);
+        let poll_config = config.health.clone();
+
+        let poll_handle = tokio::spawn(async move {
+            health_poll_loop(poll_nodes, poll_health, poll_config, shutdown_rx).await;
+        });
+
+        Self {
+            health,
+            affinity,
+            nodes: node_map,
+            config,
+            shutdown_tx,
+            _poll_handle: poll_handle,
+        }
+    }
+
+    pub fn health_cache(&self) -> &Arc<HealthCache> {
+        &self.health
+    }
+
+    pub fn affinity_index(&self) -> &Arc<AffinityIndex> {
+        &self.affinity
+    }
+
+    pub async fn route_and_execute(
+        &self,
+        plan: &Plan,
+    ) -> Result<QueryResult, RouterError> {
+        let annotated = self.annotate(plan);
+        let decision = self.route(&annotated)?;
+        let node = self.nodes.get(&decision.node)
+            .ok_or(RouterError::NoCandidates)?;
+        let result = node.execute(plan).await?;
+        Ok(result)
+    }
+
+    fn annotate(&self, plan: &Plan) -> AnnotatedPlan {
+        AnnotatedPlan {
+            plan: plan.clone(),
+            verb: plan_verb(plan),
+            acu: estimate_acu(plan),
+            targets: plan_targets(plan),
+        }
+    }
+
+    fn route(&self, annotated: &AnnotatedPlan) -> Result<RoutingDecision, RouterError> {
+        let strategy = match annotated.verb {
+            QueryVerb::Search => RoutingStrategy::ScatterGather,
+            _ => RoutingStrategy::LocationAware,
+        };
+
+        let candidates: Vec<NodeId> = self.health.healthy_nodes()
+            .into_iter()
+            .filter(|(_, load)| *load < self.config.health.load_shed_threshold)
+            .map(|(id, _)| id)
+            .collect();
+
+        if candidates.is_empty() {
+            let all = self.health.healthy_nodes();
+            if all.is_empty() {
+                return Err(RouterError::NoCandidates);
+            } else {
+                return Err(RouterError::ClusterOverloaded);
+            }
+        }
+
+        let mut scored: Vec<ScoredCandidate> = candidates
+            .iter()
+            .filter_map(|id| {
+                routing_score(id, annotated.verb, &annotated.targets, &self.health, &self.affinity, &self.config)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let best = scored.first().ok_or(RouterError::NoCandidates)?;
+
+        Ok(RoutingDecision {
+            node: best.node.clone(),
+            score: best.score,
+            all_candidates: scored,
+            strategy,
+        })
+    }
+}
+
+impl Drop for SemanticRouter {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+}
+
+async fn health_poll_loop(
+    nodes: Arc<DashMap<NodeId, Arc<dyn NodeHandle>>>,
+    health: Arc<HealthCache>,
+    config: crate::config::HealthConfig,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let interval = std::time::Duration::from_millis(config.push_interval_ms);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                // Collect node handles into a Vec to avoid holding DashMap
+                // refs across an await point (avoids lifetime issues with
+                // dyn Trait + DashMap).
+                let snapshot: Vec<Arc<dyn NodeHandle>> = nodes
+                    .iter()
+                    .map(|entry| Arc::clone(entry.value()))
+                    .collect();
+
+                for node in &snapshot {
+                    let mut signal = node.health_snapshot().await;
+                    signal.load_score = compute_load_score(&signal, &config);
+                    if signal.load_score >= config.load_shed_threshold {
+                        signal.status = NodeStatus::Overloaded;
+                    } else if signal.cpu_utilisation >= config.cpu_warn_threshold
+                        || signal.ram_pressure >= config.ram_warn_threshold
+                        || signal.queue_depth >= config.queue_depth_alert
+                        || signal.hnsw_p99_ms >= config.hnsw_baseline_p99_ms * 2.0
+                    {
+                        signal.status = NodeStatus::Degraded;
+                    }
+                    health.update(signal);
+                }
+            }
+            _ = shutdown.changed() => {
+                break;
+            }
+        }
     }
 }
 
