@@ -868,25 +868,46 @@ impl Executor {
                 // Validate edge type exists
                 let edge_type = self.store.get_edge_type(&p.edge_type)?;
 
-                // Gate multi-hop
-                if p.depth > 1 {
-                    return Err(EngineError::UnsupportedOperation(
-                        "TRAVERSE DEPTH > 1 requires Phase 6+".into(),
-                    ));
-                }
+                // Cap depth at 10
+                let max_depth = p.depth.min(10);
 
                 let from_id = LogicalId::from_string(&p.from_id);
-                let entries = self.adjacency.get(&from_id, &p.edge_type);
+                let mut visited: HashSet<LogicalId> = HashSet::new();
+                visited.insert(from_id.clone());
 
+                let mut frontier = vec![from_id];
                 let mut rows = Vec::new();
-                for entry in &entries {
-                    if let Ok(entity) = self.store.get(&edge_type.to_collection, &entry.to_id) {
-                        rows.push(entity_to_row(&entity, &FieldList::All));
-                    }
-                }
+                let limit = p.limit.unwrap_or(usize::MAX);
 
-                if let Some(limit) = p.limit {
-                    rows.truncate(limit);
+                for _hop in 0..max_depth {
+                    if frontier.is_empty() || rows.len() >= limit {
+                        break;
+                    }
+
+                    let mut next_frontier = Vec::new();
+
+                    for node_id in &frontier {
+                        let entries = self.adjacency.get(node_id, &p.edge_type);
+                        for entry in &entries {
+                            if visited.contains(&entry.to_id) {
+                                continue;
+                            }
+                            visited.insert(entry.to_id.clone());
+
+                            if let Ok(entity) = self.store.get(&edge_type.to_collection, &entry.to_id) {
+                                rows.push(entity_to_row(&entity, &FieldList::All));
+                                if rows.len() >= limit {
+                                    break;
+                                }
+                            }
+                            next_frontier.push(entry.to_id.clone());
+                        }
+                        if rows.len() >= limit {
+                            break;
+                        }
+                    }
+
+                    frontier = next_frontier;
                 }
 
                 let scanned = rows.len();
@@ -1433,7 +1454,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{CreateCollectionPlan, FetchPlan, FetchStrategy, InsertPlan, PreFilter, SearchPlan};
+    use crate::planner::{CreateCollectionPlan, CreateEdgeTypePlan, FetchPlan, FetchStrategy, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -2603,5 +2624,75 @@ mod tests {
             pf_row.values.get("value"),
             Some(&Value::String("ScalarPreFilter (idx_city)".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn traverse_multi_hop_depth_3() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Insert 4 people: a, b, c, d
+        for (id, name) in [("a", "Alice"), ("b", "Bob"), ("c", "Carol"), ("d", "Dave")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        // Create edge type: knows (people → people)
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Insert chain: a→b→c→d
+        for (from, to) in [("a", "b"), ("b", "c"), ("c", "d")] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "knows".into(),
+                from_id: from.into(),
+                to_id: to.into(),
+                metadata: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Traverse depth 3 from "a" — should reach b, c, d
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 3,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 3); // b, c, d
     }
 }
