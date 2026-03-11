@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -163,6 +163,30 @@ impl Executor {
 
         match plan {
             Plan::CreateCollection(p) => {
+                // Validate no duplicate representation names
+                let mut repr_names = HashSet::new();
+                for r in &p.representations {
+                    if !repr_names.insert(&r.name) {
+                        return Err(EngineError::DuplicateRepresentation(r.name.clone()));
+                    }
+                }
+
+                // Validate no duplicate field names
+                let mut field_names = HashSet::new();
+                for f in &p.fields {
+                    if !field_names.insert(&f.name) {
+                        return Err(EngineError::DuplicateField(f.name.clone()));
+                    }
+                }
+
+                // Validate no duplicate index names
+                let mut index_names = HashSet::new();
+                for i in &p.indexes {
+                    if !index_names.insert(&i.name) {
+                        return Err(EngineError::DuplicateIndex(i.name.clone()));
+                    }
+                }
+
                 // Build CollectionSchema from plan
                 let schema = build_collection_schema(p);
 
@@ -180,7 +204,39 @@ impl Executor {
                 self.store.create_collection_schema(&schema)?;
 
                 // Register in schemas map
-                self.schemas.insert(schema.name.clone(), schema);
+                self.schemas.insert(schema.name.clone(), schema.clone());
+
+                // Instantiate HNSW indexes for dense representations
+                for repr in &schema.representations {
+                    if !repr.sparse {
+                        if let Some(dims) = repr.dimensions {
+                            let hnsw_key = format!("{}:{}", schema.name, repr.name);
+                            self.indexes.insert(hnsw_key, HnswIndex::new(dims));
+                        }
+                    }
+                }
+
+                // Instantiate SparseIndex for sparse representations
+                for repr in &schema.representations {
+                    if repr.sparse {
+                        let sparse_key = format!("{}:{}", schema.name, repr.name);
+                        self.sparse_indexes.insert(sparse_key, SparseIndex::new());
+                    }
+                }
+
+                // Instantiate FieldIndex for each declared index
+                for idx in &schema.indexes {
+                    let partition = self.store.open_field_index_partition(&schema.name, &idx.name)?;
+                    let field_types: Vec<(String, FieldType)> = idx.fields.iter()
+                        .filter_map(|f| {
+                            schema.fields.iter()
+                                .find(|sf| sf.name == *f)
+                                .map(|sf| (sf.name.clone(), sf.field_type.clone()))
+                        })
+                        .collect();
+                    let fidx_key = format!("{}:{}", schema.name, idx.name);
+                    self.field_indexes.insert(fidx_key, FieldIndex::new(partition, field_types));
+                }
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
@@ -207,12 +263,60 @@ impl Executor {
             }
 
             Plan::Insert(p) => {
+                // Look up schema and validate collection exists
+                let schema = self.schemas.get(&p.collection)
+                    .ok_or_else(|| EngineError::CollectionNotFound(p.collection.clone()))?
+                    .clone();
+
+                // Validate vectors against schema representations and dimensions
+                for (repr_name, vec_lit) in &p.vectors {
+                    let schema_repr = schema.representations.iter()
+                        .find(|r| r.name == *repr_name)
+                        .ok_or_else(|| EngineError::InvalidQuery(
+                            format!("no representation '{}' in collection '{}'", repr_name, p.collection)
+                        ))?;
+                    if let VectorLiteral::Dense(v) = vec_lit {
+                        if let Some(expected_dims) = schema_repr.dimensions {
+                            if v.len() != expected_dims {
+                                return Err(EngineError::InvalidQuery(format!(
+                                    "representation '{}' expects {} dimensions, got {}",
+                                    repr_name, expected_dims, v.len()
+                                )));
+                            }
+                        }
+                    }
+                }
+
                 // Find or generate LogicalId
-                let id = find_id_in_fields(&p.fields, &p.values)
+                let entity_id = find_id_in_fields(&p.fields, &p.values)
                     .unwrap_or_default();
 
+                // Handle entity updates — if entity exists, remove old index entries
+                if let Ok(old_entity) = self.store.get(&p.collection, &entity_id) {
+                    // Remove old sparse index entries
+                    for repr in &old_entity.representations {
+                        if let VectorData::Sparse(ref sv) = repr.vector {
+                            let sparse_key = format!("{}:{}", p.collection, repr.name);
+                            if let Some(sidx) = self.sparse_indexes.get(&sparse_key) {
+                                sidx.remove(&entity_id, sv);
+                            }
+                        }
+                    }
+                    // Remove old field index entries
+                    for entry in self.field_indexes.iter() {
+                        if entry.key().starts_with(&format!("{}:", p.collection)) {
+                            let old_values: Vec<Value> = entry.field_types().iter()
+                                .filter_map(|(fname, _)| old_entity.metadata.get(fname).cloned())
+                                .collect();
+                            if old_values.len() == entry.field_types().len() {
+                                let _ = entry.remove(&entity_id, &old_values);
+                            }
+                        }
+                    }
+                }
+
                 // Build entity with metadata
-                let mut entity = Entity::new(id.clone());
+                let mut entity = Entity::new(entity_id.clone());
                 for (field, value) in p.fields.iter().zip(p.values.iter()) {
                     if field == "id" {
                         continue;
@@ -251,18 +355,22 @@ impl Executor {
                     .map_err(|e| EngineError::Storage(e.to_string()))?;
                 self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, entity_payload);
 
-                // LocationUpdate for each representation
-                for (idx, _repr) in entity.representations.iter().enumerate() {
+                // LocationUpdate for each representation with appropriate encoding
+                for (idx, repr) in entity.representations.iter().enumerate() {
                     let loc_key = ReprKey {
-                        entity_id: id.clone(),
+                        entity_id: entity_id.clone(),
                         repr_index: idx as u32,
+                    };
+                    let encoding = match &repr.vector {
+                        VectorData::Sparse(_) => Encoding::Sparse,
+                        VectorData::Dense(_) => Encoding::Float32,
                     };
                     let loc_desc = LocationDescriptor {
                         tier: Tier::Fjall,
                         node_address: NodeAddress::localhost(),
                         state: LocState::Clean,
                         version: 1,
-                        encoding: Encoding::Float32,
+                        encoding,
                     };
                     let loc_payload = rmp_serde::to_vec_named(&(&loc_key, &loc_desc))
                         .map_err(|e| EngineError::Storage(e.to_string()))?;
@@ -276,10 +384,14 @@ impl Executor {
                 self.store.persist()?;
 
                 // Apply to Location Table
-                for (idx, _repr) in entity.representations.iter().enumerate() {
+                for (idx, repr) in entity.representations.iter().enumerate() {
+                    let encoding = match &repr.vector {
+                        VectorData::Sparse(_) => Encoding::Sparse,
+                        VectorData::Dense(_) => Encoding::Float32,
+                    };
                     self.location.register(
                         ReprKey {
-                            entity_id: id.clone(),
+                            entity_id: entity_id.clone(),
                             repr_index: idx as u32,
                         },
                         LocationDescriptor {
@@ -287,21 +399,41 @@ impl Executor {
                             node_address: NodeAddress::localhost(),
                             state: LocState::Clean,
                             version: 1,
-                            encoding: Encoding::Float32,
+                            encoding,
                         },
                     );
                 }
 
-                // Apply to HNSW index (only dense vectors)
+                // Apply to HNSW index (only dense vectors, repr-scoped keys)
                 for repr in &entity.representations {
                     if let VectorData::Dense(ref vec_f32) = repr.vector {
-                        let dims = vec_f32.len();
-                        let index = self.indexes
-                            .entry(p.collection.clone())
-                            .or_insert_with(|| HnswIndex::new(dims));
-                        index.insert(&id, vec_f32);
+                        let hnsw_key = format!("{}:{}", p.collection, repr.name);
+                        if let Some(hnsw) = self.indexes.get(&hnsw_key) {
+                            hnsw.insert(&entity_id, vec_f32);
+                        }
                     }
-                    // NOTE: sparse index updates are Task 9 work
+                }
+
+                // Apply to SparseIndex
+                for repr in &entity.representations {
+                    if let VectorData::Sparse(ref sv) = repr.vector {
+                        let sparse_key = format!("{}:{}", p.collection, repr.name);
+                        if let Some(sidx) = self.sparse_indexes.get(&sparse_key) {
+                            sidx.insert(&entity_id, sv);
+                        }
+                    }
+                }
+
+                // Apply to FieldIndexes
+                for entry in self.field_indexes.iter() {
+                    if entry.key().starts_with(&format!("{}:", p.collection)) {
+                        let values: Vec<Value> = entry.field_types().iter()
+                            .filter_map(|(fname, _)| entity.metadata.get(fname).cloned())
+                            .collect();
+                        if values.len() == entry.field_types().len() {
+                            entry.insert(&entity_id, &values)?;
+                        }
+                    }
                 }
 
                 Ok(QueryResult {
@@ -309,7 +441,7 @@ impl Executor {
                     rows: vec![Row {
                         values: HashMap::from([(
                             "result".into(),
-                            Value::String(format!("Inserted entity '{}'", id)),
+                            Value::String(format!("Inserted entity '{}'", entity_id)),
                         )]),
                         score: None,
                     }],
@@ -370,11 +502,18 @@ impl Executor {
                             .ok_or_else(|| EngineError::InvalidQuery("HNSW requires dense vector".into()))?;
                         let query_f32: Vec<f32> = query_f64.iter().map(|v| *v as f32).collect();
 
-                        // Search HNSW index
-                        let candidates = if let Some(index) = self.indexes.get(&p.collection) {
-                            index.search(&query_f32, p.k)
-                        } else {
-                            Vec::new()
+                        // Search HNSW index using repr-scoped keys
+                        // Find the first HNSW index for this collection
+                        let candidates = {
+                            let mut found = Vec::new();
+                            let prefix = format!("{}:", p.collection);
+                            for entry in self.indexes.iter() {
+                                if entry.key().starts_with(&prefix) {
+                                    found = entry.search(&query_f32, p.k);
+                                    break;
+                                }
+                            }
+                            found
                         };
 
                         // Filter by confidence threshold and resolve entities
@@ -1158,5 +1297,253 @@ mod tests {
             mode_row.values.get("value"),
             Some(&Value::String("Deterministic".into()))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 9 tests: CREATE COLLECTION validation + INSERT enhancements
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_collection_validates_duplicate_repr() {
+        let (exec, _dir) = setup_executor().await;
+
+        let result = exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "test".into(),
+            representations: vec![
+                trondb_tql::RepresentationDecl {
+                    name: "identity".into(),
+                    model: None,
+                    dimensions: Some(3),
+                    metric: trondb_tql::Metric::Cosine,
+                    sparse: false,
+                },
+                trondb_tql::RepresentationDecl {
+                    name: "identity".into(),
+                    model: None,
+                    dimensions: Some(3),
+                    metric: trondb_tql::Metric::Cosine,
+                    sparse: false,
+                },
+            ],
+            fields: vec![],
+            indexes: vec![],
+        })).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::DuplicateRepresentation(name) => assert_eq!(name, "identity"),
+            other => panic!("expected DuplicateRepresentation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_collection_validates_duplicate_field() {
+        let (exec, _dir) = setup_executor().await;
+
+        let result = exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "test".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl {
+                    name: "status".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+                trondb_tql::FieldDecl {
+                    name: "status".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+            ],
+            indexes: vec![],
+        })).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::DuplicateField(name) => assert_eq!(name, "status"),
+            other => panic!("expected DuplicateField, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_collection_validates_duplicate_index() {
+        let (exec, _dir) = setup_executor().await;
+
+        let result = exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "test".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "status".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![
+                trondb_tql::IndexDecl {
+                    name: "idx_status".into(),
+                    fields: vec!["status".into()],
+                    partial_condition: None,
+                },
+                trondb_tql::IndexDecl {
+                    name: "idx_status".into(),
+                    fields: vec!["status".into()],
+                    partial_condition: None,
+                },
+            ],
+        })).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::DuplicateIndex(name) => assert_eq!(name, "idx_status"),
+            other => panic!("expected DuplicateIndex, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_collection_registers_indexes() {
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "docs".into(),
+            representations: vec![
+                trondb_tql::RepresentationDecl {
+                    name: "dense_repr".into(),
+                    model: None,
+                    dimensions: Some(4),
+                    metric: trondb_tql::Metric::Cosine,
+                    sparse: false,
+                },
+                trondb_tql::RepresentationDecl {
+                    name: "sparse_repr".into(),
+                    model: None,
+                    dimensions: None,
+                    metric: trondb_tql::Metric::Cosine,
+                    sparse: true,
+                },
+            ],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "status".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_status".into(),
+                fields: vec!["status".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Verify HNSW index registered with repr-scoped key
+        assert!(exec.indexes().contains_key("docs:dense_repr"));
+        assert_eq!(exec.indexes().get("docs:dense_repr").unwrap().dimensions(), 4);
+
+        // Verify SparseIndex registered
+        assert!(exec.sparse_indexes().contains_key("docs:sparse_repr"));
+
+        // Verify FieldIndex registered
+        assert!(exec.field_indexes().contains_key("docs:idx_status"));
+    }
+
+    #[tokio::test]
+    async fn insert_validates_dimensions() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        let result = exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into()],
+            values: vec![Literal::String("v1".into())],
+            vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![1.0, 2.0]))],
+        })).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            EngineError::InvalidQuery(msg) => {
+                assert!(msg.contains("3 dimensions"), "error should mention expected dims: {msg}");
+                assert!(msg.contains("got 2"), "error should mention actual dims: {msg}");
+            }
+            other => panic!("expected InvalidQuery, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_updates_sparse_index() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with sparse representation
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "docs".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "keywords".into(),
+                model: None,
+                dimensions: None,
+                metric: trondb_tql::Metric::Cosine,
+                sparse: true,
+            }],
+            fields: vec![],
+            indexes: vec![],
+        })).await.unwrap();
+
+        // Insert with sparse vector
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "docs".into(),
+            fields: vec!["id".into()],
+            values: vec![Literal::String("d1".into())],
+            vectors: vec![("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.8), (42, 0.5)]))],
+        })).await.unwrap();
+
+        // Verify SparseIndex contains the entry
+        let sidx = exec.sparse_indexes().get("docs:keywords").expect("sparse index should exist");
+        let results = sidx.search(&[(1, 1.0)], 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, LogicalId::from_string("d1"));
+    }
+
+    #[tokio::test]
+    async fn insert_updates_field_index() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a field and index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "venues".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "city".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_city".into(),
+                fields: vec!["city".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert with field values
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("London".into())],
+            vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+        })).await.unwrap();
+
+        // Verify FieldIndex contains the entry
+        let fidx = exec.field_indexes().get("venues:idx_city").expect("field index should exist");
+        let results = fidx.lookup_eq(&[Value::String("London".into())]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], LogicalId::from_string("v1"));
     }
 }

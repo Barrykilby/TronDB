@@ -76,23 +76,73 @@ impl Engine {
             executor.schemas().insert(schema.name.clone(), schema);
         }
 
-        // Rebuild HNSW indexes from Fjall
+        // Rebuild HNSW indexes and SparseIndexes from Fjall
         for collection_name in executor.collections() {
+            if let Some(schema_ref) = executor.schemas().get(&collection_name) {
+                // Instantiate HNSW indexes for dense representations
+                for repr in &schema_ref.representations {
+                    if !repr.sparse {
+                        if let Some(dims) = repr.dimensions {
+                            let hnsw_key = format!("{}:{}", collection_name, repr.name);
+                            executor.indexes()
+                                .entry(hnsw_key)
+                                .or_insert_with(|| crate::index::HnswIndex::new(dims));
+                        }
+                    }
+                }
+                // Instantiate SparseIndexes for sparse representations
+                for repr in &schema_ref.representations {
+                    if repr.sparse {
+                        let sparse_key = format!("{}:{}", collection_name, repr.name);
+                        executor.sparse_indexes()
+                            .entry(sparse_key)
+                            .or_insert_with(crate::sparse_index::SparseIndex::new);
+                    }
+                }
+                // Instantiate FieldIndexes for declared indexes
+                for idx in &schema_ref.indexes {
+                    let fidx_key = format!("{}:{}", collection_name, idx.name);
+                    if !executor.field_indexes().contains_key(&fidx_key) {
+                        if let Ok(partition) = executor.store().open_field_index_partition(&collection_name, &idx.name) {
+                            let field_types: Vec<(String, types::FieldType)> = idx.fields.iter()
+                                .filter_map(|f| {
+                                    schema_ref.fields.iter()
+                                        .find(|sf| sf.name == *f)
+                                        .map(|sf| (sf.name.clone(), sf.field_type.clone()))
+                                })
+                                .collect();
+                            executor.field_indexes().insert(fidx_key, crate::field_index::FieldIndex::new(partition, field_types));
+                        }
+                    }
+                }
+            }
+            // Rebuild index contents from stored entities
             if let Ok(entities) = executor.scan_collection(&collection_name) {
-                // Get dimensions from schema
-                if let Some(schema_ref) = executor.schemas().get(&collection_name) {
-                    let dims = schema_ref.representations.iter()
-                        .find(|r| !r.sparse)
-                        .and_then(|r| r.dimensions);
-                    if let Some(dims) = dims {
-                        for entity in &entities {
-                            for repr in &entity.representations {
-                                if let types::VectorData::Dense(ref vec_f32) = repr.vector {
-                                    let index = executor.indexes()
-                                        .entry(collection_name.clone())
-                                        .or_insert_with(|| crate::index::HnswIndex::new(dims));
+                for entity in &entities {
+                    for repr in &entity.representations {
+                        match &repr.vector {
+                            types::VectorData::Dense(ref vec_f32) => {
+                                let hnsw_key = format!("{}:{}", collection_name, repr.name);
+                                if let Some(index) = executor.indexes().get(&hnsw_key) {
                                     index.insert(&entity.id, vec_f32);
                                 }
+                            }
+                            types::VectorData::Sparse(ref sv) => {
+                                let sparse_key = format!("{}:{}", collection_name, repr.name);
+                                if let Some(sidx) = executor.sparse_indexes().get(&sparse_key) {
+                                    sidx.insert(&entity.id, sv);
+                                }
+                            }
+                        }
+                    }
+                    // Rebuild field indexes
+                    for entry in executor.field_indexes().iter() {
+                        if entry.key().starts_with(&format!("{}:", collection_name)) {
+                            let values: Vec<types::Value> = entry.field_types().iter()
+                                .filter_map(|(fname, _)| entity.metadata.get(fname).cloned())
+                                .collect();
+                            if values.len() == entry.field_types().len() {
+                                let _ = entry.insert(&entity.id, &values);
                             }
                         }
                     }
