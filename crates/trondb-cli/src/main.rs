@@ -21,6 +21,7 @@ async fn main() {
             wal_dir: data_dir.join("wal"),
             ..Default::default()
         },
+        snapshot_interval_secs: 60,
     };
 
     println!("TronDB v0.2.0 — inference-first storage engine");

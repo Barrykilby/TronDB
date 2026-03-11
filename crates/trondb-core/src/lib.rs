@@ -22,6 +22,7 @@ use trondb_wal::{WalConfig, WalRecovery, WalWriter};
 pub struct EngineConfig {
     pub data_dir: PathBuf,
     pub wal: WalConfig,
+    pub snapshot_interval_secs: u64,
 }
 
 pub struct Engine {
@@ -99,6 +100,7 @@ mod tests {
                 wal_dir: dir.path().join("wal"),
                 ..Default::default()
             },
+            snapshot_interval_secs: 0,
         };
         let engine = Engine::open(config).await.unwrap();
         (engine, dir)
@@ -229,6 +231,7 @@ mod tests {
                 wal_dir,
                 ..Default::default()
             },
+            snapshot_interval_secs: 0,
         };
         let engine = Engine::open(config).await.unwrap();
 
@@ -253,6 +256,7 @@ mod tests {
                 wal_dir: dir.path().join("wal"),
                 ..Default::default()
             },
+            snapshot_interval_secs: 0,
         };
 
         // Write data
