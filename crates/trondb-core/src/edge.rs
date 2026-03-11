@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{LogicalId, Value};
 
+/// A list of `(edge_type, entity_id)` pairs returned by edge queries.
+pub type EdgeList = Vec<(String, LogicalId)>;
+
 // ---------------------------------------------------------------------------
 // Edge — a directional relationship between two entities
 // ---------------------------------------------------------------------------
@@ -167,7 +170,7 @@ impl AdjacencyIndex {
     /// Returns `(forward_edges, backward_edges)` where:
     /// - `forward_edges`: `(edge_type, to_id)` pairs where `entity_id` is the source
     /// - `backward_edges`: `(edge_type, from_id)` pairs where `entity_id` is the target
-    pub fn edges_involving(&self, entity_id: &LogicalId) -> (Vec<(String, LogicalId)>, Vec<(String, LogicalId)>) {
+    pub fn edges_involving(&self, entity_id: &LogicalId) -> (EdgeList, EdgeList) {
         // Forward: all (edge_type, to_id) pairs where entity_id is the source
         let mut forward_edges = Vec::new();
         for entry in self.forward.iter() {
