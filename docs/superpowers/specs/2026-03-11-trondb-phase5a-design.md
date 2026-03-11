@@ -10,6 +10,26 @@ Add field indexes and sparse vector indexes to TronDB: Fjall-backed field indexe
 - trondb_design_v4.docx: Build phase table, five index types, query planner strategy selection
 - User-confirmed: full schema syntax (option A), no backwards-compatible shorthand, ACU costs deferred, EXPLAIN omits cost fields entirely
 
+## Existing Type Migration
+
+Phase 5a replaces or extends several existing types. Explicit mapping:
+
+| Existing Type | Location | Action |
+|---|---|---|
+| `FieldType` (String, Int, Float, Bool) | `types.rs:157-163` | **Replace** with expanded `FieldType` (Text, DateTime, Bool, Int, Float, EntityRef). `String` variant renamed to `Text` for consistency with TQL syntax. |
+| `FieldDef` (name, field_type, indexed) | `types.rs:165-170` | **Remove**. Replaced by `StoredField`. The `indexed: bool` flag is superseded by explicit `IndexDecl`. |
+| `Collection` (name, dimensions, fields) | `types.rs:172-194` | **Remove**. Replaced by `CollectionSchema`. Dimension count validation moves to `RepresentationDecl` parsing (dense representations require dimensions > 0). |
+| `Encoding` (Float32, Int8, Binary) | `location.rs:55-60` | **Extend** — add `Sparse` variant to the existing enum. Not a new type. |
+| `Representation` (repr_type, fields, vector, recipe_hash, state) | `types.rs:99-106` | **Extend** — `vector: Vec<f32>` replaced with `vector: VectorData`. Add `name: String` field for named representation lookup. |
+| `CreateCollectionStmt` (name, dimensions) | `ast.rs:14-18` | **Replace** with expanded struct (name, representations, fields, indexes). |
+| `SearchStmt` (collection, fields, near, confidence, limit) | `ast.rs:36-43` | **Replace** — `near: Vec<f64>` becomes `dense_vector: Option<Vec<f64>>`, add `sparse_vector: Option<Vec<(u32, f32)>>`, add `filter: Option<WhereClause>`. |
+| `InsertStmt` (collection, fields, values, vector) | `ast.rs:20-26` | **Extend** — `vector: Option<Vec<f64>>` replaced with `vectors: Vec<(String, VectorLiteral)>` for named representation support. See INSERT syntax section. |
+| `CreateCollectionPlan` (name, dimensions) | `planner.rs:21-25` | **Replace** with expanded struct matching new `CreateCollectionStmt`. |
+| `SearchPlan` (collection, query_vector, k, confidence_threshold) | `planner.rs:43-49` | **Replace** with expanded struct (dense_vector, sparse_vector, strategy, pre_filter, k, confidence_threshold). |
+| `FetchPlan` (collection, fields, filter, limit) | `planner.rs:35-41` | **Extend** — add `strategy: FetchStrategy` field. |
+| `InsertPlan` (collection, fields, values, vector) | `planner.rs:27-33` | **Extend** — `vector` becomes `vectors: Vec<(String, VectorLiteral)>`. |
+| `plan()` function signature | `planner.rs:85` | **Change** — `plan(stmt, schemas)` — add `&DashMap<String, CollectionSchema>` parameter for strategy selection. |
+
 ## Architecture
 
 ### Schema Grammar — CREATE COLLECTION Expansion
@@ -45,9 +65,11 @@ All existing tests must be updated to the new syntax. No backwards-compatible sh
 
 ### New Keywords
 
-`REPRESENTATION`, `MODEL`, `METRIC`, `SPARSE`, `FIELD`, `DATETIME`, `TEXT`, `BOOL`, `ENTITY_REF`, `INDEX`, `ON`, `INNER_PRODUCT`, `COSINE`
+`REPRESENTATION`, `MODEL`, `METRIC`, `SPARSE`, `FIELD`, `DATETIME`, `TEXT`, `BOOL`, `INT`, `FLOAT`, `ENTITY_REF`, `INDEX`, `ON`, `INNER_PRODUCT`, `COSINE`
 
-Note: `TRUE`, `FALSE`, `WITH`, `WHERE` already exist. `DELETE`, `EDGE`, `TRAVERSE`, `DEPTH`, `TO` were added in Phase 5.
+New punctuation token: `Colon` (`:`) — used in sparse vector literal syntax `[dim:weight, ...]`.
+
+Note: `TRUE`, `FALSE`, `WITH`, `WHERE` already exist. `DELETE`, `EDGE`, `TRAVERSE`, `DEPTH`, `TO` were added in Phase 5. `DIMENSIONS` already exists but now appears inside `REPRESENTATION` blocks rather than after `WITH`.
 
 ### AST Types
 
@@ -125,6 +147,55 @@ pub struct SearchStmt {
 
 Sparse vector literal syntax: `[dim:weight, dim:weight, ...]` where dim is an integer and weight is a float.
 
+### INSERT Syntax Expansion
+
+With named representations, INSERT must specify which representation each vector belongs to:
+
+```sql
+-- Single dense representation
+INSERT INTO venues (name, status) VALUES ('Pub', 'active')
+    REPRESENTATION identity VECTOR [0.1, 0.2, 0.3];
+
+-- Multiple representations (dense + sparse)
+INSERT INTO venues (name, status) VALUES ('Pub', 'active')
+    REPRESENTATION identity VECTOR [0.1, 0.2, 0.3]
+    REPRESENTATION sparse_title SPARSE [1:0.8, 42:0.5];
+```
+
+New AST type for vector literals:
+
+```rust
+pub enum VectorLiteral {
+    Dense(Vec<f64>),
+    Sparse(Vec<(u32, f32)>),
+}
+
+pub struct InsertStmt {
+    pub collection: String,
+    pub fields: Vec<String>,
+    pub values: Vec<Literal>,
+    pub vectors: Vec<(String, VectorLiteral)>,  // (repr_name, vector)
+}
+```
+
+Replaces the old `vector: Option<Vec<f64>>` field.
+
+### Parser Grammar for SEARCH
+
+Parse order for SEARCH statement:
+
+```
+SEARCH <collection>
+    [WHERE <condition>]            -- optional ScalarPreFilter
+    [NEAR VECTOR <dense_vec>]      -- optional dense search
+    [NEAR SPARSE <sparse_vec>]     -- optional sparse search
+    [CONFIDENCE > <threshold>]     -- optional threshold
+    [LIMIT <n>]                    -- optional limit
+;
+```
+
+At least one of `NEAR VECTOR` or `NEAR SPARSE` is required. Both may be present (hybrid). After consuming `NEAR`, the parser checks the next keyword: if `VECTOR`, parse a dense vector literal `[f64, f64, ...]`; if `SPARSE`, parse a sparse vector literal `[u32:f32, u32:f32, ...]`. Then optionally consume another `NEAR` for hybrid.
+
 ## Types
 
 ### VectorData
@@ -136,7 +207,20 @@ pub enum VectorData {
 }
 ```
 
-Replaces the current `vector: Vec<f32>` field on `Representation`.
+Replaces the current `vector: Vec<f32>` field on `Representation`. The `Representation` struct also gains a `name: String` field for lookup:
+
+```rust
+pub struct Representation {
+    pub name: String,           // NEW: matches RepresentationDecl.name
+    pub repr_type: ReprType,
+    pub fields: Vec<String>,
+    pub vector: VectorData,     // CHANGED: was Vec<f32>
+    pub recipe_hash: [u8; 32],
+    pub state: ReprState,
+}
+```
+
+Entities map their representations to collection schema entries by name. The `representations` Vec on `Entity` continues to hold one entry per representation, but now keyed by name rather than by position. Sparse representations have no fixed dimension count — dimensions are implicit in the vocabulary space.
 
 ### Encoding
 
@@ -181,7 +265,7 @@ pub struct StoredField {
 pub struct StoredIndex {
     pub name: String,
     pub fields: Vec<String>,
-    pub partial_condition: Option<String>,  // serialised WHERE clause
+    pub partial_condition: Option<String>,  // original TQL WHERE clause text, re-parsed at load time
 }
 ```
 
@@ -263,12 +347,14 @@ impl FieldIndex {
 
 ### Write Path Integration
 
-Every `ENTITY_WRITE` triggers field index updates:
+Every `ENTITY_WRITE` triggers field index and sparse index updates:
 1. Check which indexes cover the entity's collection
-2. For each matching index, check partial condition (if any)
+2. For each matching field index, check partial condition (if any)
 3. Extract declared field values from entity metadata
-4. Encode sortable key, insert into index partition
-5. On `ENTITY_DELETE`, remove corresponding entries
+4. Encode sortable key, insert into field index partition
+5. For each sparse representation on the entity, insert into SparseIndex
+6. On `ENTITY_DELETE`, remove corresponding entries from all indexes
+7. On entity **update**: read the old entity from Fjall first, use its sparse vectors and field values to remove old index entries, then insert new entries. This ensures posting lists and field indexes stay consistent.
 
 ### Startup Rebuild
 
@@ -280,10 +366,10 @@ H3 cell IDs are stored as plain `TEXT` fields and indexed as field indexes. Hier
 
 ```sql
 -- Find events in an H3 res4 cell
-FETCH events WHERE h3_res4 = '8928342e3ffffff';
+FETCH * FROM events WHERE h3_res4 = '8928342e3ffffff';
 
 -- Find events in a more precise res8 cell
-FETCH events WHERE h3_res8 = '89283470c27ffff';
+FETCH * FROM events WHERE h3_res8 = '89283470c27ffff';
 ```
 
 ## Sparse Vector Index
@@ -332,10 +418,10 @@ Rebuilt from Fjall on startup — scan all entities with sparse representations,
 When both `NEAR VECTOR` and `NEAR SPARSE` are present, both searches run and results are merged:
 
 ```
-score(entity) = Σ 1 / (k + rank_in_list)
+score(entity) = Σ 1 / (k + rank)
 ```
 
-Where `k` defaults to 60. Each result list contributes a rank-based score. Combined scores determine final order.
+Where `k` defaults to 60 and `rank` is 1-based (first result has rank 1, per Cormack et al. 2009). Each result list contributes a rank-based score. Combined scores determine final order. Note: RRF scores are not comparable to cosine similarity or dot product scores — they are relative ranking scores only.
 
 ### Merge Function
 
@@ -383,9 +469,15 @@ pub enum FetchStrategy {
     FullScan,
     FieldIndexLookup { index_name: String },
 }
-```
 
-`FetchPlan` gains a `strategy: FetchStrategy` field.
+pub struct FetchPlan {
+    pub collection: String,
+    pub fields: FieldList,
+    pub filter: Option<WhereClause>,
+    pub limit: Option<usize>,
+    pub strategy: FetchStrategy,   // NEW
+}
+```
 
 ### Strategy Selection
 
@@ -398,7 +490,7 @@ pub enum FetchStrategy {
 | SEARCH NEAR VECTOR NEAR SPARSE | Both | Hybrid |
 | SEARCH WHERE x NEAR VECTOR | Field index + HNSW | ScalarPreFilter + Hnsw |
 
-The planner needs access to collection schemas to make these decisions. The executor exposes collection schema info to the planner.
+The planner needs access to collection schemas to make these decisions. The `plan()` function signature changes from `plan(stmt: &Statement)` to `plan(stmt: &Statement, schemas: &DashMap<String, CollectionSchema>)`. For statements that don't need schema lookup (edges, EXPLAIN), schemas is unused. For SEARCH/FETCH, the planner looks up the collection schema to determine available indexes, representations, and select the correct strategy.
 
 ## Executor Changes
 
@@ -489,7 +581,7 @@ New error variants:
 - `DuplicateIndex(String)` — index name already exists in collection
 - `DuplicateRepresentation(String)` — representation name already exists
 - `DuplicateField(String)` — field name already exists
-- `FieldNotIndexed(String)` — WHERE clause references field with no index
+- `FieldNotIndexed(String)` — ScalarPreFilter WHERE clause references field with no index (FETCH with WHERE on unindexed field falls back to FullScan silently — this error is only for SEARCH WHERE pre-filter)
 - `SparseVectorRequired(String)` — SEARCH NEAR SPARSE on collection with no sparse representation
 - `InvalidFieldType { field: String, expected: String, got: String }` — WHERE value doesn't match declared field type
 
@@ -545,6 +637,14 @@ No new record types. Field indexes and sparse indexes are derived from `ENTITY_W
 - SEARCH NEAR SPARSE with sparse vector literal
 - Hybrid SEARCH with both NEAR VECTOR and NEAR SPARSE
 - SEARCH with WHERE clause (ScalarPreFilter syntax)
+
+### Error / Negative Tests
+- DuplicateIndex: CREATE COLLECTION with two indexes of same name → error
+- DuplicateRepresentation: CREATE COLLECTION with two representations of same name → error
+- DuplicateField: CREATE COLLECTION with two fields of same name → error
+- SparseVectorRequired: SEARCH NEAR SPARSE on collection with no sparse representation → error
+- FieldNotIndexed: SEARCH WHERE on unindexed field → error (not fallback — that's FETCH)
+- InvalidFieldType: WHERE clause value doesn't match declared field type → error
 
 ### Integration Tests
 - CREATE COLLECTION with fields + indexes → INSERT → FETCH via field index
