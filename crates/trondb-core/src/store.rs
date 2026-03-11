@@ -3,7 +3,7 @@ use std::path::Path;
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
 use crate::error::EngineError;
-use crate::types::{Collection, Entity, LogicalId};
+use crate::types::{CollectionSchema, Entity, LogicalId};
 
 const META_PARTITION: &str = "_meta";
 const COLLECTION_PREFIX: &str = "collection:";
@@ -29,19 +29,18 @@ impl FjallStore {
         Ok(Self { keyspace, meta })
     }
 
-    pub fn create_collection(&self, name: &str, dimensions: usize) -> Result<(), EngineError> {
-        let key = format!("{COLLECTION_PREFIX}{name}");
+    pub fn create_collection_schema(&self, schema: &CollectionSchema) -> Result<(), EngineError> {
+        let key = format!("{COLLECTION_PREFIX}{}", schema.name);
         if self
             .meta
             .get(&key)
             .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?
             .is_some()
         {
-            return Err(EngineError::CollectionAlreadyExists(name.to_owned()));
+            return Err(EngineError::CollectionAlreadyExists(schema.name.clone()));
         }
 
-        let collection = Collection::new(name, dimensions)?;
-        let bytes = rmp_serde::to_vec_named(&collection)
+        let bytes = rmp_serde::to_vec_named(schema)
             .map_err(|e| EngineError::Storage(e.to_string()))?;
 
         self.meta
@@ -50,8 +49,16 @@ impl FjallStore {
 
         // Create the partition for entities in this collection
         self.keyspace
-            .open_partition(name, PartitionCreateOptions::default())
+            .open_partition(&schema.name, PartitionCreateOptions::default())
             .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        // Create field index partitions for each declared index
+        for idx in &schema.indexes {
+            let partition_name = format!("{}.idx.{}", schema.name, idx.name);
+            self.keyspace
+                .open_partition(&partition_name, PartitionCreateOptions::default())
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+        }
 
         self.keyspace
             .persist(PersistMode::SyncAll)
@@ -65,9 +72,25 @@ impl FjallStore {
         self.meta.get(&key).ok().flatten().is_some()
     }
 
-    pub fn get_dimensions(&self, collection: &str) -> Result<usize, EngineError> {
-        let col = self.get_collection_meta(collection)?;
-        Ok(col.dimensions)
+    pub fn get_collection_schema(&self, name: &str) -> Result<CollectionSchema, EngineError> {
+        let key = format!("{COLLECTION_PREFIX}{name}");
+        let bytes = self
+            .meta
+            .get(&key)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?
+            .ok_or_else(|| EngineError::CollectionNotFound(name.to_owned()))?;
+
+        rmp_serde::from_slice(&bytes).map_err(|e| EngineError::Storage(e.to_string()))
+    }
+
+    pub fn list_collection_schemas(&self) -> Vec<CollectionSchema> {
+        self.meta
+            .prefix(COLLECTION_PREFIX)
+            .filter_map(|kv| {
+                let (_k, v) = kv.ok()?;
+                rmp_serde::from_slice(&v).ok()
+            })
+            .collect()
     }
 
     pub fn list_collections(&self) -> Vec<String> {
@@ -81,16 +104,21 @@ impl FjallStore {
             .collect()
     }
 
+    pub fn open_field_index_partition(
+        &self,
+        collection: &str,
+        index_name: &str,
+    ) -> Result<PartitionHandle, EngineError> {
+        let partition_name = format!("{collection}.idx.{index_name}");
+        self.keyspace
+            .open_partition(&partition_name, PartitionCreateOptions::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))
+    }
+
     pub fn insert(&self, collection: &str, entity: Entity) -> Result<(), EngineError> {
-        // Validate collection exists and check dimensions
-        let col = self.get_collection_meta(collection)?;
-        for repr in &entity.representations {
-            if repr.vector.len() != col.dimensions {
-                return Err(EngineError::DimensionMismatch {
-                    expected: col.dimensions,
-                    got: repr.vector.len(),
-                });
-            }
+        // Validate collection exists
+        if !self.has_collection(collection) {
+            return Err(EngineError::CollectionNotFound(collection.to_owned()));
         }
 
         let partition = self
@@ -251,23 +279,12 @@ impl FjallStore {
             .persist(PersistMode::SyncAll)
             .map_err(|e| EngineError::Storage(e.to_string()))
     }
-
-    fn get_collection_meta(&self, name: &str) -> Result<Collection, EngineError> {
-        let key = format!("{COLLECTION_PREFIX}{name}");
-        let bytes = self
-            .meta
-            .get(&key)
-            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?
-            .ok_or_else(|| EngineError::CollectionNotFound(name.to_owned()))?;
-
-        rmp_serde::from_slice(&bytes).map_err(|e| EngineError::Storage(e.to_string()))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Value;
+    use crate::types::{CollectionSchema, Metric, StoredRepresentation, Value};
     use tempfile::TempDir;
 
     fn open_store() -> (FjallStore, TempDir) {
@@ -276,24 +293,42 @@ mod tests {
         (store, dir)
     }
 
+    fn make_schema(name: &str, dims: usize) -> CollectionSchema {
+        CollectionSchema {
+            name: name.into(),
+            representations: vec![StoredRepresentation {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(dims),
+                metric: Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![],
+            indexes: vec![],
+        }
+    }
+
     #[test]
     fn create_collection() {
         let (store, _dir) = open_store();
-        store.create_collection("docs", 384).unwrap();
+        let schema = make_schema("docs", 384);
+        store.create_collection_schema(&schema).unwrap();
         assert!(store.has_collection("docs"));
     }
 
     #[test]
     fn create_duplicate_collection_fails() {
         let (store, _dir) = open_store();
-        store.create_collection("docs", 384).unwrap();
-        assert!(store.create_collection("docs", 384).is_err());
+        let schema = make_schema("docs", 384);
+        store.create_collection_schema(&schema).unwrap();
+        assert!(store.create_collection_schema(&schema).is_err());
     }
 
     #[test]
     fn insert_and_get_entity() {
         let (store, _dir) = open_store();
-        store.create_collection("docs", 3).unwrap();
+        let schema = make_schema("docs", 3);
+        store.create_collection_schema(&schema).unwrap();
 
         let id = LogicalId::from_string("e1");
         let entity = Entity::new(id.clone()).with_metadata("title", Value::String("Hello".into()));
@@ -317,7 +352,8 @@ mod tests {
     #[test]
     fn scan_all_entities() {
         let (store, _dir) = open_store();
-        store.create_collection("docs", 3).unwrap();
+        let schema = make_schema("docs", 3);
+        store.create_collection_schema(&schema).unwrap();
 
         for i in 0..5 {
             let entity = Entity::new(LogicalId::from_string(&format!("e{i}")));
@@ -329,10 +365,13 @@ mod tests {
     }
 
     #[test]
-    fn get_collection_dimensions() {
+    fn get_collection_schema_round_trip() {
         let (store, _dir) = open_store();
-        store.create_collection("docs", 1408).unwrap();
-        assert_eq!(store.get_dimensions("docs").unwrap(), 1408);
+        let schema = make_schema("docs", 1408);
+        store.create_collection_schema(&schema).unwrap();
+        let retrieved = store.get_collection_schema("docs").unwrap();
+        assert_eq!(retrieved.name, "docs");
+        assert_eq!(retrieved.representations[0].dimensions, Some(1408));
     }
 
     #[test]
@@ -342,7 +381,8 @@ mod tests {
         // Write
         {
             let store = FjallStore::open(dir.path()).unwrap();
-            store.create_collection("venues", 3).unwrap();
+            let schema = make_schema("venues", 3);
+            store.create_collection_schema(&schema).unwrap();
             let entity = Entity::new(LogicalId::from_string("v1"))
                 .with_metadata("name", Value::String("The Shard".into()));
             store.insert("venues", entity).unwrap();

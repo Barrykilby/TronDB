@@ -6,15 +6,20 @@ use dashmap::DashMap;
 
 use crate::edge::{AdjacencyIndex, Edge, EdgeType, DecayConfig};
 use crate::error::EngineError;
+use crate::field_index::FieldIndex;
 use crate::index::HnswIndex;
 use crate::location::{
     Encoding, LocState, LocationDescriptor, LocationTable, NodeAddress, ReprKey, Tier,
 };
-use crate::planner::Plan;
+use crate::planner::{Plan, SearchStrategy};
 use crate::result::{QueryMode, QueryResult, QueryStats, Row};
+use crate::sparse_index::SparseIndex;
 use crate::store::FjallStore;
-use crate::types::{Entity, LogicalId, ReprState, ReprType, Representation, Value};
-use trondb_tql::{FieldList, Literal, WhereClause};
+use crate::types::{
+    CollectionSchema, Entity, FieldType, LogicalId, Metric, ReprState, ReprType, Representation,
+    StoredField, StoredIndex, StoredRepresentation, Value, VectorData,
+};
+use trondb_tql::{FieldList, Literal, VectorLiteral, WhereClause};
 use trondb_wal::{RecordType, WalRecord, WalWriter};
 
 // ---------------------------------------------------------------------------
@@ -26,6 +31,9 @@ pub struct Executor {
     wal: WalWriter,
     location: Arc<LocationTable>,
     indexes: DashMap<String, HnswIndex>,
+    sparse_indexes: DashMap<String, SparseIndex>,
+    field_indexes: DashMap<String, FieldIndex>,
+    schemas: DashMap<String, CollectionSchema>,
     adjacency: AdjacencyIndex,
     edge_types: DashMap<String, EdgeType>,
 }
@@ -37,6 +45,9 @@ impl Executor {
             wal,
             location,
             indexes: DashMap::new(),
+            sparse_indexes: DashMap::new(),
+            field_indexes: DashMap::new(),
+            schemas: DashMap::new(),
             adjacency: AdjacencyIndex::new(),
             edge_types: DashMap::new(),
         }
@@ -50,18 +61,39 @@ impl Executor {
         for record in records {
             match record.record_type {
                 RecordType::SchemaCreateColl => {
-                    #[derive(serde::Deserialize)]
-                    struct CreateCollPayload {
-                        name: String,
-                        dimensions: usize,
-                    }
-                    let payload: CreateCollPayload = rmp_serde::from_slice(&record.payload)
-                        .map_err(|e| EngineError::Storage(e.to_string()))?;
-
-                    // Idempotent: skip if collection already exists
-                    if !self.store.has_collection(&payload.name) {
-                        self.store.create_collection(&payload.name, payload.dimensions)?;
-                        replayed += 1;
+                    // Try to deserialize as CollectionSchema first (new format)
+                    if let Ok(schema) = rmp_serde::from_slice::<CollectionSchema>(&record.payload) {
+                        if !self.store.has_collection(&schema.name) {
+                            self.store.create_collection_schema(&schema)?;
+                            self.schemas.insert(schema.name.clone(), schema);
+                            replayed += 1;
+                        }
+                    } else {
+                        // Legacy format — try old {name, dimensions} struct
+                        #[derive(serde::Deserialize)]
+                        struct LegacyPayload {
+                            name: String,
+                            dimensions: usize,
+                        }
+                        if let Ok(payload) = rmp_serde::from_slice::<LegacyPayload>(&record.payload) {
+                            if !self.store.has_collection(&payload.name) {
+                                let schema = CollectionSchema {
+                                    name: payload.name.clone(),
+                                    representations: vec![StoredRepresentation {
+                                        name: "default".into(),
+                                        model: None,
+                                        dimensions: Some(payload.dimensions),
+                                        metric: Metric::Cosine,
+                                        sparse: false,
+                                    }],
+                                    fields: vec![],
+                                    indexes: vec![],
+                                };
+                                self.store.create_collection_schema(&schema)?;
+                                self.schemas.insert(schema.name.clone(), schema);
+                                replayed += 1;
+                            }
+                        }
                     }
                 }
                 RecordType::EntityWrite => {
@@ -131,21 +163,24 @@ impl Executor {
 
         match plan {
             Plan::CreateCollection(p) => {
-                // WAL: TX_BEGIN → SCHEMA_CREATE_COLL → commit
+                // Build CollectionSchema from plan
+                let schema = build_collection_schema(p);
+
+                // WAL: TX_BEGIN -> SCHEMA_CREATE_COLL -> commit
                 let tx_id = self.wal.next_tx_id();
                 self.wal.append(RecordType::TxBegin, &p.name, tx_id, 1, vec![]);
 
-                let payload = rmp_serde::to_vec_named(&serde_json::json!({
-                    "name": p.name,
-                    "dimensions": p.dimensions,
-                }))
-                .map_err(|e| EngineError::Storage(e.to_string()))?;
+                let payload = rmp_serde::to_vec_named(&schema)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
 
                 self.wal.append(RecordType::SchemaCreateColl, &p.name, tx_id, 1, payload);
                 self.wal.commit(tx_id).await?;
 
                 // Apply to Fjall
-                self.store.create_collection(&p.name, p.dimensions)?;
+                self.store.create_collection_schema(&schema)?;
+
+                // Register in schemas map
+                self.schemas.insert(schema.name.clone(), schema);
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
@@ -153,8 +188,11 @@ impl Executor {
                         values: HashMap::from([(
                             "result".into(),
                             Value::String(format!(
-                                "Collection '{}' created ({} dimensions)",
-                                p.name, p.dimensions
+                                "Collection '{}' created ({} representations, {} fields, {} indexes)",
+                                p.name,
+                                p.representations.len(),
+                                p.fields.len(),
+                                p.indexes.len(),
                             )),
                         )]),
                         score: None,
@@ -182,29 +220,30 @@ impl Executor {
                     entity.metadata.insert(field.clone(), literal_to_value(value));
                 }
 
-                // Handle vector
-                if let Some(ref vec_f64) = p.vector {
-                    let dims = self.store.get_dimensions(&p.collection)?;
-                    if vec_f64.len() != dims {
-                        return Err(EngineError::DimensionMismatch {
-                            expected: dims,
-                            got: vec_f64.len(),
-                        });
-                    }
-
-                    let vec_f32: Vec<f32> = vec_f64.iter().map(|v| *v as f32).collect();
+                // Handle named representation vectors
+                for (repr_name, vec_lit) in &p.vectors {
+                    let vector_data = match vec_lit {
+                        VectorLiteral::Dense(v) => {
+                            let vec_f32: Vec<f32> = v.iter().map(|x| *x as f32).collect();
+                            VectorData::Dense(vec_f32)
+                        }
+                        VectorLiteral::Sparse(v) => {
+                            VectorData::Sparse(v.clone())
+                        }
+                    };
 
                     let repr = Representation {
+                        name: repr_name.clone(),
                         repr_type: ReprType::Atomic,
                         fields: p.fields.clone(),
-                        vector: vec_f32,
+                        vector: vector_data,
                         recipe_hash: [0u8; 32],
                         state: ReprState::Clean,
                     };
                     entity.representations.push(repr);
                 }
 
-                // WAL: TX_BEGIN → ENTITY_WRITE → LOCATION_UPDATE(s) → commit
+                // WAL: TX_BEGIN -> ENTITY_WRITE -> LOCATION_UPDATE(s) -> commit
                 let tx_id = self.wal.next_tx_id();
                 self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
 
@@ -253,13 +292,16 @@ impl Executor {
                     );
                 }
 
-                // Apply to HNSW index
+                // Apply to HNSW index (only dense vectors)
                 for repr in &entity.representations {
-                    let dims = self.store.get_dimensions(&p.collection)?;
-                    let index = self.indexes
-                        .entry(p.collection.clone())
-                        .or_insert_with(|| HnswIndex::new(dims));
-                    index.insert(&id, &repr.vector);
+                    if let VectorData::Dense(ref vec_f32) = repr.vector {
+                        let dims = vec_f32.len();
+                        let index = self.indexes
+                            .entry(p.collection.clone())
+                            .or_insert_with(|| HnswIndex::new(dims));
+                        index.insert(&id, vec_f32);
+                    }
+                    // NOTE: sparse index updates are Task 9 work
                 }
 
                 Ok(QueryResult {
@@ -322,54 +364,59 @@ impl Executor {
                     return Err(EngineError::CollectionNotFound(p.collection.clone()));
                 }
 
-                // Validate dimensions
-                let dims = self.store.get_dimensions(&p.collection)?;
-                if p.query_vector.len() != dims {
-                    return Err(EngineError::DimensionMismatch {
-                        expected: dims,
-                        got: p.query_vector.len(),
-                    });
-                }
+                match &p.strategy {
+                    SearchStrategy::Hnsw => {
+                        let query_f64 = p.dense_vector.as_ref()
+                            .ok_or_else(|| EngineError::InvalidQuery("HNSW requires dense vector".into()))?;
+                        let query_f32: Vec<f32> = query_f64.iter().map(|v| *v as f32).collect();
 
-                // Cast query vector f64 → f32
-                let query_f32: Vec<f32> = p.query_vector.iter().map(|v| *v as f32).collect();
+                        // Search HNSW index
+                        let candidates = if let Some(index) = self.indexes.get(&p.collection) {
+                            index.search(&query_f32, p.k)
+                        } else {
+                            Vec::new()
+                        };
 
-                // Search HNSW index
-                let candidates = if let Some(index) = self.indexes.get(&p.collection) {
-                    index.search(&query_f32, p.k)
-                } else {
-                    Vec::new()
-                };
+                        // Filter by confidence threshold and resolve entities
+                        let mut rows = Vec::new();
+                        let mut scanned = 0;
+                        for (id, similarity) in candidates {
+                            if (similarity as f64) < p.confidence_threshold {
+                                continue;
+                            }
+                            scanned += 1;
 
-                // Filter by confidence threshold and resolve entities
-                let mut rows = Vec::new();
-                let mut scanned = 0;
-                for (id, similarity) in candidates {
-                    if (similarity as f64) < p.confidence_threshold {
-                        continue;
-                    }
-                    scanned += 1;
-
-                    // Resolve entity from Fjall
-                    if let Ok(entities) = self.store.scan(&p.collection) {
-                        if let Some(entity) = entities.iter().find(|e| e.id == id) {
-                            let mut row = entity_to_row(entity, &FieldList::All);
-                            row.score = Some(similarity);
-                            rows.push(row);
+                            if let Ok(entities) = self.store.scan(&p.collection) {
+                                if let Some(entity) = entities.iter().find(|e| e.id == id) {
+                                    let mut row = entity_to_row(entity, &p.fields);
+                                    row.score = Some(similarity);
+                                    rows.push(row);
+                                }
+                            }
                         }
+
+                        Ok(QueryResult {
+                            columns: build_columns(&rows, &p.fields),
+                            rows,
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: scanned,
+                                mode: QueryMode::Probabilistic,
+                                tier: "Ram".into(),
+                            },
+                        })
+                    }
+                    SearchStrategy::Sparse => {
+                        Err(EngineError::UnsupportedOperation(
+                            "Sparse-only SEARCH not yet implemented (Task 10)".into(),
+                        ))
+                    }
+                    SearchStrategy::Hybrid => {
+                        Err(EngineError::UnsupportedOperation(
+                            "Hybrid SEARCH not yet implemented (Task 10)".into(),
+                        ))
                     }
                 }
-
-                Ok(QueryResult {
-                    columns: build_columns(&rows, &FieldList::All),
-                    rows,
-                    stats: QueryStats {
-                        elapsed: start.elapsed(),
-                        entities_scanned: scanned,
-                        mode: QueryMode::Probabilistic,
-                        tier: "Ram".into(),
-                    },
-                })
             }
 
             Plan::Explain(inner) => {
@@ -402,7 +449,7 @@ impl Executor {
                     decay_config: DecayConfig::default(),
                 };
 
-                // WAL: TxBegin → SchemaCreateEdgeType → commit
+                // WAL: TxBegin -> SchemaCreateEdgeType -> commit
                 let tx_id = self.wal.next_tx_id();
                 self.wal.append(RecordType::TxBegin, &p.name, tx_id, 1, vec![]);
                 let payload = rmp_serde::to_vec_named(&edge_type)
@@ -422,7 +469,7 @@ impl Executor {
                         values: HashMap::from([(
                             "result".into(),
                             Value::String(format!(
-                                "Edge type '{}' created ({} → {})",
+                                "Edge type '{}' created ({} -> {})",
                                 p.name, p.from_collection, p.to_collection
                             )),
                         )]),
@@ -461,7 +508,7 @@ impl Executor {
                     metadata,
                 };
 
-                // WAL: TxBegin → EdgeWrite → commit
+                // WAL: TxBegin -> EdgeWrite -> commit
                 let tx_id = self.wal.next_tx_id();
                 self.wal.append(RecordType::TxBegin, &p.edge_type, tx_id, 1, vec![]);
                 let payload = rmp_serde::to_vec_named(&edge)
@@ -482,7 +529,7 @@ impl Executor {
                         values: HashMap::from([(
                             "result".into(),
                             Value::String(format!(
-                                "Edge '{}' created: {} → {}",
+                                "Edge '{}' created: {} -> {}",
                                 p.edge_type, p.from_id, p.to_id
                             )),
                         )]),
@@ -501,7 +548,7 @@ impl Executor {
                 let from_id = LogicalId::from_string(&p.from_id);
                 let to_id = LogicalId::from_string(&p.to_id);
 
-                // WAL: TxBegin → EdgeDelete → commit
+                // WAL: TxBegin -> EdgeDelete -> commit
                 let tx_id = self.wal.next_tx_id();
                 self.wal.append(RecordType::TxBegin, &p.edge_type, tx_id, 1, vec![]);
                 let payload = rmp_serde::to_vec_named(&serde_json::json!({
@@ -526,7 +573,7 @@ impl Executor {
                         values: HashMap::from([(
                             "result".into(),
                             Value::String(format!(
-                                "Edge '{}' deleted: {} → {}",
+                                "Edge '{}' deleted: {} -> {}",
                                 p.edge_type, p.from_id, p.to_id
                             )),
                         )]),
@@ -602,12 +649,24 @@ impl Executor {
         &self.indexes
     }
 
+    pub fn sparse_indexes(&self) -> &DashMap<String, SparseIndex> {
+        &self.sparse_indexes
+    }
+
+    pub fn field_indexes(&self) -> &DashMap<String, FieldIndex> {
+        &self.field_indexes
+    }
+
+    pub fn schemas(&self) -> &DashMap<String, CollectionSchema> {
+        &self.schemas
+    }
+
     pub fn scan_collection(&self, name: &str) -> Result<Vec<crate::types::Entity>, EngineError> {
         self.store.scan(name)
     }
 
-    pub fn get_collection_dimensions(&self, name: &str) -> Result<usize, EngineError> {
-        self.store.get_dimensions(name)
+    pub fn store(&self) -> &FjallStore {
+        &self.store
     }
 
     pub fn adjacency(&self) -> &AdjacencyIndex {
@@ -624,6 +683,64 @@ impl Executor {
 
     pub fn scan_edges(&self, edge_type: &str) -> Result<Vec<Edge>, EngineError> {
         self.store.scan_edges(edge_type)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build CollectionSchema from CreateCollectionPlan
+// ---------------------------------------------------------------------------
+
+fn build_collection_schema(p: &crate::planner::CreateCollectionPlan) -> CollectionSchema {
+    let representations: Vec<StoredRepresentation> = p.representations.iter().map(|r| {
+        StoredRepresentation {
+            name: r.name.clone(),
+            model: r.model.clone(),
+            dimensions: r.dimensions,
+            metric: convert_metric(&r.metric),
+            sparse: r.sparse,
+        }
+    }).collect();
+
+    let fields: Vec<StoredField> = p.fields.iter().map(|f| {
+        StoredField {
+            name: f.name.clone(),
+            field_type: convert_field_type(&f.field_type),
+        }
+    }).collect();
+
+    let indexes: Vec<StoredIndex> = p.indexes.iter().map(|i| {
+        StoredIndex {
+            name: i.name.clone(),
+            fields: i.fields.clone(),
+            partial_condition: i.partial_condition.as_ref().map(|c| format!("{c:?}")),
+        }
+    }).collect();
+
+    CollectionSchema {
+        name: p.name.clone(),
+        representations,
+        fields,
+        indexes,
+    }
+}
+
+/// Convert AST FieldType to core FieldType.
+fn convert_field_type(ft: &trondb_tql::FieldType) -> FieldType {
+    match ft {
+        trondb_tql::FieldType::Text => FieldType::Text,
+        trondb_tql::FieldType::DateTime => FieldType::DateTime,
+        trondb_tql::FieldType::Bool => FieldType::Bool,
+        trondb_tql::FieldType::Int => FieldType::Int,
+        trondb_tql::FieldType::Float => FieldType::Float,
+        trondb_tql::FieldType::EntityRef(s) => FieldType::EntityRef(s.clone()),
+    }
+}
+
+/// Convert AST Metric to core Metric.
+fn convert_metric(m: &trondb_tql::Metric) -> Metric {
+    match m {
+        trondb_tql::Metric::Cosine => Metric::Cosine,
+        trondb_tql::Metric::InnerProduct => Metric::InnerProduct,
     }
 }
 
@@ -778,7 +895,7 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("verb", "FETCH".into()));
             props.push(("collection", p.collection.clone()));
             props.push(("tier", "Fjall".into()));
-            props.push(("strategy", "FullScan".into()));
+            props.push(("strategy", format!("{:?}", p.strategy)));
             if let Some(limit) = p.limit {
                 props.push(("limit", limit.to_string()));
             }
@@ -789,7 +906,12 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("collection", p.collection.clone()));
             props.push(("tier", "Ram".into()));
             props.push(("encoding", "Float32".into()));
-            props.push(("strategy", "HNSW".into()));
+            let strategy_name = match &p.strategy {
+                SearchStrategy::Hnsw => "HNSW",
+                SearchStrategy::Sparse => "Sparse",
+                SearchStrategy::Hybrid => "Hybrid",
+            };
+            props.push(("strategy", strategy_name.into()));
             props.push(("k", p.k.to_string()));
             props.push(("confidence_threshold", p.confidence_threshold.to_string()));
         }
@@ -803,7 +925,9 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("mode", "Deterministic".into()));
             props.push(("verb", "CREATE COLLECTION".into()));
             props.push(("collection", p.name.clone()));
-            props.push(("dimensions", p.dimensions.to_string()));
+            props.push(("representations", p.representations.len().to_string()));
+            props.push(("fields", p.fields.len().to_string()));
+            props.push(("indexes", p.indexes.len().to_string()));
         }
         Plan::Explain(_) => {
             props.push(("mode", "Deterministic".into()));
@@ -859,7 +983,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{CreateCollectionPlan, FetchPlan, InsertPlan};
+    use crate::planner::{CreateCollectionPlan, FetchPlan, FetchStrategy, InsertPlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -877,7 +1001,15 @@ mod tests {
     async fn create_collection(exec: &Executor, name: &str, dims: usize) {
         exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
             name: name.into(),
-            dimensions: dims,
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(dims),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![],
+            indexes: vec![],
         }))
         .await
         .unwrap();
@@ -896,11 +1028,15 @@ mod tests {
             fields.push(k.into());
             values.push(v);
         }
+        let vectors = match vector {
+            Some(v) => vec![("default".to_string(), VectorLiteral::Dense(v))],
+            None => vec![],
+        };
         exec.execute(&Plan::Insert(InsertPlan {
             collection: collection.into(),
             fields,
             values,
-            vector,
+            vectors,
         }))
         .await
         .unwrap();
@@ -934,6 +1070,7 @@ mod tests {
                 fields: FieldList::All,
                 filter: None,
                 limit: None,
+                strategy: FetchStrategy::FullScan,
             }))
             .await
             .unwrap();
@@ -978,6 +1115,7 @@ mod tests {
                     Literal::String("London".into()),
                 )),
                 limit: None,
+                strategy: FetchStrategy::FullScan,
             }))
             .await
             .unwrap();
@@ -998,6 +1136,7 @@ mod tests {
             fields: FieldList::All,
             filter: None,
             limit: None,
+            strategy: FetchStrategy::FullScan,
         });
 
         let result = exec

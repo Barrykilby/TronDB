@@ -4,8 +4,6 @@ use std::collections::HashMap;
 use std::fmt;
 use uuid::Uuid;
 
-use crate::error::EngineError;
-
 // ---------------------------------------------------------------------------
 // LogicalId
 // ---------------------------------------------------------------------------
@@ -98,9 +96,10 @@ pub enum ReprState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Representation {
+    pub name: String,
     pub repr_type: ReprType,
     pub fields: Vec<String>,
-    pub vector: Vec<f32>,
+    pub vector: VectorData,
     pub recipe_hash: [u8; 32],
     pub state: ReprState,
 }
@@ -213,48 +212,6 @@ pub struct StoredIndex {
     pub partial_condition: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// LegacyFieldType / FieldDef / Collection
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LegacyFieldType {
-    String,
-    Int,
-    Float,
-    Bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FieldDef {
-    pub name: String,
-    pub field_type: LegacyFieldType,
-    pub indexed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Collection {
-    pub name: String,
-    pub dimensions: usize,
-    pub fields: Vec<FieldDef>,
-}
-
-impl Collection {
-    /// Create a new collection. Fails if `dims` is zero.
-    pub fn new(name: impl Into<String>, dims: usize) -> Result<Self, EngineError> {
-        if dims == 0 {
-            return Err(EngineError::DimensionMismatch {
-                expected: 1,
-                got: 0,
-            });
-        }
-        Ok(Self {
-            name: name.into(),
-            dimensions: dims,
-            fields: Vec::new(),
-        })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -298,13 +255,6 @@ mod tests {
         );
         assert_eq!(entity.metadata.get("age"), Some(&Value::Int(30)));
         assert!(entity.representations.is_empty());
-    }
-
-    #[test]
-    fn collection_validates_dimensions() {
-        assert!(Collection::new("test", 0).is_err());
-        let col = Collection::new("test", 384).unwrap();
-        assert_eq!(col.dimensions, 384);
     }
 
     #[test]

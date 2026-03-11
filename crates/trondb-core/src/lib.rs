@@ -71,17 +71,28 @@ impl Engine {
             eprintln!("WAL recovery: replayed {replayed} records");
         }
 
+        // Load schemas from Fjall into memory
+        for schema in executor.store().list_collection_schemas() {
+            executor.schemas().insert(schema.name.clone(), schema);
+        }
+
         // Rebuild HNSW indexes from Fjall
         for collection_name in executor.collections() {
             if let Ok(entities) = executor.scan_collection(&collection_name) {
-                if let Ok(dims) = executor.get_collection_dimensions(&collection_name) {
-                    for entity in &entities {
-                        if !entity.representations.is_empty() {
-                            let index = executor.indexes()
-                                .entry(collection_name.clone())
-                                .or_insert_with(|| crate::index::HnswIndex::new(dims));
+                // Get dimensions from schema
+                if let Some(schema_ref) = executor.schemas().get(&collection_name) {
+                    let dims = schema_ref.representations.iter()
+                        .find(|r| !r.sparse)
+                        .and_then(|r| r.dimensions);
+                    if let Some(dims) = dims {
+                        for entity in &entities {
                             for repr in &entity.representations {
-                                index.insert(&entity.id, &repr.vector);
+                                if let types::VectorData::Dense(ref vec_f32) = repr.vector {
+                                    let index = executor.indexes()
+                                        .entry(collection_name.clone())
+                                        .or_insert_with(|| crate::index::HnswIndex::new(dims));
+                                    index.insert(&entity.id, vec_f32);
+                                }
                             }
                         }
                     }
@@ -143,7 +154,7 @@ impl Engine {
     pub async fn execute_tql(&self, input: &str) -> Result<QueryResult, EngineError> {
         let stmt =
             trondb_tql::parse(input).map_err(|e| EngineError::InvalidQuery(e.to_string()))?;
-        let plan = planner::plan(&stmt)?;
+        let plan = planner::plan(&stmt, self.executor.schemas())?;
         self.executor.execute(&plan).await
     }
 
@@ -184,25 +195,32 @@ mod tests {
         (engine, dir)
     }
 
+    /// Helper: CREATE COLLECTION with a single dense representation using new block syntax.
+    async fn create_simple_collection(engine: &Engine, name: &str, dims: usize) {
+        let tql = format!(
+            "CREATE COLLECTION {name} (\
+                REPRESENTATION default DIMENSIONS {dims} METRIC COSINE\
+            );"
+        );
+        engine.execute_tql(&tql).await.unwrap();
+    }
+
     #[tokio::test]
     async fn end_to_end_create_insert_fetch() {
         let (engine, _dir) = test_engine().await;
 
-        engine
-            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-            .await
-            .unwrap();
+        create_simple_collection(&engine, "venues", 3).await;
 
         engine
             .execute_tql(
-                "INSERT INTO venues (id, name, city) VALUES ('v1', 'The Shard', 'London') VECTOR [0.1, 0.2, 0.3];",
+                "INSERT INTO venues (id, name, city) VALUES ('v1', 'The Shard', 'London') REPRESENTATION default VECTOR [0.1, 0.2, 0.3];",
             )
             .await
             .unwrap();
 
         engine
             .execute_tql(
-                "INSERT INTO venues (id, name, city) VALUES ('v2', 'Old Trafford', 'Manchester') VECTOR [0.4, 0.5, 0.6];",
+                "INSERT INTO venues (id, name, city) VALUES ('v2', 'Old Trafford', 'Manchester') REPRESENTATION default VECTOR [0.4, 0.5, 0.6];",
             )
             .await
             .unwrap();
@@ -223,21 +241,18 @@ mod tests {
     async fn search_returns_results() {
         let (engine, _dir) = test_engine().await;
 
-        engine
-            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-            .await
-            .unwrap();
+        create_simple_collection(&engine, "venues", 3).await;
 
         engine
             .execute_tql(
-                "INSERT INTO venues (id, name) VALUES ('v1', 'The Shard') VECTOR [1.0, 0.0, 0.0];",
+                "INSERT INTO venues (id, name) VALUES ('v1', 'The Shard') REPRESENTATION default VECTOR [1.0, 0.0, 0.0];",
             )
             .await
             .unwrap();
 
         engine
             .execute_tql(
-                "INSERT INTO venues (id, name) VALUES ('v2', 'Big Ben') VECTOR [0.0, 1.0, 0.0];",
+                "INSERT INTO venues (id, name) VALUES ('v2', 'Big Ben') REPRESENTATION default VECTOR [0.0, 1.0, 0.0];",
             )
             .await
             .unwrap();
@@ -262,21 +277,18 @@ mod tests {
     async fn search_confidence_filtering() {
         let (engine, _dir) = test_engine().await;
 
-        engine
-            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-            .await
-            .unwrap();
+        create_simple_collection(&engine, "venues", 3).await;
 
         engine
             .execute_tql(
-                "INSERT INTO venues (id, name) VALUES ('v1', 'Close') VECTOR [0.9, 0.1, 0.0];",
+                "INSERT INTO venues (id, name) VALUES ('v1', 'Close') REPRESENTATION default VECTOR [0.9, 0.1, 0.0];",
             )
             .await
             .unwrap();
 
         engine
             .execute_tql(
-                "INSERT INTO venues (id, name) VALUES ('v2', 'Far') VECTOR [0.0, 0.0, 1.0];",
+                "INSERT INTO venues (id, name) VALUES ('v2', 'Far') REPRESENTATION default VECTOR [0.0, 0.0, 1.0];",
             )
             .await
             .unwrap();
@@ -299,10 +311,7 @@ mod tests {
     async fn search_empty_collection_returns_empty() {
         let (engine, _dir) = test_engine().await;
 
-        engine
-            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-            .await
-            .unwrap();
+        create_simple_collection(&engine, "venues", 3).await;
 
         let result = engine
             .execute_tql("SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 5;")
@@ -359,13 +368,10 @@ mod tests {
         // Insert data
         {
             let engine = Engine::open(config.clone()).await.unwrap();
-            engine
-                .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-                .await
-                .unwrap();
+            create_simple_collection(&engine, "venues", 3).await;
             engine
                 .execute_tql(
-                    "INSERT INTO venues (id, name) VALUES ('v1', 'Test') VECTOR [1.0, 0.0, 0.0];",
+                    "INSERT INTO venues (id, name) VALUES ('v1', 'Test') REPRESENTATION default VECTOR [1.0, 0.0, 0.0];",
                 )
                 .await
                 .unwrap();
@@ -425,14 +431,22 @@ mod tests {
             };
             let writer = trondb_wal::WalWriter::open(wal_config).await.unwrap();
 
-            // Tx1: create collection
+            // Tx1: create collection (new schema format)
             let tx1 = writer.next_tx_id();
             writer.append(trondb_wal::RecordType::TxBegin, "venues", tx1, 1, vec![]);
-            let coll_payload = rmp_serde::to_vec_named(&serde_json::json!({
-                "name": "venues",
-                "dimensions": 3
-            }))
-            .unwrap();
+            let schema = crate::types::CollectionSchema {
+                name: "venues".into(),
+                representations: vec![crate::types::StoredRepresentation {
+                    name: "default".into(),
+                    model: None,
+                    dimensions: Some(3),
+                    metric: crate::types::Metric::Cosine,
+                    sparse: false,
+                }],
+                fields: vec![],
+                indexes: vec![],
+            };
+            let coll_payload = rmp_serde::to_vec_named(&schema).unwrap();
             writer.append(
                 trondb_wal::RecordType::SchemaCreateColl,
                 "venues",
@@ -497,13 +511,10 @@ mod tests {
         // Write data
         {
             let engine = Engine::open(config.clone()).await.unwrap();
-            engine
-                .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-                .await
-                .unwrap();
+            create_simple_collection(&engine, "venues", 3).await;
             engine
                 .execute_tql(
-                    "INSERT INTO venues (id, name) VALUES ('v1', 'The Shard') VECTOR [0.1, 0.2, 0.3];",
+                    "INSERT INTO venues (id, name) VALUES ('v1', 'The Shard') REPRESENTATION default VECTOR [0.1, 0.2, 0.3];",
                 )
                 .await
                 .unwrap();
@@ -528,14 +539,11 @@ mod tests {
     async fn insert_with_vector_creates_location_entry() {
         let (engine, _dir) = test_engine().await;
 
-        engine
-            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-            .await
-            .unwrap();
+        create_simple_collection(&engine, "venues", 3).await;
 
         engine
             .execute_tql(
-                "INSERT INTO venues (id, name) VALUES ('v1', 'Test') VECTOR [0.1, 0.2, 0.3];",
+                "INSERT INTO venues (id, name) VALUES ('v1', 'Test') REPRESENTATION default VECTOR [0.1, 0.2, 0.3];",
             )
             .await
             .unwrap();
@@ -555,10 +563,7 @@ mod tests {
     async fn insert_without_vector_has_no_location_entry() {
         let (engine, _dir) = test_engine().await;
 
-        engine
-            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-            .await
-            .unwrap();
+        create_simple_collection(&engine, "venues", 3).await;
 
         engine
             .execute_tql("INSERT INTO venues (id, name) VALUES ('v1', 'Test');")
@@ -572,7 +577,7 @@ mod tests {
     async fn create_edge_type_and_traverse() {
         let (engine, _dir) = test_engine().await;
 
-        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        create_simple_collection(&engine, "people", 3).await;
         engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
         engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
 
@@ -591,7 +596,7 @@ mod tests {
     async fn delete_edge_removes_from_traverse() {
         let (engine, _dir) = test_engine().await;
 
-        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        create_simple_collection(&engine, "people", 3).await;
         engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
         engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
 
@@ -607,7 +612,7 @@ mod tests {
     async fn insert_edge_with_metadata() {
         let (engine, _dir) = test_engine().await;
 
-        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        create_simple_collection(&engine, "people", 3).await;
         engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
         engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
 
@@ -623,7 +628,7 @@ mod tests {
     async fn insert_edge_nonexistent_type_fails() {
         let (engine, _dir) = test_engine().await;
 
-        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        create_simple_collection(&engine, "people", 3).await;
         engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
         engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
 
@@ -642,7 +647,7 @@ mod tests {
     async fn traverse_depth_gt_1_fails() {
         let (engine, _dir) = test_engine().await;
 
-        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        create_simple_collection(&engine, "people", 3).await;
         engine.execute_tql("CREATE EDGE knows FROM people TO people;").await.unwrap();
 
         let result = engine.execute_tql("TRAVERSE knows FROM 'p1' DEPTH 2;").await;
@@ -690,7 +695,7 @@ mod tests {
         // Insert edge
         {
             let engine = Engine::open(config.clone()).await.unwrap();
-            engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+            create_simple_collection(&engine, "people", 3).await;
             engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
             engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
             engine.execute_tql("CREATE EDGE knows FROM people TO people;").await.unwrap();
@@ -725,13 +730,10 @@ mod tests {
         // Insert data
         {
             let engine = Engine::open(config.clone()).await.unwrap();
-            engine
-                .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
-                .await
-                .unwrap();
+            create_simple_collection(&engine, "venues", 3).await;
             engine
                 .execute_tql(
-                    "INSERT INTO venues (id, name) VALUES ('v1', 'Test') VECTOR [0.1, 0.2, 0.3];",
+                    "INSERT INTO venues (id, name) VALUES ('v1', 'Test') REPRESENTATION default VECTOR [0.1, 0.2, 0.3];",
                 )
                 .await
                 .unwrap();
