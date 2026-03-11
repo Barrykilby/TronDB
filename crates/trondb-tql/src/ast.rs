@@ -15,6 +15,7 @@ pub enum Statement {
     Demote(DemoteStmt),
     Promote(PromoteStmt),
     ExplainTiers(ExplainTiersStmt),
+    Update(UpdateStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -226,4 +227,13 @@ pub struct PromoteStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainTiersStmt {
     pub collection: String,
+}
+
+// --- UPDATE ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStmt {
+    pub entity_id: String,
+    pub collection: String,
+    pub assignments: Vec<(String, Literal)>,
 }

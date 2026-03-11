@@ -187,6 +187,15 @@ pub enum Token {
     #[token("STEP", priority = 10, ignore(ascii_case))]
     Step,
 
+    #[token("UPDATE", priority = 10, ignore(ascii_case))]
+    Update,
+
+    #[token("SET", priority = 10, ignore(ascii_case))]
+    Set,
+
+    #[token("IN", priority = 10, ignore(ascii_case))]
+    In,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),

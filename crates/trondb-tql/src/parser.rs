@@ -132,6 +132,7 @@ impl Parser {
                 self.expect(&Token::Semicolon)?;
                 Ok(Statement::AlterEntityDropAffinity(AlterEntityDropAffinityStmt { entity_id }))
             }
+            Some(Token::Update) => self.parse_update(),
             Some(Token::Delete) => self.parse_delete(),
             Some(Token::Traverse) => self.parse_traverse(),
             Some(tok) => {
@@ -521,6 +522,41 @@ impl Parser {
             from_id,
             to_id,
             metadata,
+        }))
+    }
+
+    fn parse_update(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // UPDATE
+        let entity_id = self.expect_string_lit()?;
+        self.expect(&Token::In)?;
+        let collection = self.expect_ident()?;
+        self.expect(&Token::Set)?;
+
+        let mut assignments = Vec::new();
+        loop {
+            let field = self.expect_ident()?;
+            self.expect(&Token::Eq)?;
+            if self.peek() == Some(&Token::Null) {
+                let pos = self.tokens.get(self.pos).map(|(_, s)| s.start).unwrap_or(0);
+                return Err(ParseError::UnexpectedToken {
+                    pos,
+                    expected: "value (NULL not supported in UPDATE)".to_string(),
+                    got: "NULL".into(),
+                });
+            }
+            let value = self.parse_literal()?;
+            assignments.push((field, value));
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::Update(UpdateStmt {
+            entity_id,
+            collection,
+            assignments,
         }))
     }
 
@@ -1415,5 +1451,40 @@ mod tests {
             }
             _ => panic!("expected CreateEdgeType"),
         }
+    }
+
+    #[test]
+    fn parse_update_single_field() {
+        let stmt = parse("UPDATE 'v1' IN venues SET name = 'New Name';").unwrap();
+        match stmt {
+            Statement::Update(u) => {
+                assert_eq!(u.entity_id, "v1");
+                assert_eq!(u.collection, "venues");
+                assert_eq!(u.assignments.len(), 1);
+                assert_eq!(u.assignments[0].0, "name");
+                assert_eq!(u.assignments[0].1, Literal::String("New Name".into()));
+            }
+            _ => panic!("expected UpdateStmt"),
+        }
+    }
+
+    #[test]
+    fn parse_update_multiple_fields() {
+        let stmt = parse("UPDATE 'v1' IN venues SET name = 'X', score = 42, active = true;").unwrap();
+        match stmt {
+            Statement::Update(u) => {
+                assert_eq!(u.assignments.len(), 3);
+                assert_eq!(u.assignments[0], ("name".into(), Literal::String("X".into())));
+                assert_eq!(u.assignments[1], ("score".into(), Literal::Int(42)));
+                assert_eq!(u.assignments[2], ("active".into(), Literal::Bool(true)));
+            }
+            _ => panic!("expected UpdateStmt"),
+        }
+    }
+
+    #[test]
+    fn parse_update_rejects_null() {
+        let err = parse("UPDATE 'v1' IN venues SET name = NULL;").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }));
     }
 }
