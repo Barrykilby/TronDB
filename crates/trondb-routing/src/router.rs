@@ -161,6 +161,7 @@ pub struct SemanticRouter {
     config: RouterConfig,
     shutdown_tx: watch::Sender<bool>,
     _poll_handle: JoinHandle<()>,
+    last_decision: Arc<std::sync::Mutex<Option<RoutingDecision>>>,
 }
 
 impl SemanticRouter {
@@ -195,6 +196,7 @@ impl SemanticRouter {
             config,
             shutdown_tx,
             _poll_handle: poll_handle,
+            last_decision: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -206,12 +208,38 @@ impl SemanticRouter {
         &self.affinity
     }
 
+    pub fn last_routing_decision(&self) -> Option<RoutingDecision> {
+        self.last_decision.lock().unwrap().clone()
+    }
+
     pub async fn route_and_execute(
         &self,
         plan: &Plan,
     ) -> Result<QueryResult, RouterError> {
+        // For EXPLAIN plans, route the inner plan then append routing rows to the result.
+        if let Plan::Explain(inner) = plan {
+            let annotated = self.annotate(inner);
+            let decision = self.route(&annotated)?;
+            *self.last_decision.lock().unwrap() = Some(decision.clone());
+            let node = self.nodes.get(&decision.node)
+                .ok_or(RouterError::NoCandidates)?;
+            let mut result = node.execute(plan).await?;
+            // Append routing rows to the explain output
+            let mut extra = routing_rows(&decision);
+            result.rows.append(&mut extra);
+            // Ensure columns include property/value if not already present
+            if !result.columns.contains(&"property".to_owned()) {
+                result.columns.push("property".to_owned());
+            }
+            if !result.columns.contains(&"value".to_owned()) {
+                result.columns.push("value".to_owned());
+            }
+            return Ok(result);
+        }
+
         let annotated = self.annotate(plan);
         let decision = self.route(&annotated)?;
+        *self.last_decision.lock().unwrap() = Some(decision.clone());
         let node = self.nodes.get(&decision.node)
             .ok_or(RouterError::NoCandidates)?;
         let result = node.execute(plan).await?;
@@ -271,6 +299,38 @@ impl Drop for SemanticRouter {
     fn drop(&mut self) {
         let _ = self.shutdown_tx.send(true);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Routing rows helper
+// ---------------------------------------------------------------------------
+
+fn routing_rows(decision: &RoutingDecision) -> Vec<trondb_core::result::Row> {
+    use std::collections::HashMap;
+    use trondb_core::types::Value;
+    use trondb_core::result::Row;
+
+    let mut rows = vec![];
+    let make_row = |prop: &str, val: &str| Row {
+        values: HashMap::from([
+            ("property".to_owned(), Value::String(prop.to_owned())),
+            ("value".to_owned(), Value::String(val.to_owned())),
+        ]),
+        score: None,
+    };
+    rows.push(make_row("routing", &format!("{:?}", decision.strategy)));
+    rows.push(make_row("selected_node", decision.node.as_str()));
+    rows.push(make_row("routing_score", &format!("{:.3}", decision.score)));
+    for c in &decision.all_candidates {
+        rows.push(make_row(
+            &format!("candidate:{}", c.node.as_str()),
+            &format!(
+                "score={:.3} health={:.3} verb={:.3} affinity={:.3}",
+                c.score, c.health_score, c.verb_score, c.affinity_score
+            ),
+        ));
+    }
+    rows
 }
 
 async fn health_poll_loop(

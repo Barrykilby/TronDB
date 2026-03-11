@@ -64,4 +64,46 @@ mod tests {
         let result = router.route_and_execute(&plan).await;
         assert!(matches!(result, Err(RouterError::Engine(_))));
     }
+
+    #[tokio::test]
+    async fn explain_includes_routing_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = trondb_core::EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+        let engine = std::sync::Arc::new(trondb_core::Engine::open(cfg).await.unwrap());
+        let node = std::sync::Arc::new(
+            node::LocalNode::new(engine, node::NodeId::from_string("local"))
+        ) as std::sync::Arc<dyn node::NodeHandle>;
+        let router = router::SemanticRouter::new(vec![node], config::RouterConfig::default());
+
+        // Wait for health polling
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Create an EXPLAIN plan wrapping a Fetch
+        let inner = trondb_core::planner::Plan::Fetch(trondb_core::planner::FetchPlan {
+            collection: "test".into(),
+            fields: trondb_tql::FieldList::All,
+            filter: None,
+            limit: Some(10),
+            strategy: trondb_core::planner::FetchStrategy::FullScan,
+        });
+        let plan = trondb_core::planner::Plan::Explain(Box::new(inner));
+
+        let result = router.route_and_execute(&plan).await.unwrap();
+        // Should have routing rows appended
+        let has_routing = result.rows.iter().any(|r| {
+            r.values.get("property") == Some(&trondb_core::types::Value::String("routing".into()))
+        });
+        assert!(has_routing, "EXPLAIN should include routing section");
+        let has_node = result.rows.iter().any(|r| {
+            r.values.get("property") == Some(&trondb_core::types::Value::String("selected_node".into()))
+        });
+        assert!(has_node, "EXPLAIN should include selected_node");
+    }
 }
