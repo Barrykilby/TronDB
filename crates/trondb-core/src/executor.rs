@@ -962,9 +962,99 @@ impl Executor {
                 })
             }
 
-            Plan::DeleteEntity(_) => {
-                // TODO(task-10): implement entity deletion in executor
-                Err(EngineError::UnsupportedOperation("DELETE entity not yet implemented".into()))
+            Plan::DeleteEntity(p) => {
+                let entity_id = LogicalId::from_string(&p.entity_id);
+
+                // Step 1: Read entity before deletion (needed for index cleanup)
+                let entity = self.store.get(&p.collection, &entity_id)?;
+
+                // Step 2: WAL log
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+                #[derive(serde::Serialize)]
+                struct EntityDeletePayload<'a> {
+                    entity_id: &'a str,
+                    collection: &'a str,
+                }
+                let payload = rmp_serde::to_vec_named(&EntityDeletePayload {
+                    entity_id: &p.entity_id,
+                    collection: &p.collection,
+                })
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::EntityDelete, &p.collection, tx_id, 1, payload);
+                self.wal.commit(tx_id).await?;
+
+                // Step 3: HNSW tombstone — indexes keyed as "{collection}:{repr_name}"
+                let hnsw_prefix = format!("{}:", p.collection);
+                for entry in self.indexes.iter() {
+                    if entry.key().starts_with(&hnsw_prefix) {
+                        entry.value().remove(&entity_id);
+                    }
+                }
+
+                // Step 4: Field index removal
+                let schema = self.schemas.get(&p.collection);
+                if let Some(schema) = &schema {
+                    for idx_def in &schema.indexes {
+                        let fidx_key = format!("{}:{}", p.collection, idx_def.name);
+                        if let Some(fidx) = self.field_indexes.get(&fidx_key) {
+                            let values: Vec<Value> = idx_def.fields.iter()
+                                .map(|f| entity.metadata.get(f).cloned().unwrap_or(Value::Null))
+                                .collect();
+                            let _ = fidx.remove(&entity_id, &values);
+                        }
+                    }
+                }
+
+                // Step 5: Sparse index removal — keyed as "{collection}:{repr_name}"
+                for repr in &entity.representations {
+                    if let VectorData::Sparse(ref sv) = repr.vector {
+                        let sparse_key = format!("{}:{}", p.collection, repr.name);
+                        if let Some(sparse_idx) = self.sparse_indexes.get(&sparse_key) {
+                            sparse_idx.remove(&entity_id, sv);
+                        }
+                    }
+                }
+
+                // Step 6: Location table removal (remove_entity removes all reprs)
+                self.location.remove_entity(&entity_id);
+
+                // Step 7: Fjall delete
+                self.store.delete_entity(&p.collection, &entity_id)?;
+
+                // Step 8: Edge cleanup — find and delete all edges involving this entity
+                let (forward_edges, backward_edges) = self.adjacency.edges_involving(&entity_id);
+                for (edge_type, to_id) in &forward_edges {
+                    self.store.delete_edge(edge_type, entity_id.as_str(), to_id.as_str())?;
+                    self.adjacency.remove(&entity_id, edge_type, to_id);
+                }
+                for (edge_type, from_id) in &backward_edges {
+                    self.store.delete_edge(edge_type, from_id.as_str(), entity_id.as_str())?;
+                    self.adjacency.remove(from_id, edge_type, &entity_id);
+                }
+
+                // Step 9: Tiered storage cleanup
+                let _ = self.store.delete_from_tier(&p.collection, &entity_id, Tier::NVMe);
+                let _ = self.store.delete_from_tier(&p.collection, &entity_id, Tier::Archive);
+
+                self.store.persist()?;
+
+                Ok(QueryResult {
+                    columns: vec!["result".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([(
+                            "result".into(),
+                            Value::String(format!("Entity '{}' deleted from '{}'", p.entity_id, p.collection)),
+                        )]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 1,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                    },
+                })
             }
 
             Plan::ExplainTiers(ref p) => {
@@ -1465,7 +1555,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{CreateCollectionPlan, CreateEdgeTypePlan, FetchPlan, FetchStrategy, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
+    use crate::planner::{CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, FetchPlan, FetchStrategy, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -2974,5 +3064,144 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.rows.len(), 1); // just b
+    }
+
+    #[tokio::test]
+    async fn delete_entity_cascading() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert two entities
+        insert_entity(
+            &exec,
+            "venues",
+            "v1",
+            vec![("name", Literal::String("Venue A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        )
+        .await;
+        insert_entity(
+            &exec,
+            "venues",
+            "v2",
+            vec![("name", Literal::String("Venue B".into()))],
+            Some(vec![0.0, 1.0, 0.0]),
+        )
+        .await;
+
+        // Verify both exist
+        let fetch = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: None,
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(fetch.rows.len(), 2);
+
+        // Delete v1
+        let result = exec
+            .execute(&Plan::DeleteEntity(DeleteEntityPlan {
+                entity_id: "v1".into(),
+                collection: "venues".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        match &result.rows[0].values["result"] {
+            Value::String(s) => assert!(s.contains("deleted"), "expected 'deleted' in: {s}"),
+            other => panic!("expected Value::String, got: {other:?}"),
+        }
+
+        // Verify only v2 remains
+        let fetch = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: None,
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(fetch.rows.len(), 1);
+        assert_eq!(
+            fetch.rows[0].values["id"],
+            Value::String("v2".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_entity_removes_edges() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "people", 3).await;
+
+        insert_entity(&exec, "people", "p1", vec![], Some(vec![1.0, 0.0, 0.0])).await;
+        insert_entity(&exec, "people", "p2", vec![], Some(vec![0.0, 1.0, 0.0])).await;
+        insert_entity(&exec, "people", "p3", vec![], Some(vec![0.0, 0.0, 1.0])).await;
+
+        // Create edge type and edges: p1 -> p2, p3 -> p1
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "p1".into(),
+            to_id: "p2".into(),
+            metadata: vec![],
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "p3".into(),
+            to_id: "p1".into(),
+            metadata: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Delete p1 — should cascade-remove both edges
+        exec.execute(&Plan::DeleteEntity(DeleteEntityPlan {
+            entity_id: "p1".into(),
+            collection: "people".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Traverse from p3 should find no outgoing edges (p3 -> p1 was removed)
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "p3".into(),
+                depth: 1,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_entity_errors() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        let result = exec
+            .execute(&Plan::DeleteEntity(DeleteEntityPlan {
+                entity_id: "nonexistent".into(),
+                collection: "venues".into(),
+            }))
+            .await;
+        assert!(result.is_err());
     }
 }
