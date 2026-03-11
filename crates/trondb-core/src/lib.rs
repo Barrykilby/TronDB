@@ -1483,6 +1483,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phase8_integration_update_then_restart_with_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        // Session 1: create, insert, update, snapshot
+        {
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
+            engine.execute_tql("CREATE COLLECTION venues (
+                REPRESENTATION default DIMENSIONS 3 METRIC COSINE,
+                FIELD name TEXT,
+                INDEX idx_name ON (name)
+            );").await.unwrap();
+
+            engine.execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'Old') \
+                 REPRESENTATION default VECTOR [1.0, 0.0, 0.0];"
+            ).await.unwrap();
+            engine.execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v2', 'Keep') \
+                 REPRESENTATION default VECTOR [0.0, 1.0, 0.0];"
+            ).await.unwrap();
+
+            // UPDATE v1's name
+            engine.execute_tql("UPDATE 'v1' IN venues SET name = 'New';").await.unwrap();
+
+            // DELETE v2
+            engine.execute_tql("DELETE 'v2' FROM venues;").await.unwrap();
+
+            // Save HNSW snapshot
+            engine.save_hnsw_snapshots().unwrap();
+        }
+
+        // Session 2: reopen and verify all state survived
+        {
+            let (engine, _) = Engine::open(config).await.unwrap();
+
+            // v1 should exist with updated name
+            let result = engine.execute_tql("FETCH * FROM venues WHERE name = 'New';").await.unwrap();
+            assert_eq!(result.rows.len(), 1, "v1 should be findable by updated name");
+
+            // Old name should not match
+            let result = engine.execute_tql("FETCH * FROM venues WHERE name = 'Old';").await.unwrap();
+            assert_eq!(result.rows.len(), 0, "old name should not match");
+
+            // v2 should be gone
+            let result = engine.execute_tql("FETCH * FROM venues;").await.unwrap();
+            assert_eq!(result.rows.len(), 1, "only v1 should remain");
+
+            // SEARCH should still work (HNSW loaded from snapshot)
+            let result = engine.execute_tql(
+                "SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 5;"
+            ).await.unwrap();
+            assert!(!result.rows.is_empty(), "SEARCH should return results after snapshot restore");
+        }
+    }
+
+    #[tokio::test]
     async fn hnsw_snapshot_periodic_creates_files() {
         let dir = tempfile::tempdir().unwrap();
         let config = EngineConfig {
