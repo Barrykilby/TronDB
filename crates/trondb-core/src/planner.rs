@@ -37,7 +37,6 @@ pub struct FetchPlan {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SearchPlan {
     pub collection: String,
     pub query_vector: Vec<f64>,
