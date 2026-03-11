@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use dashmap::DashMap;
+
 use crate::error::EngineError;
+use crate::index::HnswIndex;
 use crate::location::{
     Encoding, LocState, LocationDescriptor, LocationTable, NodeAddress, ReprKey, Tier,
 };
@@ -21,11 +24,17 @@ pub struct Executor {
     store: FjallStore,
     wal: WalWriter,
     location: Arc<LocationTable>,
+    indexes: DashMap<String, HnswIndex>,
 }
 
 impl Executor {
     pub fn new(store: FjallStore, wal: WalWriter, location: Arc<LocationTable>) -> Self {
-        Self { store, wal, location }
+        Self {
+            store,
+            wal,
+            location,
+            indexes: DashMap::new(),
+        }
     }
 
     /// Replay committed WAL records into the Fjall store.
@@ -210,6 +219,15 @@ impl Executor {
                     );
                 }
 
+                // Apply to HNSW index
+                for repr in &entity.representations {
+                    let dims = self.store.get_dimensions(&p.collection)?;
+                    let index = self.indexes
+                        .entry(p.collection.clone())
+                        .or_insert_with(|| HnswIndex::new(dims));
+                    index.insert(&id, &repr.vector);
+                }
+
                 Ok(QueryResult {
                     columns: vec!["result".into()],
                     rows: vec![Row {
@@ -298,6 +316,10 @@ impl Executor {
 
     pub fn wal_head_lsn(&self) -> u64 {
         self.wal.head_lsn()
+    }
+
+    pub fn indexes(&self) -> &DashMap<String, HnswIndex> {
+        &self.indexes
     }
 }
 
