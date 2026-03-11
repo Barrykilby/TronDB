@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 5: Structural edges + TRAVERSE.
+Inference-first storage engine. Phase 5a: Indexes + Structural edges + TRAVERSE.
 
 ## Project Structure
 
@@ -39,3 +39,16 @@ Inference-first storage engine. Phase 5: Structural edges + TRAVERSE.
   - Structural edges have confidence=1.0, no decay
   - TRAVERSE returns connected entities (single-hop, DEPTH > 1 gated)
   - DecayConfig fields defined but not driven until Phase 6
+- Field Index: Fjall-backed sortable byte encoding, compound/partial indexes
+  - One Fjall partition per declared index (fidx.{collection}.{index_name})
+  - Sortable encoding: Text=UTF-8, Int=sign-bit-flipped BE, Float=IEEE754 manipulated, Bool=0x00/0x01
+  - Compound keys: null-byte separated, prefix scan on leading fields
+- Sparse Vector Index: RAM-resident inverted index (DashMap), SPLADE-style sparse vectors
+  - SparseIndex rebuilt from Fjall on startup
+  - Inner product scoring, min_weight=0.001 filter
+- Hybrid SEARCH: RRF merge (k=60, 1-based ranking) combines dense + sparse results
+- ScalarPreFilter: WHERE + SEARCH optimisation via field index narrowing (post-filter, 4x over-fetch)
+- Planner: schema-aware strategy selection (Hnsw, Sparse, Hybrid, FieldIndexLookup, ScalarPreFilter)
+- CREATE COLLECTION: block syntax with REPRESENTATION, FIELD, INDEX declarations
+- INSERT: named representation vectors (REPRESENTATION name VECTOR/SPARSE)
+- EXPLAIN: shows strategy, index names, pre-filter details

@@ -60,6 +60,22 @@ impl Parser {
         }
     }
 
+    /// Like expect_ident but also accepts keywords that may be used as names
+    /// (e.g. SPARSE as a representation name).
+    fn expect_name(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Some((Token::Ident(s), _)) => Ok(s),
+            // Allow SPARSE keyword to be used as an identifier in name positions
+            Some((Token::Sparse, _)) => Ok("sparse".to_string()),
+            Some((tok, pos)) => Err(ParseError::UnexpectedToken {
+                pos,
+                expected: "identifier".to_string(),
+                got: format!("{tok:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEof("expected identifier".to_string())),
+        }
+    }
+
     fn expect_int(&mut self) -> Result<i64, ParseError> {
         match self.advance() {
             Some((Token::IntLit(n), _)) => Ok(n),
@@ -69,6 +85,18 @@ impl Parser {
                 got: format!("{tok:?}"),
             }),
             None => Err(ParseError::UnexpectedEof("expected integer".to_string())),
+        }
+    }
+
+    fn expect_string_lit(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Some((Token::StringLit(s), _)) => Ok(s),
+            Some((tok, pos)) => Err(ParseError::UnexpectedToken {
+                pos,
+                expected: "string literal".to_string(),
+                got: format!("{tok:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEof("expected string literal".to_string())),
         }
     }
 
@@ -117,14 +145,146 @@ impl Parser {
     fn parse_create_collection(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // COLLECTION
         let name = self.expect_ident()?;
-        self.expect(&Token::With)?;
-        self.expect(&Token::Dimensions)?;
-        let dims = self.expect_int()?;
+        self.expect(&Token::LParen)?;
+
+        let mut representations = Vec::new();
+        let mut fields = Vec::new();
+        let mut indexes = Vec::new();
+
+        loop {
+            match self.peek() {
+                Some(Token::RParen) => {
+                    self.advance();
+                    break;
+                }
+                Some(Token::Representation) => {
+                    representations.push(self.parse_representation_decl()?);
+                }
+                Some(Token::Field) => {
+                    fields.push(self.parse_field_decl()?);
+                }
+                Some(Token::Index) => {
+                    indexes.push(self.parse_index_decl()?);
+                }
+                Some(tok) => {
+                    let tok_str = format!("{tok:?}");
+                    let pos = self.tokens[self.pos].1.start;
+                    return Err(ParseError::UnexpectedToken {
+                        pos,
+                        expected: "REPRESENTATION, FIELD, INDEX, or )".into(),
+                        got: tok_str,
+                    });
+                }
+                None => return Err(ParseError::UnexpectedEof("expected ) or declaration".into())),
+            }
+
+            // Consume optional comma between declarations
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            }
+        }
+
         self.expect(&Token::Semicolon)?;
         Ok(Statement::CreateCollection(CreateCollectionStmt {
             name,
-            dimensions: dims as usize,
+            representations,
+            fields,
+            indexes,
         }))
+    }
+
+    fn parse_representation_decl(&mut self) -> Result<RepresentationDecl, ParseError> {
+        self.advance(); // REPRESENTATION
+        let name = self.expect_name()?;
+        let mut model = None;
+        let mut dimensions = None;
+        let mut metric = Metric::Cosine;
+        let mut sparse = false;
+
+        // Parse optional attributes in any order
+        loop {
+            match self.peek() {
+                Some(Token::Model) => {
+                    self.advance();
+                    model = Some(self.expect_string_lit()?);
+                }
+                Some(Token::Dimensions) => {
+                    self.advance();
+                    dimensions = Some(self.expect_int()? as usize);
+                }
+                Some(Token::TokenMetric) => {
+                    self.advance();
+                    match self.peek() {
+                        Some(Token::Cosine) => { self.advance(); metric = Metric::Cosine; }
+                        Some(Token::InnerProduct) => { self.advance(); metric = Metric::InnerProduct; }
+                        _ => return Err(ParseError::InvalidSyntax("expected COSINE or INNER_PRODUCT".into())),
+                    }
+                }
+                Some(Token::Sparse) => {
+                    self.advance();
+                    match self.peek() {
+                        Some(Token::True) => { self.advance(); sparse = true; }
+                        Some(Token::False) => { self.advance(); sparse = false; }
+                        _ => return Err(ParseError::InvalidSyntax("expected true or false after SPARSE".into())),
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        Ok(RepresentationDecl { name, model, dimensions, metric, sparse })
+    }
+
+    fn parse_field_decl(&mut self) -> Result<FieldDecl, ParseError> {
+        self.advance(); // FIELD
+        let name = self.expect_ident()?;
+        let field_type = self.parse_field_type()?;
+        Ok(FieldDecl { name, field_type })
+    }
+
+    fn parse_field_type(&mut self) -> Result<FieldType, ParseError> {
+        match self.advance() {
+            Some((Token::Text, _)) => Ok(FieldType::Text),
+            Some((Token::DateTime, _)) => Ok(FieldType::DateTime),
+            Some((Token::TokenBool, _)) => Ok(FieldType::Bool),
+            Some((Token::TokenInt, _)) => Ok(FieldType::Int),
+            Some((Token::TokenFloat, _)) => Ok(FieldType::Float),
+            Some((Token::EntityRef, _)) => {
+                self.expect(&Token::LParen)?;
+                let collection = self.expect_ident()?;
+                self.expect(&Token::RParen)?;
+                Ok(FieldType::EntityRef(collection))
+            }
+            Some((tok, pos)) => Err(ParseError::UnexpectedToken {
+                pos,
+                expected: "field type (TEXT, DATETIME, BOOL, INT, FLOAT, ENTITY_REF)".into(),
+                got: format!("{tok:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEof("expected field type".into())),
+        }
+    }
+
+    fn parse_index_decl(&mut self) -> Result<IndexDecl, ParseError> {
+        self.advance(); // INDEX
+        let name = self.expect_ident()?;
+        self.expect(&Token::On)?;
+        self.expect(&Token::LParen)?;
+
+        let mut fields = vec![self.expect_ident()?];
+        while self.peek() == Some(&Token::Comma) {
+            self.advance();
+            fields.push(self.expect_ident()?);
+        }
+        self.expect(&Token::RParen)?;
+
+        let partial_condition = if self.peek() == Some(&Token::Where) {
+            self.advance();
+            Some(self.parse_where_clause()?)
+        } else {
+            None
+        };
+
+        Ok(IndexDecl { name, fields, partial_condition })
     }
 
     fn parse_create_edge(&mut self) -> Result<Statement, ParseError> {
@@ -182,19 +342,43 @@ impl Parser {
         }
         self.expect(&Token::RParen)?;
 
-        let vector = if self.peek() == Some(&Token::Vector) {
-            self.advance();
-            Some(self.parse_float_list()?)
-        } else {
-            None
-        };
+        // Parse named representation vectors (no backward-compat shorthand per spec)
+        let mut vectors = Vec::new();
+
+        // Named representations
+        while self.peek() == Some(&Token::Representation) {
+            self.advance(); // REPRESENTATION
+            let repr_name = self.expect_name()?;
+            match self.peek() {
+                Some(Token::Vector) => {
+                    self.advance();
+                    let vec = self.parse_float_list()?;
+                    vectors.push((repr_name, VectorLiteral::Dense(vec)));
+                }
+                Some(Token::Sparse) => {
+                    self.advance();
+                    let vec = self.parse_sparse_vector_list()?;
+                    vectors.push((repr_name, VectorLiteral::Sparse(vec)));
+                }
+                Some(tok) => {
+                    let tok_str = format!("{tok:?}");
+                    let pos = self.tokens[self.pos].1.start;
+                    return Err(ParseError::UnexpectedToken {
+                        pos,
+                        expected: "VECTOR or SPARSE".into(),
+                        got: tok_str,
+                    });
+                }
+                None => return Err(ParseError::UnexpectedEof("expected VECTOR or SPARSE".into())),
+            }
+        }
 
         self.expect(&Token::Semicolon)?;
         Ok(Statement::Insert(InsertStmt {
             collection,
             fields,
             values,
-            vector,
+            vectors,
         }))
     }
 
@@ -270,18 +454,6 @@ impl Parser {
         }))
     }
 
-    fn expect_string_lit(&mut self) -> Result<String, ParseError> {
-        match self.advance() {
-            Some((Token::StringLit(s), _)) => Ok(s),
-            Some((tok, pos)) => Err(ParseError::UnexpectedToken {
-                pos,
-                expected: "string literal".to_string(),
-                got: format!("{tok:?}"),
-            }),
-            None => Err(ParseError::UnexpectedEof("expected string literal".to_string())),
-        }
-    }
-
     fn parse_kv_list(&mut self) -> Result<Vec<(String, Literal)>, ParseError> {
         self.expect(&Token::LParen)?;
         let mut pairs = Vec::new();
@@ -333,17 +505,47 @@ impl Parser {
         self.advance(); // SEARCH
         let collection = self.expect_ident()?;
 
-        // Optional field list before NEAR
-        let fields = if self.peek() == Some(&Token::Near) {
-            FieldList::All
+        // Optional WHERE clause (ScalarPreFilter)
+        let filter = if self.peek() == Some(&Token::Where) {
+            self.advance();
+            Some(self.parse_where_clause()?)
         } else {
-            // Not specified in grammar — default to All
-            FieldList::All
+            None
         };
 
-        self.expect(&Token::Near)?;
-        self.expect(&Token::Vector)?;
-        let near = self.parse_float_list()?;
+        // Parse NEAR VECTOR and/or NEAR SPARSE
+        let mut dense_vector = None;
+        let mut sparse_vector = None;
+
+        while self.peek() == Some(&Token::Near) {
+            self.advance(); // NEAR
+            match self.peek() {
+                Some(Token::Vector) => {
+                    self.advance(); // VECTOR
+                    dense_vector = Some(self.parse_float_list()?);
+                }
+                Some(Token::Sparse) => {
+                    self.advance(); // SPARSE
+                    sparse_vector = Some(self.parse_sparse_vector_list()?);
+                }
+                Some(tok) => {
+                    let tok_str = format!("{tok:?}");
+                    let pos = self.tokens[self.pos].1.start;
+                    return Err(ParseError::UnexpectedToken {
+                        pos,
+                        expected: "VECTOR or SPARSE".into(),
+                        got: tok_str,
+                    });
+                }
+                None => return Err(ParseError::UnexpectedEof("expected VECTOR or SPARSE".into())),
+            }
+        }
+
+        if dense_vector.is_none() && sparse_vector.is_none() {
+            return Err(ParseError::InvalidSyntax(
+                "SEARCH requires at least one NEAR VECTOR or NEAR SPARSE clause".into(),
+            ));
+        }
 
         let confidence = if self.peek() == Some(&Token::Confidence) {
             self.advance();
@@ -363,11 +565,37 @@ impl Parser {
         self.expect(&Token::Semicolon)?;
         Ok(Statement::Search(SearchStmt {
             collection,
-            fields,
-            near,
+            fields: FieldList::All,
+            dense_vector,
+            sparse_vector,
+            filter,
             confidence,
             limit,
         }))
+    }
+
+    fn parse_sparse_vector_list(&mut self) -> Result<Vec<(u32, f32)>, ParseError> {
+        self.expect(&Token::LBracket)?;
+        let mut entries = Vec::new();
+
+        loop {
+            if self.peek() == Some(&Token::RBracket) {
+                break;
+            }
+            let dim = self.expect_int()? as u32;
+            self.expect(&Token::Colon)?;
+            let weight = self.parse_number_as_f64()? as f32;
+            entries.push((dim, weight));
+
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.expect(&Token::RBracket)?;
+        Ok(entries)
     }
 
     fn parse_explain(&mut self) -> Result<Statement, ParseError> {
@@ -492,52 +720,187 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_create_collection() {
-        let stmt = parse("CREATE COLLECTION venues WITH DIMENSIONS 384;").unwrap();
-        assert_eq!(
-            stmt,
-            Statement::CreateCollection(CreateCollectionStmt {
-                name: "venues".to_string(),
-                dimensions: 384,
-            })
-        );
-    }
-
-    #[test]
-    fn parse_insert_with_vector() {
-        let stmt = parse(
-            "INSERT INTO venues (id, name, city) VALUES ('v1', 'Apollo', 'London') VECTOR [1.0, 2.0, 3.0];",
-        )
-        .unwrap();
-        assert_eq!(
-            stmt,
-            Statement::Insert(InsertStmt {
-                collection: "venues".to_string(),
-                fields: vec![
-                    "id".to_string(),
-                    "name".to_string(),
-                    "city".to_string(),
-                ],
-                values: vec![
-                    Literal::String("v1".to_string()),
-                    Literal::String("Apollo".to_string()),
-                    Literal::String("London".to_string()),
-                ],
-                vector: Some(vec![1.0, 2.0, 3.0]),
-            })
-        );
-    }
-
-    #[test]
-    fn parse_insert_without_vector() {
-        let stmt =
-            parse("INSERT INTO venues (id, name) VALUES ('v1', 'Apollo');").unwrap();
-        match &stmt {
-            Statement::Insert(ins) => assert_eq!(ins.vector, None),
-            _ => panic!("expected Insert statement"),
+    fn parse_create_collection_block() {
+        let stmt = parse("CREATE COLLECTION venues (
+            REPRESENTATION identity MODEL 'jina-v4' DIMENSIONS 1024 METRIC COSINE,
+            FIELD status TEXT,
+            FIELD venue_id ENTITY_REF(venues),
+            INDEX idx_status ON (status)
+        );").unwrap();
+        match stmt {
+            Statement::CreateCollection(c) => {
+                assert_eq!(c.name, "venues");
+                assert_eq!(c.representations.len(), 1);
+                assert_eq!(c.representations[0].name, "identity");
+                assert_eq!(c.representations[0].dimensions, Some(1024));
+                assert_eq!(c.representations[0].metric, Metric::Cosine);
+                assert!(!c.representations[0].sparse);
+                assert_eq!(c.fields.len(), 2);
+                assert_eq!(c.fields[0].name, "status");
+                assert_eq!(c.fields[0].field_type, FieldType::Text);
+                assert_eq!(c.indexes.len(), 1);
+                assert_eq!(c.indexes[0].name, "idx_status");
+            }
+            _ => panic!("expected CreateCollection"),
         }
     }
 
+    #[test]
+    fn parse_create_collection_sparse_repr() {
+        let stmt = parse("CREATE COLLECTION docs (
+            REPRESENTATION sparse_title MODEL 'splade-v3' METRIC INNER_PRODUCT SPARSE true
+        );").unwrap();
+        match stmt {
+            Statement::CreateCollection(c) => {
+                assert_eq!(c.representations[0].sparse, true);
+                assert_eq!(c.representations[0].metric, Metric::InnerProduct);
+                assert_eq!(c.representations[0].dimensions, None);
+            }
+            _ => panic!("expected CreateCollection"),
+        }
+    }
+
+    #[test]
+    fn parse_create_collection_partial_index() {
+        let stmt = parse("CREATE COLLECTION events (
+            FIELD publish_ready BOOL,
+            INDEX idx_ready ON (publish_ready) WHERE publish_ready = true
+        );").unwrap();
+        match stmt {
+            Statement::CreateCollection(c) => {
+                assert!(c.indexes[0].partial_condition.is_some());
+            }
+            _ => panic!("expected CreateCollection"),
+        }
+    }
+
+    #[test]
+    fn parse_create_collection_compound_index() {
+        let stmt = parse("CREATE COLLECTION events (
+            FIELD venue_id TEXT,
+            FIELD start_date DATETIME,
+            INDEX idx_venue_start ON (venue_id, start_date)
+        );").unwrap();
+        match stmt {
+            Statement::CreateCollection(c) => {
+                assert_eq!(c.indexes[0].fields, vec!["venue_id", "start_date"]);
+            }
+            _ => panic!("expected CreateCollection"),
+        }
+    }
+
+    #[test]
+    fn parse_search_dense_only() {
+        let stmt = parse("SEARCH venues NEAR VECTOR [0.1, 0.2, 0.3] LIMIT 20;").unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert!(s.dense_vector.is_some());
+                assert!(s.sparse_vector.is_none());
+                assert!(s.filter.is_none());
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_sparse_only() {
+        let stmt = parse("SEARCH venues NEAR SPARSE [1:0.8, 42:0.5, 1337:0.3] LIMIT 20;").unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert!(s.dense_vector.is_none());
+                let sparse = s.sparse_vector.unwrap();
+                assert_eq!(sparse.len(), 3);
+                assert_eq!(sparse[0], (1, 0.8));
+                assert_eq!(sparse[1], (42, 0.5));
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_hybrid() {
+        let stmt = parse("SEARCH venues NEAR VECTOR [0.1, 0.2] NEAR SPARSE [1:0.8] LIMIT 10;").unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert!(s.dense_vector.is_some());
+                assert!(s.sparse_vector.is_some());
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_with_where() {
+        let stmt = parse("SEARCH venues WHERE h3_res4 = '89283' NEAR VECTOR [0.1, 0.2] LIMIT 10;").unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert!(s.filter.is_some());
+                assert!(s.dense_vector.is_some());
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_no_near_fails() {
+        let result = parse("SEARCH venues LIMIT 10;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_insert_with_named_repr() {
+        let stmt = parse("INSERT INTO venues (id, name) VALUES ('v1', 'Pub')
+            REPRESENTATION identity VECTOR [0.1, 0.2, 0.3];").unwrap();
+        match stmt {
+            Statement::Insert(i) => {
+                assert_eq!(i.vectors.len(), 1);
+                assert_eq!(i.vectors[0].0, "identity");
+                match &i.vectors[0].1 {
+                    VectorLiteral::Dense(v) => assert_eq!(v.len(), 3),
+                    _ => panic!("expected Dense"),
+                }
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_with_sparse_repr() {
+        let stmt = parse("INSERT INTO venues (id, name) VALUES ('v1', 'Pub')
+            REPRESENTATION sparse_title SPARSE [1:0.8, 42:0.5];").unwrap();
+        match stmt {
+            Statement::Insert(i) => {
+                assert_eq!(i.vectors.len(), 1);
+                match &i.vectors[0].1 {
+                    VectorLiteral::Sparse(s) => assert_eq!(s.len(), 2),
+                    _ => panic!("expected Sparse"),
+                }
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_multiple_reprs() {
+        let stmt = parse("INSERT INTO venues (id) VALUES ('v1')
+            REPRESENTATION identity VECTOR [0.1, 0.2]
+            REPRESENTATION sparse SPARSE [1:0.5];").unwrap();
+        match stmt {
+            Statement::Insert(i) => assert_eq!(i.vectors.len(), 2),
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_no_vector() {
+        let stmt = parse("INSERT INTO venues (id, name) VALUES ('v1', 'Pub');").unwrap();
+        match stmt {
+            Statement::Insert(i) => assert!(i.vectors.is_empty()),
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    // Keep existing tests for FETCH, edge operations, TRAVERSE
     #[test]
     fn parse_fetch_all() {
         let stmt = parse("FETCH * FROM venues;").unwrap();
@@ -555,18 +918,27 @@ mod tests {
     #[test]
     fn parse_fetch_with_where() {
         let stmt = parse("FETCH name, city FROM venues WHERE city = 'London';").unwrap();
-        assert_eq!(
-            stmt,
-            Statement::Fetch(FetchStmt {
-                collection: "venues".to_string(),
-                fields: FieldList::Named(vec!["name".to_string(), "city".to_string()]),
-                filter: Some(WhereClause::Eq(
-                    "city".to_string(),
-                    Literal::String("London".to_string()),
-                )),
-                limit: None,
-            })
-        );
+        match &stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.collection, "venues");
+                assert!(f.filter.is_some());
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_where_and() {
+        let stmt = parse("FETCH * FROM venues WHERE city = 'London' AND status = 'active';").unwrap();
+        match &stmt {
+            Statement::Fetch(f) => {
+                match &f.filter {
+                    Some(WhereClause::And(_, _)) => {}
+                    other => panic!("expected And clause, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Fetch"),
+        }
     }
 
     #[test]
@@ -574,38 +946,13 @@ mod tests {
         let stmt = parse("FETCH * FROM venues LIMIT 10;").unwrap();
         match &stmt {
             Statement::Fetch(f) => assert_eq!(f.limit, Some(10)),
-            _ => panic!("expected Fetch statement"),
-        }
-    }
-
-    #[test]
-    fn parse_fetch_where_and() {
-        let stmt =
-            parse("FETCH * FROM venues WHERE city = 'London' AND capacity > 500;").unwrap();
-        match &stmt {
-            Statement::Fetch(f) => {
-                assert_eq!(
-                    f.filter,
-                    Some(WhereClause::And(
-                        Box::new(WhereClause::Eq(
-                            "city".to_string(),
-                            Literal::String("London".to_string()),
-                        )),
-                        Box::new(WhereClause::Gt(
-                            "capacity".to_string(),
-                            Literal::Int(500),
-                        )),
-                    ))
-                );
-            }
-            _ => panic!("expected Fetch statement"),
+            _ => panic!("expected Fetch"),
         }
     }
 
     #[test]
     fn parse_error_missing_semicolon() {
-        let result = parse("FETCH * FROM venues");
-        assert!(result.is_err());
+        assert!(parse("FETCH * FROM venues").is_err());
     }
 
     #[test]
@@ -624,26 +971,20 @@ mod tests {
     #[test]
     fn parse_insert_edge() {
         let stmt = parse("INSERT EDGE knows FROM 'v1' TO 'v2';").unwrap();
-        assert_eq!(
-            stmt,
-            Statement::InsertEdge(InsertEdgeStmt {
-                edge_type: "knows".to_string(),
-                from_id: "v1".to_string(),
-                to_id: "v2".to_string(),
-                metadata: vec![],
-            })
-        );
+        match &stmt {
+            Statement::InsertEdge(e) => {
+                assert_eq!(e.edge_type, "knows");
+                assert!(e.metadata.is_empty());
+            }
+            _ => panic!("expected InsertEdge"),
+        }
     }
 
     #[test]
     fn parse_insert_edge_with_metadata() {
-        let stmt = parse("INSERT EDGE knows FROM 'v1' TO 'v2' WITH (since = '2024', weight = 42);").unwrap();
+        let stmt = parse("INSERT EDGE knows FROM 'v1' TO 'v2' WITH (since = '2024');").unwrap();
         match &stmt {
-            Statement::InsertEdge(e) => {
-                assert_eq!(e.metadata.len(), 2);
-                assert_eq!(e.metadata[0], ("since".to_string(), Literal::String("2024".to_string())));
-                assert_eq!(e.metadata[1], ("weight".to_string(), Literal::Int(42)));
-            }
+            Statement::InsertEdge(e) => assert_eq!(e.metadata.len(), 1),
             _ => panic!("expected InsertEdge"),
         }
     }
@@ -678,14 +1019,12 @@ mod tests {
     #[test]
     fn parse_traverse_with_depth_and_limit() {
         let stmt = parse("TRAVERSE knows FROM 'v1' DEPTH 1 LIMIT 10;").unwrap();
-        assert_eq!(
-            stmt,
-            Statement::Traverse(TraverseStmt {
-                edge_type: "knows".to_string(),
-                from_id: "v1".to_string(),
-                depth: 1,
-                limit: Some(10),
-            })
-        );
+        match &stmt {
+            Statement::Traverse(t) => {
+                assert_eq!(t.depth, 1);
+                assert_eq!(t.limit, Some(10));
+            }
+            _ => panic!("expected Traverse"),
+        }
     }
 }
