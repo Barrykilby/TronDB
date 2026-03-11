@@ -4,6 +4,7 @@ use crate::error::EngineError;
 // Int8 Scalar Quantisation
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 pub struct QuantisedInt8 {
     pub min: f32,
     pub max: f32,
@@ -19,6 +20,7 @@ pub fn quantise_int8(vector: &[f32]) -> QuantisedInt8 {
     let max = vector.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
     if (max - min).abs() < f32::EPSILON {
+        // Constant vector — all zeros, min carries the value
         return QuantisedInt8 {
             min,
             max,
@@ -52,6 +54,7 @@ pub fn dequantise_int8(q: &QuantisedInt8) -> Vec<f32> {
 }
 
 impl QuantisedInt8 {
+    /// Serialise: [min: f32 LE][max: f32 LE][data: u8...]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(8 + self.data.len());
         buf.extend_from_slice(&self.min.to_le_bytes());
@@ -75,6 +78,7 @@ impl QuantisedInt8 {
 // Binary Quantisation
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 pub struct QuantisedBinary {
     pub data: Vec<u8>,
     pub dimensions: usize,
@@ -82,7 +86,7 @@ pub struct QuantisedBinary {
 
 pub fn quantise_binary(vector: &[f32]) -> QuantisedBinary {
     let dimensions = vector.len();
-    let byte_count = (dimensions + 7) / 8;
+    let byte_count = dimensions.div_ceil(8);
     let mut data = vec![0u8; byte_count];
 
     for (i, &v) in vector.iter().enumerate() {
@@ -102,7 +106,7 @@ impl QuantisedBinary {
     }
 
     pub fn from_bytes(bytes: &[u8], dimensions: usize) -> Result<Self, EngineError> {
-        let expected = (dimensions + 7) / 8;
+        let expected = dimensions.div_ceil(8);
         if bytes.len() < expected {
             return Err(EngineError::Storage("Binary data too short".into()));
         }
