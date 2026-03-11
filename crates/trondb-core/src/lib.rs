@@ -104,6 +104,7 @@ impl Engine {
                                         &hnsw_snap_dir,
                                         &collection_name,
                                         &repr.name,
+                                        dims,
                                     ) {
                                         Ok(Some((index, meta))) => {
                                             eprintln!(
@@ -161,15 +162,19 @@ impl Engine {
                     }
                 }
             }
-            // Rebuild index contents from stored entities
+            // Rebuild index contents from stored entities.
+            // Skip HNSW inserts for collections with snapshot-loaded indexes — those
+            // are already populated and will be caught up via incremental WAL replay.
             if let Ok(entities) = executor.scan_collection(&collection_name) {
                 for entity in &entities {
                     for repr in &entity.representations {
                         match &repr.vector {
                             types::VectorData::Dense(ref vec_f32) => {
                                 let hnsw_key = format!("{}:{}", collection_name, repr.name);
-                                if let Some(index) = executor.indexes().get(&hnsw_key) {
-                                    index.insert(&entity.id, vec_f32);
+                                if !hnsw_snapshot_lsns.contains_key(&hnsw_key) {
+                                    if let Some(index) = executor.indexes().get(&hnsw_key) {
+                                        index.insert(&entity.id, vec_f32);
+                                    }
                                 }
                             }
                             types::VectorData::Sparse(ref sv) => {
@@ -311,6 +316,7 @@ impl Engine {
             let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
             let snap_dir = config.data_dir.join("hnsw_snapshots");
             let indexes_arc = Arc::clone(executor.indexes());
+            let wal_arc = executor.wal_writer();
 
             Some(tokio::spawn(async move {
                 let _ = std::fs::create_dir_all(&snap_dir);
@@ -318,11 +324,7 @@ impl Engine {
                 ticker.tick().await; // skip first immediate tick
                 loop {
                     ticker.tick().await;
-                    // LSN 0 is a known limitation — the periodic task doesn't have a live
-                    // LSN accessor. This means incremental WAL catch-up on next restart will
-                    // replay more records than strictly necessary, but is safe because HNSW
-                    // insert is idempotent. A live LSN accessor is a future improvement.
-                    let lsn = 0;
+                    let lsn = wal_arc.head_lsn();
                     for entry in indexes_arc.iter() {
                         if let Some((collection, repr_name)) = entry.key().split_once(':') {
                             if let Err(e) = crate::hnsw_snapshot::save_snapshot(

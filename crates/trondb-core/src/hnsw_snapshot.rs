@@ -113,6 +113,7 @@ pub fn load_snapshot(
     dir: &Path,
     collection: &str,
     repr_name: &str,
+    expected_dimensions: usize,
 ) -> Result<Option<(HnswIndex, HnswSnapshotMeta)>, String> {
     let basename = format!("{collection}_{repr_name}");
 
@@ -153,6 +154,14 @@ pub fn load_snapshot(
         ));
     }
 
+    // Dimensions compatibility check
+    if meta.dimensions != expected_dimensions {
+        return Err(format!(
+            "dimensions mismatch: snapshot {} != schema {}",
+            meta.dimensions, expected_dimensions,
+        ));
+    }
+
     // Verify checksum before loading graph
     let graph_bytes =
         std::fs::read(&graph_path).map_err(|e| format!("checksum read graph: {e}"))?;
@@ -173,11 +182,22 @@ pub fn load_snapshot(
     }
 
     // Load hnsw_rs graph
-    // IMPORTANT: HnswIo::load_hnsw() returns Hnsw<'b> where 'a: 'b — the HnswIo
-    // must outlive the Hnsw. Since HnswIndex stores Hnsw<'static>, we Box::leak
-    // the HnswIo to get a 'static reference. This is safe because HnswIo stores
-    // owned data (PathBuf, String, DataMap) — verified in hnsw_rs 0.3.4 hnswio.rs:302.
-    // Leaks a small struct per snapshot load, acceptable for a one-time cost.
+    //
+    // SAFETY (lifetime transmutation via Box::leak):
+    // HnswIo::load_hnsw() returns Hnsw<'b> borrowing from &'a HnswIo where 'a: 'b.
+    // HnswIndex stores Hnsw<'static>, so HnswIo must live forever.
+    //
+    // We Box::leak the HnswIo to get a &'static reference. This is sound because:
+    //   1. HnswIo stores only owned data: PathBuf, String, DataMap (memory-mapped
+    //      file data). Verified at hnsw_rs 0.3.4 hnswio.rs:302.
+    //   2. The leaked HnswIo is never accessed again after load_hnsw() — only the
+    //      Hnsw graph (which borrows its internal DataMap) is used.
+    //   3. Each Engine::open leaks one HnswIo per snapshot-loaded collection. In
+    //      production this is a one-time cost. In tests with multiple restart cycles
+    //      the leaked structs accumulate but are small (~100 bytes each).
+    //
+    // If hnsw_rs changes HnswIo internals in a future version, this assumption
+    // must be re-verified. Pin to a known-good hnsw_rs version in Cargo.toml.
     let hnsw_io = Box::leak(Box::new(HnswIo::new(dir, &basename)));
     let hnsw: hnsw_rs::hnsw::Hnsw<'static, f32, DistCosine> = hnsw_io
         .load_hnsw()
@@ -277,7 +297,7 @@ mod tests {
 
         save_snapshot(dir.path(), "venues", "default", &index, 42).unwrap();
 
-        let loaded = load_snapshot(dir.path(), "venues", "default").unwrap();
+        let loaded = load_snapshot(dir.path(), "venues", "default", 3).unwrap();
         assert!(loaded.is_some(), "load should succeed");
         let (restored_index, meta) = loaded.unwrap();
 

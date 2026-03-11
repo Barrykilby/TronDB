@@ -1190,14 +1190,14 @@ impl Executor {
                 if let Some(ref s) = schema {
                     for (idx_def, (fidx_key, old_values)) in s.indexes.iter().zip(old_field_values.iter()) {
                         if let Some(fidx) = self.field_indexes.get(fidx_key) {
-                            // Remove old entry
+                            // Remove old entry (best-effort — old entry may not exist)
                             let _ = fidx.remove(&entity_id, old_values);
                             // Insert new entry
                             let new_values: Vec<Value> = idx_def.fields.iter()
                                 .map(|f| entity.metadata.get(f).cloned().unwrap_or(Value::Null))
                                 .collect();
                             if new_values.len() == fidx.field_types().len() {
-                                let _ = fidx.insert(&entity_id, &new_values);
+                                fidx.insert(&entity_id, &new_values)?;
                             }
                         }
                     }
