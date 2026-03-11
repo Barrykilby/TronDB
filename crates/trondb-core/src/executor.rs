@@ -351,6 +351,13 @@ impl Executor {
                     },
                 })
             }
+
+            Plan::CreateEdgeType(_)
+            | Plan::InsertEdge(_)
+            | Plan::DeleteEdge(_)
+            | Plan::Traverse(_) => Err(EngineError::UnsupportedOperation(
+                "edge operations not yet implemented".into(),
+            )),
         }
     }
 
@@ -564,6 +571,33 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
         Plan::Explain(_) => {
             props.push(("mode", "Deterministic".into()));
             props.push(("verb", "EXPLAIN".into()));
+        }
+        Plan::CreateEdgeType(p) => {
+            props.push(("verb", "CREATE EDGE TYPE".into()));
+            props.push(("name", p.name.clone()));
+            props.push(("from_collection", p.from_collection.clone()));
+            props.push(("to_collection", p.to_collection.clone()));
+        }
+        Plan::InsertEdge(p) => {
+            props.push(("verb", "INSERT EDGE".into()));
+            props.push(("edge_type", p.edge_type.clone()));
+            props.push(("from_id", p.from_id.clone()));
+            props.push(("to_id", p.to_id.clone()));
+        }
+        Plan::DeleteEdge(p) => {
+            props.push(("verb", "DELETE EDGE".into()));
+            props.push(("edge_type", p.edge_type.clone()));
+            props.push(("from_id", p.from_id.clone()));
+            props.push(("to_id", p.to_id.clone()));
+        }
+        Plan::Traverse(p) => {
+            props.push(("verb", "TRAVERSE".into()));
+            props.push(("edge_type", p.edge_type.clone()));
+            props.push(("from_id", p.from_id.clone()));
+            props.push(("depth", p.depth.to_string()));
+            if let Some(limit) = p.limit {
+                props.push(("limit", limit.to_string()));
+            }
         }
     }
 

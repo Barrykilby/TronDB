@@ -12,6 +12,10 @@ pub enum Plan {
     Fetch(FetchPlan),
     Search(SearchPlan),
     Explain(Box<Plan>),
+    CreateEdgeType(CreateEdgeTypePlan),
+    InsertEdge(InsertEdgePlan),
+    DeleteEdge(DeleteEdgePlan),
+    Traverse(TraversePlan),
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +48,36 @@ pub struct SearchPlan {
     pub confidence_threshold: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CreateEdgeTypePlan {
+    pub name: String,
+    pub from_collection: String,
+    pub to_collection: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertEdgePlan {
+    pub edge_type: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub metadata: Vec<(String, trondb_tql::Literal)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteEdgePlan {
+    pub edge_type: String,
+    pub from_id: String,
+    pub to_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraversePlan {
+    pub edge_type: String,
+    pub from_id: String,
+    pub depth: usize,
+    pub limit: Option<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // Planner
 // ---------------------------------------------------------------------------
@@ -74,6 +108,32 @@ pub fn plan(stmt: &Statement) -> Result<Plan, EngineError> {
             query_vector: s.near.clone(),
             k: s.limit.unwrap_or(10),
             confidence_threshold: s.confidence.unwrap_or(0.0),
+        })),
+
+        Statement::CreateEdgeType(s) => Ok(Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: s.name.clone(),
+            from_collection: s.from_collection.clone(),
+            to_collection: s.to_collection.clone(),
+        })),
+
+        Statement::InsertEdge(s) => Ok(Plan::InsertEdge(InsertEdgePlan {
+            edge_type: s.edge_type.clone(),
+            from_id: s.from_id.clone(),
+            to_id: s.to_id.clone(),
+            metadata: s.metadata.clone(),
+        })),
+
+        Statement::DeleteEdge(s) => Ok(Plan::DeleteEdge(DeleteEdgePlan {
+            edge_type: s.edge_type.clone(),
+            from_id: s.from_id.clone(),
+            to_id: s.to_id.clone(),
+        })),
+
+        Statement::Traverse(s) => Ok(Plan::Traverse(TraversePlan {
+            edge_type: s.edge_type.clone(),
+            from_id: s.from_id.clone(),
+            depth: s.depth,
+            limit: s.limit,
         })),
 
         Statement::Explain(inner) => {
