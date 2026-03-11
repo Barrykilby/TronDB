@@ -22,6 +22,14 @@ pub struct TierMigrationPayload {
     pub encoding: Encoding,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum MigrationRecoveryAction {
+    NoAction,
+    AlreadyComplete,
+    ReExecute,
+    CleanupSource,
+}
+
 pub struct TierMigrator {
     config: TierConfig,
     pub(crate) engine: Arc<Engine>,
@@ -30,6 +38,20 @@ pub struct TierMigrator {
 }
 
 impl TierMigrator {
+    /// Classify a TierMigration WAL record based on actual tier state.
+    /// Used during startup recovery to determine what action to take.
+    pub fn classify_migration_state(
+        source_exists: bool,
+        target_exists: bool,
+    ) -> MigrationRecoveryAction {
+        match (source_exists, target_exists) {
+            (false, false) => MigrationRecoveryAction::NoAction,
+            (false, true) => MigrationRecoveryAction::AlreadyComplete,
+            (true, false) => MigrationRecoveryAction::ReExecute,
+            (true, true) => MigrationRecoveryAction::CleanupSource,
+        }
+    }
+
     pub fn new(
         config: TierConfig,
         engine: Arc<Engine>,
@@ -289,6 +311,30 @@ impl TierMigrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_tier_migration_already_completed() {
+        let result = TierMigrator::classify_migration_state(false, true);
+        assert_eq!(result, MigrationRecoveryAction::AlreadyComplete);
+    }
+
+    #[test]
+    fn replay_tier_migration_needs_reexecution() {
+        let result = TierMigrator::classify_migration_state(true, false);
+        assert_eq!(result, MigrationRecoveryAction::ReExecute);
+    }
+
+    #[test]
+    fn replay_tier_migration_partial_completion() {
+        let result = TierMigrator::classify_migration_state(true, true);
+        assert_eq!(result, MigrationRecoveryAction::CleanupSource);
+    }
+
+    #[test]
+    fn replay_tier_migration_entity_deleted() {
+        let result = TierMigrator::classify_migration_state(false, false);
+        assert_eq!(result, MigrationRecoveryAction::NoAction);
+    }
 
     #[test]
     fn tier_migration_payload_serialisation() {
