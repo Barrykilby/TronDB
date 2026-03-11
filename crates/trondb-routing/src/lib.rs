@@ -40,7 +40,8 @@ mod tests {
             },
             snapshot_interval_secs: 0,
         };
-        std::sync::Arc::new(trondb_core::Engine::open(cfg).await.unwrap())
+        let (engine, _) = trondb_core::Engine::open(cfg).await.unwrap();
+        std::sync::Arc::new(engine)
     }
 
     /// Build a HealthSignal with explicit load_score for manual cache seeding.
@@ -77,9 +78,8 @@ mod tests {
             },
             snapshot_interval_secs: 0,
         };
-        let engine = std::sync::Arc::new(
-            trondb_core::Engine::open(cfg).await.unwrap()
-        );
+        let (engine, _) = trondb_core::Engine::open(cfg).await.unwrap();
+        let engine = std::sync::Arc::new(engine);
         let node = std::sync::Arc::new(
             node::LocalNode::new(engine, node::NodeId::from_string("local"))
         ) as std::sync::Arc<dyn node::NodeHandle>;
@@ -117,7 +117,8 @@ mod tests {
             },
             snapshot_interval_secs: 0,
         };
-        let engine = std::sync::Arc::new(trondb_core::Engine::open(cfg).await.unwrap());
+        let (engine, _) = trondb_core::Engine::open(cfg).await.unwrap();
+        let engine = std::sync::Arc::new(engine);
         let node = std::sync::Arc::new(
             node::LocalNode::new(engine, node::NodeId::from_string("local"))
         ) as std::sync::Arc<dyn node::NodeHandle>;

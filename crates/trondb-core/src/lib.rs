@@ -20,7 +20,7 @@ use executor::Executor;
 use location::Tier;
 use result::QueryResult;
 use store::FjallStore;
-use trondb_wal::{WalConfig, WalRecovery, WalWriter};
+use trondb_wal::{WalConfig, WalRecord, WalRecovery, WalWriter};
 use types::LogicalId;
 
 // ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub async fn open(config: EngineConfig) -> Result<Self, EngineError> {
+    pub async fn open(config: EngineConfig) -> Result<(Self, Vec<WalRecord>), EngineError> {
         let store = FjallStore::open(&config.data_dir)?;
 
         // Load Location Table from snapshot if available
@@ -69,7 +69,7 @@ impl Engine {
             .cloned()
             .collect();
 
-        let replayed = executor.replay_wal_records(&records_to_replay)?;
+        let (replayed, unhandled_records) = executor.replay_wal_records(&records_to_replay)?;
         if replayed > 0 {
             eprintln!("WAL recovery: replayed {replayed} records");
         }
@@ -199,10 +199,10 @@ impl Engine {
             None
         };
 
-        Ok(Self {
+        Ok((Self {
             executor,
             _snapshot_handle: snapshot_handle,
-        })
+        }, unhandled_records))
     }
 
     pub fn entity_count(&self) -> usize {
@@ -332,7 +332,7 @@ mod tests {
             },
             snapshot_interval_secs: 0,
         };
-        let engine = Engine::open(config).await.unwrap();
+        let (engine, _) = Engine::open(config).await.unwrap();
         (engine, dir)
     }
 
@@ -508,7 +508,7 @@ mod tests {
 
         // Insert data
         {
-            let engine = Engine::open(config.clone()).await.unwrap();
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
             create_simple_collection(&engine, "venues", 3).await;
             engine
                 .execute_tql(
@@ -520,7 +520,7 @@ mod tests {
 
         // Reopen — HNSW index should be rebuilt from Fjall
         {
-            let engine = Engine::open(config).await.unwrap();
+            let (engine, _) = Engine::open(config).await.unwrap();
             let result = engine
                 .execute_tql("SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 1;")
                 .await
@@ -623,7 +623,7 @@ mod tests {
             },
             snapshot_interval_secs: 0,
         };
-        let engine = Engine::open(config).await.unwrap();
+        let (engine, _) = Engine::open(config).await.unwrap();
 
         // Verify the replayed data is queryable
         let result = engine
@@ -651,7 +651,7 @@ mod tests {
 
         // Write data
         {
-            let engine = Engine::open(config.clone()).await.unwrap();
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
             create_simple_collection(&engine, "venues", 3).await;
             engine
                 .execute_tql(
@@ -663,7 +663,7 @@ mod tests {
 
         // Reopen and verify
         {
-            let engine = Engine::open(config).await.unwrap();
+            let (engine, _) = Engine::open(config).await.unwrap();
             let result = engine
                 .execute_tql("FETCH * FROM venues WHERE id = 'v1';")
                 .await
@@ -842,7 +842,7 @@ mod tests {
 
         // Insert edge
         {
-            let engine = Engine::open(config.clone()).await.unwrap();
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
             create_simple_collection(&engine, "people", 3).await;
             engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
             engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
@@ -852,7 +852,7 @@ mod tests {
 
         // Reopen — AdjacencyIndex should be rebuilt
         {
-            let engine = Engine::open(config).await.unwrap();
+            let (engine, _) = Engine::open(config).await.unwrap();
             let result = engine.execute_tql("TRAVERSE knows FROM 'p1';").await.unwrap();
             assert_eq!(result.rows.len(), 1);
             assert_eq!(
@@ -876,7 +876,7 @@ mod tests {
 
         // Phase 1: Create collection with sparse repr, insert entity
         {
-            let engine = Engine::open(config.clone()).await.unwrap();
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
             engine.execute_tql("CREATE COLLECTION docs (
                 REPRESENTATION sparse_title METRIC INNER_PRODUCT SPARSE true
             );").await.unwrap();
@@ -886,7 +886,7 @@ mod tests {
 
         // Phase 2: Reopen — sparse index should be rebuilt
         {
-            let engine = Engine::open(config).await.unwrap();
+            let (engine, _) = Engine::open(config).await.unwrap();
             let result = engine.execute_tql("SEARCH docs NEAR SPARSE [1:1.0] LIMIT 5;").await.unwrap();
             assert_eq!(result.rows.len(), 1);
             assert_eq!(
@@ -909,7 +909,7 @@ mod tests {
         };
 
         {
-            let engine = Engine::open(config.clone()).await.unwrap();
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
             engine.execute_tql("CREATE COLLECTION venues (
                 REPRESENTATION identity DIMENSIONS 3 METRIC COSINE,
                 FIELD city TEXT,
@@ -922,7 +922,7 @@ mod tests {
         }
 
         {
-            let engine = Engine::open(config).await.unwrap();
+            let (engine, _) = Engine::open(config).await.unwrap();
             let result = engine.execute_tql("FETCH * FROM venues WHERE city = 'London';").await.unwrap();
             assert_eq!(result.rows.len(), 1);
             assert_eq!(
@@ -945,7 +945,7 @@ mod tests {
         };
 
         {
-            let engine = Engine::open(config.clone()).await.unwrap();
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
             engine.execute_tql("CREATE COLLECTION docs (
                 REPRESENTATION dense DIMENSIONS 3 METRIC COSINE,
                 REPRESENTATION sparse METRIC INNER_PRODUCT SPARSE true
@@ -956,7 +956,7 @@ mod tests {
         }
 
         {
-            let engine = Engine::open(config).await.unwrap();
+            let (engine, _) = Engine::open(config).await.unwrap();
             let result = engine.execute_tql(
                 "SEARCH docs NEAR VECTOR [0.1, 0.2, 0.3] NEAR SPARSE [1:1.0] LIMIT 5;"
             ).await.unwrap();
@@ -1144,7 +1144,7 @@ mod tests {
 
         // Insert data
         {
-            let engine = Engine::open(config.clone()).await.unwrap();
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
             create_simple_collection(&engine, "venues", 3).await;
             engine
                 .execute_tql(
@@ -1160,7 +1160,7 @@ mod tests {
 
         // Reopen — should restore from snapshot
         {
-            let engine = Engine::open(config).await.unwrap();
+            let (engine, _) = Engine::open(config).await.unwrap();
             let key = crate::location::ReprKey {
                 entity_id: crate::types::LogicalId::from_string("v1"),
                 repr_index: 0,
@@ -1181,7 +1181,7 @@ mod tests {
             },
             snapshot_interval_secs: 0,
         };
-        let engine = Engine::open(config).await.unwrap();
+        let (engine, _) = Engine::open(config).await.unwrap();
 
         engine.execute_tql("CREATE COLLECTION venues (
                 REPRESENTATION default DIMENSIONS 3 METRIC COSINE,
@@ -1217,7 +1217,7 @@ mod tests {
             },
             snapshot_interval_secs: 0,
         };
-        let engine = Engine::open(config).await.unwrap();
+        let (engine, _) = Engine::open(config).await.unwrap();
 
         engine.execute_tql(
             "CREATE COLLECTION venues (\
@@ -1243,7 +1243,7 @@ mod tests {
 
         // Insert then delete
         {
-            let engine = Engine::open(config.clone()).await.unwrap();
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
             engine.execute_tql(
                 "CREATE COLLECTION venues (\
                     REPRESENTATION default DIMENSIONS 3 METRIC COSINE\
@@ -1257,7 +1257,7 @@ mod tests {
         }
 
         // Reopen — WAL replay should process the EntityDelete
-        let engine = Engine::open(config).await.unwrap();
+        let (engine, _) = Engine::open(config).await.unwrap();
         let result = engine.execute_tql("FETCH * FROM venues;").await.unwrap();
         assert_eq!(result.rows.len(), 0, "entity should not exist after WAL replay of delete");
     }

@@ -55,8 +55,9 @@ impl Executor {
 
     /// Replay committed WAL records into the Fjall store.
     /// Called during engine startup to close the durability gap.
-    pub fn replay_wal_records(&self, records: &[WalRecord]) -> Result<usize, EngineError> {
+    pub fn replay_wal_records(&self, records: &[WalRecord]) -> Result<(usize, Vec<WalRecord>), EngineError> {
         let mut replayed = 0;
+        let mut unhandled = Vec::new();
 
         for record in records {
             match record.record_type {
@@ -140,7 +141,7 @@ impl Executor {
                     replayed += 1;
                 }
                 _ => {
-                    // Other record types (ReprWrite, etc.) are future phases
+                    unhandled.push(record.clone());
                 }
             }
         }
@@ -149,7 +150,7 @@ impl Executor {
             self.store.persist()?;
         }
 
-        Ok(replayed)
+        Ok((replayed, unhandled))
     }
 
     pub async fn execute(&self, plan: &Plan) -> Result<QueryResult, EngineError> {

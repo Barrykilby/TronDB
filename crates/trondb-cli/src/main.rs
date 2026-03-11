@@ -35,13 +35,14 @@ async fn main() {
     println!("Data directory: {}", data_dir.display());
     println!("Type .help for commands, or enter TQL statements ending with ;\n");
 
-    let engine = match Engine::open(config).await {
-        Ok(e) => Arc::new(e),
+    let (engine, _pending_records) = match Engine::open(config).await {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("Failed to open engine: {e}");
             std::process::exit(1);
         }
     };
+    let engine = Arc::new(engine);
 
     let wal = engine.wal_writer();
     let local_node = Arc::new(LocalNode::new(engine.clone(), NodeId::from_string("local")))
