@@ -4,6 +4,7 @@ pub mod planner;
 pub mod result;
 pub mod store;
 pub mod edge;
+pub mod field_index;
 pub mod index;
 pub mod location;
 pub mod types;
