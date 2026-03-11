@@ -88,6 +88,8 @@ pub struct LocationDescriptor {
     pub state: LocState,
     pub version: u64,
     pub encoding: Encoding,
+    #[serde(default)]
+    pub last_accessed: u64,
 }
 
 /// Per-entity view returned by get_entity(). Transient query return type.
@@ -205,6 +207,18 @@ impl LocationTable {
         Ok(())
     }
 
+    /// Update last_accessed timestamp for a representation key.
+    pub fn touch(&self, key: &ReprKey, timestamp: u64) {
+        if let Some(mut desc) = self.descriptors.get_mut(key) {
+            desc.last_accessed = timestamp;
+        }
+    }
+
+    /// Iterate over all entries in the location table.
+    pub fn iter(&self) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, ReprKey, LocationDescriptor>> {
+        self.descriptors.iter()
+    }
+
     /// Remove all descriptors for an entity (uses secondary index).
     pub fn remove_entity(&self, entity_id: &LogicalId) {
         if let Some((_, indices)) = self.entity_reprs.remove(entity_id) {
@@ -307,6 +321,7 @@ mod tests {
             state: LocState::Clean,
             version: 1,
             encoding: Encoding::Float32,
+            last_accessed: 0,
         }
     }
 
@@ -523,5 +538,58 @@ mod tests {
         let (restored, lsn) = LocationTable::restore(&bytes).unwrap();
         assert_eq!(lsn, 0);
         assert_eq!(restored.len(), 0);
+    }
+
+    #[test]
+    fn last_accessed_defaults_to_zero() {
+        let lt = LocationTable::new();
+        let key = make_key("e1", 0);
+        lt.register(key.clone(), LocationDescriptor {
+            tier: Tier::Fjall,
+            node_address: NodeAddress::localhost(),
+            state: LocState::Clean,
+            version: 1,
+            encoding: Encoding::Float32,
+            last_accessed: 0,
+        });
+        let desc = lt.get(&key).unwrap();
+        assert_eq!(desc.last_accessed, 0);
+    }
+
+    #[test]
+    fn last_accessed_survives_snapshot_roundtrip() {
+        let lt = LocationTable::new();
+        let key = make_key("e1", 0);
+        lt.register(key.clone(), LocationDescriptor {
+            tier: Tier::Fjall,
+            node_address: NodeAddress::localhost(),
+            state: LocState::Clean,
+            version: 1,
+            encoding: Encoding::Float32,
+            last_accessed: 1710000000,
+        });
+
+        let snap = lt.snapshot(100).unwrap();
+        let (restored, lsn) = LocationTable::restore(&snap).unwrap();
+        assert_eq!(lsn, 100);
+        let desc = restored.get(&key).unwrap();
+        assert_eq!(desc.last_accessed, 1710000000);
+    }
+
+    #[test]
+    fn update_last_accessed() {
+        let lt = LocationTable::new();
+        let key = make_key("e1", 0);
+        lt.register(key.clone(), LocationDescriptor {
+            tier: Tier::Fjall,
+            node_address: NodeAddress::localhost(),
+            state: LocState::Clean,
+            version: 1,
+            encoding: Encoding::Float32,
+            last_accessed: 0,
+        });
+        lt.touch(&key, 1710000000);
+        let desc = lt.get(&key).unwrap();
+        assert_eq!(desc.last_accessed, 1710000000);
     }
 }

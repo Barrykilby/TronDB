@@ -347,6 +347,7 @@ impl Executor {
                         state: LocState::Clean,
                         version: 1,
                         encoding,
+                        last_accessed: 0,
                     };
                     let loc_payload = rmp_serde::to_vec_named(&(&loc_key, &loc_desc))
                         .map_err(|e| EngineError::Storage(e.to_string()))?;
@@ -376,6 +377,7 @@ impl Executor {
                             state: LocState::Clean,
                             version: 1,
                             encoding,
+                            last_accessed: 0,
                         },
                     );
                 }
