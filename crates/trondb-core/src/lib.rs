@@ -200,14 +200,171 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_returns_unsupported() {
+    async fn search_returns_results() {
+        let (engine, _dir) = test_engine().await;
+
+        engine
+            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'The Shard') VECTOR [1.0, 0.0, 0.0];",
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v2', 'Big Ben') VECTOR [0.0, 1.0, 0.0];",
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute_tql("SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 2;")
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        // First result should be v1 (exact match)
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v1".into()))
+        );
+        // Should have a score
+        assert!(result.rows[0].score.is_some());
+        assert!(result.rows[0].score.unwrap() > 0.9);
+    }
+
+    #[tokio::test]
+    async fn search_confidence_filtering() {
+        let (engine, _dir) = test_engine().await;
+
+        engine
+            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'Close') VECTOR [0.9, 0.1, 0.0];",
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v2', 'Far') VECTOR [0.0, 0.0, 1.0];",
+            )
+            .await
+            .unwrap();
+
+        // High confidence threshold should filter out the distant vector
+        let result = engine
+            .execute_tql("SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] CONFIDENCE > 0.5 LIMIT 10;")
+            .await
+            .unwrap();
+
+        // Only the close vector should pass the threshold
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v1".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn search_empty_collection_returns_empty() {
+        let (engine, _dir) = test_engine().await;
+
+        engine
+            .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute_tql("SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 5;")
+            .await
+            .unwrap();
+
+        assert!(result.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explain_search_shows_hnsw() {
         let (engine, _dir) = test_engine().await;
 
         let result = engine
-            .execute_tql("SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] CONFIDENCE > 0.8;")
-            .await;
+            .execute_tql("EXPLAIN SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 5;")
+            .await
+            .unwrap();
 
-        assert!(result.is_err());
+        let strategy_row = result
+            .rows
+            .iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("strategy".into())))
+            .expect("should have 'strategy' property");
+
+        assert_eq!(
+            strategy_row.values.get("value"),
+            Some(&Value::String("HNSW".into()))
+        );
+
+        let mode_row = result
+            .rows
+            .iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("mode".into())))
+            .expect("should have 'mode' property");
+
+        assert_eq!(
+            mode_row.values.get("value"),
+            Some(&Value::String("Probabilistic".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn search_works_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("data"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        // Insert data
+        {
+            let engine = Engine::open(config.clone()).await.unwrap();
+            engine
+                .execute_tql("CREATE COLLECTION venues WITH DIMENSIONS 3;")
+                .await
+                .unwrap();
+            engine
+                .execute_tql(
+                    "INSERT INTO venues (id, name) VALUES ('v1', 'Test') VECTOR [1.0, 0.0, 0.0];",
+                )
+                .await
+                .unwrap();
+        }
+
+        // Reopen — HNSW index should be rebuilt from Fjall
+        {
+            let engine = Engine::open(config).await.unwrap();
+            let result = engine
+                .execute_tql("SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 1;")
+                .await
+                .unwrap();
+
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(
+                result.rows[0].values.get("id"),
+                Some(&Value::String("v1".into()))
+            );
+        }
     }
 
     #[tokio::test]
