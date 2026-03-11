@@ -1,5 +1,6 @@
 pub mod error;
 pub mod executor;
+pub mod hnsw_snapshot;
 pub mod hybrid;
 pub mod planner;
 pub mod quantise;

@@ -11,10 +11,10 @@ use crate::types::LogicalId;
 // HNSW parameters — sensible defaults for single-node
 // ---------------------------------------------------------------------------
 
-const MAX_NB_CONNECTION: usize = 16;
-const MAX_ELEMENTS: usize = 100_000;
-const MAX_LAYER: usize = 16;
-const EF_CONSTRUCTION: usize = 200;
+pub(crate) const MAX_NB_CONNECTION: usize = 16;
+pub(crate) const MAX_ELEMENTS: usize = 100_000;
+pub(crate) const MAX_LAYER: usize = 16;
+pub(crate) const EF_CONSTRUCTION: usize = 200;
 const EF_SEARCH: usize = 50;
 
 /// Fraction of live entries that tombstones must exceed before a rebuild is
@@ -174,6 +174,39 @@ impl HnswIndex {
 
     pub fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    /// Access the underlying HNSW mutex (for snapshot dump).
+    pub fn inner(&self) -> &Mutex<Hnsw<'static, f32, DistCosine>> {
+        &self.inner
+    }
+
+    /// Snapshot the ID maps for persistence.
+    pub fn snapshot_id_maps(
+        &self,
+    ) -> (
+        std::collections::HashMap<String, usize>,
+        std::collections::HashMap<usize, String>,
+        usize,
+        Vec<String>,
+    ) {
+        let id_to_idx: std::collections::HashMap<String, usize> = self
+            .id_to_idx
+            .iter()
+            .map(|e| (e.key().as_str().to_owned(), *e.value()))
+            .collect();
+        let idx_to_id: std::collections::HashMap<usize, String> = self
+            .idx_to_id
+            .iter()
+            .map(|e| (*e.key(), e.value().as_str().to_owned()))
+            .collect();
+        let next_idx = self.next_idx.load(Ordering::SeqCst);
+        let tombstones: Vec<String> = self
+            .tombstones
+            .iter()
+            .map(|e| e.key().as_str().to_owned())
+            .collect();
+        (id_to_idx, idx_to_id, next_idx, tombstones)
     }
 }
 
