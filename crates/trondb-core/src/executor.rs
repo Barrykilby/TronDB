@@ -282,9 +282,61 @@ impl Executor {
                 })
             }
 
-            Plan::Search(_) => Err(EngineError::UnsupportedOperation(
-                "SEARCH requires vector index (Phase 4)".into(),
-            )),
+            Plan::Search(p) => {
+                // Validate collection exists
+                if !self.store.has_collection(&p.collection) {
+                    return Err(EngineError::CollectionNotFound(p.collection.clone()));
+                }
+
+                // Validate dimensions
+                let dims = self.store.get_dimensions(&p.collection)?;
+                if p.query_vector.len() != dims {
+                    return Err(EngineError::DimensionMismatch {
+                        expected: dims,
+                        got: p.query_vector.len(),
+                    });
+                }
+
+                // Cast query vector f64 → f32
+                let query_f32: Vec<f32> = p.query_vector.iter().map(|v| *v as f32).collect();
+
+                // Search HNSW index
+                let candidates = if let Some(index) = self.indexes.get(&p.collection) {
+                    index.search(&query_f32, p.k)
+                } else {
+                    Vec::new()
+                };
+
+                // Filter by confidence threshold and resolve entities
+                let mut rows = Vec::new();
+                let mut scanned = 0;
+                for (id, similarity) in candidates {
+                    if (similarity as f64) < p.confidence_threshold {
+                        continue;
+                    }
+                    scanned += 1;
+
+                    // Resolve entity from Fjall
+                    if let Ok(entities) = self.store.scan(&p.collection) {
+                        if let Some(entity) = entities.iter().find(|e| e.id == id) {
+                            let mut row = entity_to_row(entity, &FieldList::All);
+                            row.score = Some(similarity);
+                            rows.push(row);
+                        }
+                    }
+                }
+
+                Ok(QueryResult {
+                    columns: build_columns(&rows, &FieldList::All),
+                    rows,
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: scanned,
+                        mode: QueryMode::Probabilistic,
+                        tier: "Ram".into(),
+                    },
+                })
+            }
 
             Plan::Explain(inner) => {
                 let rows = explain_plan(inner);
@@ -483,9 +535,9 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("mode", "Probabilistic".into()));
             props.push(("verb", "SEARCH".into()));
             props.push(("collection", p.collection.clone()));
-            props.push(("tier", "Fjall".into()));
+            props.push(("tier", "Ram".into()));
             props.push(("encoding", "Float32".into()));
-            props.push(("strategy", "BruteForce".into()));
+            props.push(("strategy", "HNSW".into()));
             props.push(("k", p.k.to_string()));
             props.push(("confidence_threshold", p.confidence_threshold.to_string()));
         }
