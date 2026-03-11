@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 7b: Graph Depth, Entity Lifecycle, Range Queries, Edge Decay.
+Inference-first storage engine. Phase 8: UPDATE, WAL Replay, HNSW Persistence.
 
 ## Project Structure
 
@@ -39,17 +39,29 @@ Inference-first storage engine. Phase 7b: Graph Depth, Entity Lifecycle, Range Q
 - Persistence: Fjall (LSM-based). Data dir default: ./trondb_data
 - WAL: MessagePack records, CRC32 verified, segment files. Dir: {data_dir}/wal/
 - Write path: WAL append → flush+fsync → apply to Fjall + Location Table + HNSW index + AdjacencyIndex → ack
+- UPDATE: metadata-only mutation via UPDATE 'id' IN collection SET field = value;
+  - Reuses EntityWrite WAL record (full entity blob)
+  - Captures old field index values before mutation, removes old entries, inserts new entries
 - Location Table: DashMap-backed control fabric, always in RAM
   - Tracks LocationDescriptor per representation (tier, state, encoding, node address)
   - WAL-logged via RecordType::LocationUpdate (0x40)
   - Periodically snapshotted to {data_dir}/location_table.snap
   - Restored from snapshot + WAL replay on startup
   - State machine: Clean → Dirty → Recomputing → Clean; Clean → Migrating → Clean
+- WAL replay: all actively-written record types handled
+  - EntityDelete: Fjall delete + tiered storage cleanup
+  - AffinityGroup*: routed to AffinityIndex::replay_affinity_record() via unhandled records
+  - TierMigration: state-inspection recovery (check source/target tier existence)
+  - Engine::open returns (Engine, Vec<WalRecord>) — unhandled records for routing layer
 - HNSW Index: per-collection vector index, always in RAM (control fabric)
   - Uses hnsw_rs with DistCosine (cosine similarity)
-  - Rebuilt from Fjall on startup (no persistence)
   - SEARCH returns results with similarity scores, filtered by confidence threshold
   - QueryMode::Probabilistic for SEARCH, QueryMode::Deterministic for FETCH
+- HNSW Persistence: snapshot + incremental WAL catch-up
+  - Directory: {data_dir}/hnsw_snapshots/
+  - Files per index: .hnsw.graph, .hnsw.data, .hnsw.idmap (bincode), .hnsw.meta (JSON)
+  - Startup: load snapshot → incremental WAL catch-up → fallback to full Fjall rebuild
+  - Periodic background snapshots (configurable interval)
 - Edges: schema-first structural edges with AdjacencyIndex
   - Edge types declared via CREATE EDGE, stored in Fjall
   - Edges stored in Fjall per-type partitions (edges.{type})
