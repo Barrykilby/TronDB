@@ -88,6 +88,51 @@ pub enum Token {
     #[token("DELETE", priority = 10, ignore(ascii_case))]
     Delete,
 
+    #[token("REPRESENTATION", priority = 10, ignore(ascii_case))]
+    Representation,
+
+    #[token("MODEL", priority = 10, ignore(ascii_case))]
+    Model,
+
+    #[token("METRIC", priority = 10, ignore(ascii_case))]
+    TokenMetric,
+
+    #[token("SPARSE", priority = 10, ignore(ascii_case))]
+    Sparse,
+
+    #[token("FIELD", priority = 10, ignore(ascii_case))]
+    Field,
+
+    #[token("DATETIME", priority = 10, ignore(ascii_case))]
+    DateTime,
+
+    #[token("TEXT", priority = 10, ignore(ascii_case))]
+    Text,
+
+    #[token("BOOL", priority = 10, ignore(ascii_case))]
+    TokenBool,
+
+    #[token("INT", priority = 10, ignore(ascii_case))]
+    TokenInt,
+
+    #[token("FLOAT", priority = 10, ignore(ascii_case))]
+    TokenFloat,
+
+    #[token("ENTITY_REF", priority = 10, ignore(ascii_case))]
+    EntityRef,
+
+    #[token("INDEX", priority = 10, ignore(ascii_case))]
+    Index,
+
+    #[token("ON", priority = 10, ignore(ascii_case))]
+    On,
+
+    #[token("INNER_PRODUCT", priority = 10, ignore(ascii_case))]
+    InnerProduct,
+
+    #[token("COSINE", priority = 10, ignore(ascii_case))]
+    Cosine,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
@@ -143,6 +188,9 @@ pub enum Token {
 
     #[token("<")]
     Lt,
+
+    #[token(":")]
+    Colon,
 }
 
 #[cfg(test)]
@@ -239,5 +287,57 @@ mod tests {
                 Token::Semicolon,
             ]
         );
+    }
+
+    #[test]
+    fn lex_representation_tokens() {
+        let tokens = lex("REPRESENTATION identity MODEL 'jina-v4' DIMENSIONS 1024 METRIC COSINE");
+        assert_eq!(tokens[0], Token::Representation);
+        assert_eq!(tokens[1], Token::Ident("identity".to_string()));
+        assert_eq!(tokens[2], Token::Model);
+        assert_eq!(tokens[3], Token::StringLit("jina-v4".to_string()));
+        assert_eq!(tokens[4], Token::Dimensions);
+        assert_eq!(tokens[5], Token::IntLit(1024));
+        assert_eq!(tokens[6], Token::TokenMetric);
+        assert_eq!(tokens[7], Token::Cosine);
+    }
+
+    #[test]
+    fn lex_sparse_vector_literal() {
+        let tokens = lex("[1:0.8, 42:0.5]");
+        assert_eq!(tokens, vec![
+            Token::LBracket,
+            Token::IntLit(1),
+            Token::Colon,
+            Token::FloatLit(0.8),
+            Token::Comma,
+            Token::IntLit(42),
+            Token::Colon,
+            Token::FloatLit(0.5),
+            Token::RBracket,
+        ]);
+    }
+
+    #[test]
+    fn lex_field_and_index_tokens() {
+        let tokens = lex("FIELD status TEXT INDEX idx_status ON");
+        assert_eq!(tokens[0], Token::Field);
+        assert_eq!(tokens[1], Token::Ident("status".to_string()));
+        assert_eq!(tokens[2], Token::Text);
+        assert_eq!(tokens[3], Token::Index);
+        assert_eq!(tokens[4], Token::Ident("idx_status".to_string()));
+        assert_eq!(tokens[5], Token::On);
+    }
+
+    #[test]
+    fn lex_sparse_keyword() {
+        let tokens = lex("SPARSE INNER_PRODUCT ENTITY_REF BOOL INT FLOAT DATETIME");
+        assert_eq!(tokens[0], Token::Sparse);
+        assert_eq!(tokens[1], Token::InnerProduct);
+        assert_eq!(tokens[2], Token::EntityRef);
+        assert_eq!(tokens[3], Token::TokenBool);
+        assert_eq!(tokens[4], Token::TokenInt);
+        assert_eq!(tokens[5], Token::TokenFloat);
+        assert_eq!(tokens[6], Token::DateTime);
     }
 }
