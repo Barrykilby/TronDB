@@ -30,25 +30,13 @@ pub struct EdgeType {
     pub decay_config: DecayConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DecayConfig {
     pub decay_fn: Option<DecayFn>,
     pub decay_rate: Option<f64>,
     pub floor: Option<f64>,
     pub promote_threshold: Option<f64>,
     pub prune_threshold: Option<f64>,
-}
-
-impl Default for DecayConfig {
-    fn default() -> Self {
-        Self {
-            decay_fn: None,
-            decay_rate: None,
-            floor: None,
-            promote_threshold: None,
-            prune_threshold: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +75,7 @@ impl AdjacencyIndex {
         };
         self.forward
             .entry(key)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(entry);
     }
 

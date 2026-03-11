@@ -1,11 +1,11 @@
 # TronDB
 
-Inference-first storage engine. Phase 4: HNSW vector index.
+Inference-first storage engine. Phase 5: Structural edges + TRAVERSE.
 
 ## Project Structure
 
 - `crates/trondb-wal/` — Write-Ahead Log: record types (MessagePack), segment files, buffer, async writer, crash recovery
-- `crates/trondb-core/` — Engine: types, Fjall-backed store, Location Table (DashMap), HNSW index (hnsw_rs), planner, async executor. Depends on trondb-wal + trondb-tql.
+- `crates/trondb-core/` — Engine: types, Fjall-backed store, Location Table (DashMap), HNSW index (hnsw_rs), edges (AdjacencyIndex), planner, async executor. Depends on trondb-wal + trondb-tql.
 - `crates/trondb-tql/` — TQL parser (logos lexer + recursive descent). No engine dependency.
 - `crates/trondb-cli/` — Interactive REPL binary (Tokio + rustyline). Depends on all crates.
 
@@ -20,7 +20,7 @@ Inference-first storage engine. Phase 4: HNSW vector index.
 - LogicalId is a String wrapper (user-provided or UUID v4)
 - Persistence: Fjall (LSM-based). Data dir default: ./trondb_data
 - WAL: MessagePack records, CRC32 verified, segment files. Dir: {data_dir}/wal/
-- Write path: WAL append → flush+fsync → apply to Fjall + Location Table + HNSW index → ack
+- Write path: WAL append → flush+fsync → apply to Fjall + Location Table + HNSW index + AdjacencyIndex → ack
 - Location Table: DashMap-backed control fabric, always in RAM
   - Tracks LocationDescriptor per representation (tier, state, encoding, node address)
   - WAL-logged via RecordType::LocationUpdate (0x40)
@@ -32,3 +32,10 @@ Inference-first storage engine. Phase 4: HNSW vector index.
   - Rebuilt from Fjall on startup (no persistence)
   - SEARCH returns results with similarity scores, filtered by confidence threshold
   - QueryMode::Probabilistic for SEARCH, QueryMode::Deterministic for FETCH
+- Edges: schema-first structural edges with AdjacencyIndex
+  - Edge types declared via CREATE EDGE, stored in Fjall
+  - Edges stored in Fjall per-type partitions (edges.{type})
+  - AdjacencyIndex (DashMap) in RAM for fast TRAVERSE, rebuilt from Fjall on startup
+  - Structural edges have confidence=1.0, no decay
+  - TRAVERSE returns connected entities (single-hop, DEPTH > 1 gated)
+  - DecayConfig fields defined but not driven until Phase 6
