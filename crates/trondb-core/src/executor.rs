@@ -1129,8 +1129,77 @@ impl Executor {
                     },
                 })
             }
-            Plan::UpdateEntity(_) => {
-                Err(EngineError::UnsupportedOperation("UPDATE execution not yet implemented".into()))
+            Plan::UpdateEntity(p) => {
+                let entity_id = LogicalId::from_string(&p.entity_id);
+
+                // Step 1: Read current entity (errors if not found)
+                let mut entity = self.store.get(&p.collection, &entity_id)?;
+
+                // Step 2: Capture old field values for indexed fields (before mutation)
+                let schema = self.schemas.get(&p.collection);
+                let old_field_values: Vec<(String, Vec<Value>)> = if let Some(ref s) = schema {
+                    s.indexes.iter().map(|idx_def| {
+                        let fidx_key = format!("{}:{}", p.collection, idx_def.name);
+                        let values: Vec<Value> = idx_def.fields.iter()
+                            .map(|f| entity.metadata.get(f).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        (fidx_key, values)
+                    }).collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Step 3: Apply assignments
+                for (field, literal) in &p.assignments {
+                    let value = literal_to_value(literal);
+                    entity.metadata.insert(field.clone(), value);
+                }
+
+                // Step 4: WAL append (reuse EntityWrite — full entity blob)
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+                let payload = rmp_serde::to_vec_named(&entity)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
+                self.wal.commit(tx_id).await?;
+
+                // Step 5: Write to Fjall
+                self.store.insert(&p.collection, entity.clone())?;
+                self.store.persist()?;
+
+                // Step 6: Update field indexes — remove old, insert new
+                if let Some(ref s) = schema {
+                    for (idx_def, (fidx_key, old_values)) in s.indexes.iter().zip(old_field_values.iter()) {
+                        if let Some(fidx) = self.field_indexes.get(fidx_key) {
+                            // Remove old entry
+                            let _ = fidx.remove(&entity_id, old_values);
+                            // Insert new entry
+                            let new_values: Vec<Value> = idx_def.fields.iter()
+                                .map(|f| entity.metadata.get(f).cloned().unwrap_or(Value::Null))
+                                .collect();
+                            if new_values.len() == fidx.field_types().len() {
+                                let _ = fidx.insert(&entity_id, &new_values);
+                            }
+                        }
+                    }
+                }
+
+                Ok(QueryResult {
+                    columns: vec!["result".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([(
+                            "result".into(),
+                            Value::String(format!("Entity '{}' updated in '{}'", p.entity_id, p.collection)),
+                        )]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 1,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                    },
+                })
             }
         }
     }

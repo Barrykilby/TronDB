@@ -1169,4 +1169,63 @@ mod tests {
             assert_eq!(desc.tier, crate::location::Tier::Fjall);
         }
     }
+
+    #[tokio::test]
+    async fn update_entity_changes_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+        let engine = Engine::open(config).await.unwrap();
+
+        engine.execute_tql("CREATE COLLECTION venues (
+                REPRESENTATION default DIMENSIONS 3 METRIC COSINE,
+                FIELD name TEXT,
+                INDEX idx_name ON (name)
+            );").await.unwrap();
+
+        engine.execute_tql(
+            "INSERT INTO venues (id, name) VALUES ('v1', 'Old Name') \
+             REPRESENTATION default VECTOR [1.0, 0.0, 0.0];"
+        ).await.unwrap();
+
+        // UPDATE
+        engine.execute_tql("UPDATE 'v1' IN venues SET name = 'New Name';").await.unwrap();
+
+        // FETCH to verify
+        let result = engine.execute_tql("FETCH * FROM venues WHERE name = 'New Name';").await.unwrap();
+        assert_eq!(result.rows.len(), 1, "should find entity by new name");
+
+        // Old name should return nothing
+        let result = engine.execute_tql("FETCH * FROM venues WHERE name = 'Old Name';").await.unwrap();
+        assert_eq!(result.rows.len(), 0, "old name should not match");
+    }
+
+    #[tokio::test]
+    async fn update_nonexistent_entity_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+        let engine = Engine::open(config).await.unwrap();
+
+        engine.execute_tql(
+            "CREATE COLLECTION venues (\
+                REPRESENTATION default DIMENSIONS 3 METRIC COSINE\
+            );"
+        ).await.unwrap();
+
+        let result = engine.execute_tql("UPDATE 'nonexistent' IN venues SET name = 'X';").await;
+        assert!(result.is_err(), "updating nonexistent entity should error");
+    }
 }
