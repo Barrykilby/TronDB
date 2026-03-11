@@ -499,6 +499,8 @@ async fn health_poll_loop(
                                 replica_lag_ms: None,
                                 load_score: 1.0,
                                 status: NodeStatus::Faulted,
+                                warm_entity_count: 0,
+                                archive_entity_count: 0,
                             };
                             health.update(signal);
                         }
@@ -541,6 +543,8 @@ mod tests {
             replica_lag_ms: None,
             load_score: load,
             status: NodeStatus::Healthy,
+            warm_entity_count: 0,
+            archive_entity_count: 0,
         }
     }
 

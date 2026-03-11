@@ -59,6 +59,8 @@ mod tests {
             replica_lag_ms: None,
             load_score,
             status: health::NodeStatus::Healthy,
+            warm_entity_count: 0,
+            archive_entity_count: 0,
         }
     }
 
