@@ -1369,12 +1369,14 @@ name = "trondb-core"
 version = "0.1.0"
 dependencies = [
  "anndists",
+ "bincode",
  "bytes",
  "dashmap",
  "fjall",
  "hnsw_rs",
  "rmp-serde",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
