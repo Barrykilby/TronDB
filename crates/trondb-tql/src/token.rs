@@ -73,6 +73,21 @@ pub enum Token {
     #[token("FALSE", priority = 10, ignore(ascii_case))]
     False,
 
+    #[token("EDGE", priority = 10, ignore(ascii_case))]
+    Edge,
+
+    #[token("TRAVERSE", priority = 10, ignore(ascii_case))]
+    Traverse,
+
+    #[token("DEPTH", priority = 10, ignore(ascii_case))]
+    Depth,
+
+    #[token("TO", priority = 10, ignore(ascii_case))]
+    To,
+
+    #[token("DELETE", priority = 10, ignore(ascii_case))]
+    Delete,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
@@ -206,5 +221,23 @@ mod tests {
         assert_eq!(lex("FETCH"), vec![Token::Fetch]);
         assert_eq!(lex("fetch"), vec![Token::Fetch]);
         assert_eq!(lex("Fetch"), vec![Token::Fetch]);
+    }
+
+    #[test]
+    fn lex_edge_statement() {
+        let tokens = lex("CREATE EDGE knows FROM people TO people;");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Create,
+                Token::Edge,
+                Token::Ident("knows".to_string()),
+                Token::From,
+                Token::Ident("people".to_string()),
+                Token::To,
+                Token::Ident("people".to_string()),
+                Token::Semicolon,
+            ]
+        );
     }
 }

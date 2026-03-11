@@ -79,6 +79,8 @@ impl Parser {
             Some(Token::Fetch) => self.parse_fetch(),
             Some(Token::Search) => self.parse_search(),
             Some(Token::Explain) => self.parse_explain(),
+            Some(Token::Delete) => self.parse_delete(),
+            Some(Token::Traverse) => self.parse_traverse(),
             Some(tok) => {
                 let tok_str = format!("{tok:?}");
                 let pos = self.tokens[self.pos].1.start;
@@ -96,7 +98,24 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // CREATE
-        self.expect(&Token::Collection)?;
+        match self.peek() {
+            Some(Token::Collection) => self.parse_create_collection(),
+            Some(Token::Edge) => self.parse_create_edge(),
+            Some(tok) => {
+                let tok_str = format!("{tok:?}");
+                let pos = self.tokens[self.pos].1.start;
+                Err(ParseError::UnexpectedToken {
+                    pos,
+                    expected: "COLLECTION or EDGE".to_string(),
+                    got: tok_str,
+                })
+            }
+            None => Err(ParseError::UnexpectedEof("expected COLLECTION or EDGE".to_string())),
+        }
+    }
+
+    fn parse_create_collection(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // COLLECTION
         let name = self.expect_ident()?;
         self.expect(&Token::With)?;
         self.expect(&Token::Dimensions)?;
@@ -108,13 +127,44 @@ impl Parser {
         }))
     }
 
+    fn parse_create_edge(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // EDGE
+        let name = self.expect_ident()?;
+        self.expect(&Token::From)?;
+        let from_collection = self.expect_ident()?;
+        self.expect(&Token::To)?;
+        let to_collection = self.expect_ident()?;
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::CreateEdgeType(CreateEdgeTypeStmt {
+            name,
+            from_collection,
+            to_collection,
+        }))
+    }
+
     fn parse_insert(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // INSERT
-        self.expect(&Token::Into)?;
+        match self.peek() {
+            Some(Token::Into) => self.parse_insert_entity(),
+            Some(Token::Edge) => self.parse_insert_edge(),
+            Some(tok) => {
+                let tok_str = format!("{tok:?}");
+                let pos = self.tokens[self.pos].1.start;
+                Err(ParseError::UnexpectedToken {
+                    pos,
+                    expected: "INTO or EDGE".to_string(),
+                    got: tok_str,
+                })
+            }
+            None => Err(ParseError::UnexpectedEof("expected INTO or EDGE".to_string())),
+        }
+    }
+
+    fn parse_insert_entity(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // INTO
         let collection = self.expect_ident()?;
         self.expect(&Token::LParen)?;
 
-        // Parse field list
         let mut fields = vec![self.expect_ident()?];
         while self.peek() == Some(&Token::Comma) {
             self.advance();
@@ -125,7 +175,6 @@ impl Parser {
         self.expect(&Token::Values)?;
         self.expect(&Token::LParen)?;
 
-        // Parse values
         let mut values = vec![self.parse_literal()?];
         while self.peek() == Some(&Token::Comma) {
             self.advance();
@@ -133,7 +182,6 @@ impl Parser {
         }
         self.expect(&Token::RParen)?;
 
-        // Optional VECTOR [...]
         let vector = if self.peek() == Some(&Token::Vector) {
             self.advance();
             Some(self.parse_float_list()?)
@@ -148,6 +196,108 @@ impl Parser {
             values,
             vector,
         }))
+    }
+
+    fn parse_insert_edge(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // EDGE
+        let edge_type = self.expect_ident()?;
+        self.expect(&Token::From)?;
+        let from_id = self.expect_string_lit()?;
+        self.expect(&Token::To)?;
+        let to_id = self.expect_string_lit()?;
+
+        // Optional WITH (key = value, ...)
+        let metadata = if self.peek() == Some(&Token::With) {
+            self.advance(); // WITH
+            self.parse_kv_list()?
+        } else {
+            Vec::new()
+        };
+
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::InsertEdge(InsertEdgeStmt {
+            edge_type,
+            from_id,
+            to_id,
+            metadata,
+        }))
+    }
+
+    fn parse_delete(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // DELETE
+        self.expect(&Token::Edge)?;
+        let edge_type = self.expect_ident()?;
+        self.expect(&Token::From)?;
+        let from_id = self.expect_string_lit()?;
+        self.expect(&Token::To)?;
+        let to_id = self.expect_string_lit()?;
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::DeleteEdge(DeleteEdgeStmt {
+            edge_type,
+            from_id,
+            to_id,
+        }))
+    }
+
+    fn parse_traverse(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // TRAVERSE
+        let edge_type = self.expect_ident()?;
+        self.expect(&Token::From)?;
+        let from_id = self.expect_string_lit()?;
+
+        // Optional DEPTH n (default 1)
+        let depth = if self.peek() == Some(&Token::Depth) {
+            self.advance();
+            self.expect_int()? as usize
+        } else {
+            1
+        };
+
+        // Optional LIMIT n
+        let limit = if self.peek() == Some(&Token::Limit) {
+            self.advance();
+            Some(self.expect_int()? as usize)
+        } else {
+            None
+        };
+
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::Traverse(TraverseStmt {
+            edge_type,
+            from_id,
+            depth,
+            limit,
+        }))
+    }
+
+    fn expect_string_lit(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Some((Token::StringLit(s), _)) => Ok(s),
+            Some((tok, pos)) => Err(ParseError::UnexpectedToken {
+                pos,
+                expected: "string literal".to_string(),
+                got: format!("{tok:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEof("expected string literal".to_string())),
+        }
+    }
+
+    fn parse_kv_list(&mut self) -> Result<Vec<(String, Literal)>, ParseError> {
+        self.expect(&Token::LParen)?;
+        let mut pairs = Vec::new();
+        let key = self.expect_ident()?;
+        self.expect(&Token::Eq)?;
+        let value = self.parse_literal()?;
+        pairs.push((key, value));
+        while self.peek() == Some(&Token::Comma) {
+            self.advance();
+            let key = self.expect_ident()?;
+            self.expect(&Token::Eq)?;
+            let value = self.parse_literal()?;
+            pairs.push((key, value));
+        }
+        self.expect(&Token::RParen)?;
+        Ok(pairs)
     }
 
     fn parse_fetch(&mut self) -> Result<Statement, ParseError> {
@@ -456,5 +606,86 @@ mod tests {
     fn parse_error_missing_semicolon() {
         let result = parse("FETCH * FROM venues");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_create_edge() {
+        let stmt = parse("CREATE EDGE knows FROM people TO people;").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::CreateEdgeType(CreateEdgeTypeStmt {
+                name: "knows".to_string(),
+                from_collection: "people".to_string(),
+                to_collection: "people".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_insert_edge() {
+        let stmt = parse("INSERT EDGE knows FROM 'v1' TO 'v2';").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::InsertEdge(InsertEdgeStmt {
+                edge_type: "knows".to_string(),
+                from_id: "v1".to_string(),
+                to_id: "v2".to_string(),
+                metadata: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_insert_edge_with_metadata() {
+        let stmt = parse("INSERT EDGE knows FROM 'v1' TO 'v2' WITH (since = '2024', weight = 42);").unwrap();
+        match &stmt {
+            Statement::InsertEdge(e) => {
+                assert_eq!(e.metadata.len(), 2);
+                assert_eq!(e.metadata[0], ("since".to_string(), Literal::String("2024".to_string())));
+                assert_eq!(e.metadata[1], ("weight".to_string(), Literal::Int(42)));
+            }
+            _ => panic!("expected InsertEdge"),
+        }
+    }
+
+    #[test]
+    fn parse_delete_edge() {
+        let stmt = parse("DELETE EDGE knows FROM 'v1' TO 'v2';").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::DeleteEdge(DeleteEdgeStmt {
+                edge_type: "knows".to_string(),
+                from_id: "v1".to_string(),
+                to_id: "v2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_traverse() {
+        let stmt = parse("TRAVERSE knows FROM 'v1';").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::Traverse(TraverseStmt {
+                edge_type: "knows".to_string(),
+                from_id: "v1".to_string(),
+                depth: 1,
+                limit: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_traverse_with_depth_and_limit() {
+        let stmt = parse("TRAVERSE knows FROM 'v1' DEPTH 1 LIMIT 10;").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::Traverse(TraverseStmt {
+                edge_type: "knows".to_string(),
+                from_id: "v1".to_string(),
+                depth: 1,
+                limit: Some(10),
+            })
+        );
     }
 }

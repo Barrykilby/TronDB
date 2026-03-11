@@ -5,6 +5,10 @@ pub enum Statement {
     Fetch(FetchStmt),
     Search(SearchStmt),
     Explain(Box<Statement>),
+    CreateEdgeType(CreateEdgeTypeStmt),
+    InsertEdge(InsertEdgeStmt),
+    DeleteEdge(DeleteEdgeStmt),
+    Traverse(TraverseStmt),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,4 +64,34 @@ pub enum Literal {
     Float(f64),
     Bool(bool),
     Null,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateEdgeTypeStmt {
+    pub name: String,
+    pub from_collection: String,
+    pub to_collection: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertEdgeStmt {
+    pub edge_type: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub metadata: Vec<(String, Literal)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteEdgeStmt {
+    pub edge_type: String,
+    pub from_id: String,
+    pub to_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraverseStmt {
+    pub edge_type: String,
+    pub from_id: String,
+    pub depth: usize,
+    pub limit: Option<usize>,
 }
