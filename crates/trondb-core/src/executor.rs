@@ -472,9 +472,49 @@ impl Executor {
                             },
                         })
                     }
-                    FetchStrategy::FieldIndexRange(_index_name) => {
-                        // TODO(Task 3): implement range scan via FieldIndex
-                        unimplemented!("FieldIndexRange execution is implemented in Task 3")
+                    FetchStrategy::FieldIndexRange(index_name) => {
+                        let fidx_key = format!("{}:{}", p.collection, index_name);
+                        let fidx = self.field_indexes.get(&fidx_key)
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                format!("field index '{}' not found", index_name),
+                            ))?;
+
+                        // Compute range bounds from the filter
+                        let entity_ids = match &p.filter {
+                            Some(clause) => {
+                                let (lower, upper) = range_bounds_from_clause(clause);
+                                fidx.lookup_range(&lower, &upper)?
+                            }
+                            None => {
+                                return Err(EngineError::InvalidQuery(
+                                    "FieldIndexRange requires a range filter".into(),
+                                ));
+                            }
+                        };
+
+                        let mut rows = Vec::new();
+                        for eid in &entity_ids {
+                            if let Ok(entity) = self.store.get(&p.collection, eid) {
+                                // Post-filter: entity_matches handles strict Gt/Lt boundary exclusion
+                                if p.filter.as_ref().map(|c| entity_matches(&entity, c)).unwrap_or(true) {
+                                    rows.push(entity_to_row(&entity, &p.fields));
+                                }
+                            }
+                        }
+                        if let Some(limit) = p.limit {
+                            rows.truncate(limit);
+                        }
+                        let columns = build_columns(&rows, &p.fields);
+                        Ok(QueryResult {
+                            columns,
+                            rows,
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: entity_ids.len(),
+                                mode: QueryMode::Deterministic,
+                                tier: "FieldIndex".into(),
+                            },
+                        })
                     }
                     FetchStrategy::FullScan => {
                         // Read directly from Fjall — no WAL involvement
@@ -1217,6 +1257,48 @@ fn build_columns(rows: &[Row], fields: &FieldList) -> Vec<String> {
     }
 }
 
+/// Extract approximate lower/upper bound `Value` vectors from a `WhereClause`
+/// for use with `FieldIndex::lookup_range()`. The bounds are intentionally
+/// inclusive — strict Gt/Lt exclusion is handled by the post-filter
+/// (`entity_matches`).
+fn range_bounds_from_clause(clause: &WhereClause) -> (Vec<Value>, Vec<Value>) {
+    match clause {
+        WhereClause::Gt(_, lit) | WhereClause::Gte(_, lit) => {
+            (vec![literal_to_value(lit)], vec![Value::Int(i64::MAX)])
+        }
+        WhereClause::Lt(_, lit) | WhereClause::Lte(_, lit) => {
+            (vec![Value::Int(i64::MIN)], vec![literal_to_value(lit)])
+        }
+        WhereClause::And(left, right) => {
+            let (l_lower, l_upper) = range_bounds_from_clause(left);
+            let (r_lower, r_upper) = range_bounds_from_clause(right);
+            // Take the tighter (more restrictive) bound from each side
+            let lower = pick_tighter_lower(&l_lower, &r_lower);
+            let upper = pick_tighter_upper(&l_upper, &r_upper);
+            (lower, upper)
+        }
+        _ => (vec![Value::Int(i64::MIN)], vec![Value::Int(i64::MAX)]),
+    }
+}
+
+/// Pick the larger (more restrictive) lower bound.
+fn pick_tighter_lower(a: &[Value], b: &[Value]) -> Vec<Value> {
+    if a.len() == 1 && b.len() == 1 {
+        if value_gt(&a[0], &b[0]) { a.to_vec() } else { b.to_vec() }
+    } else {
+        a.to_vec()
+    }
+}
+
+/// Pick the smaller (more restrictive) upper bound.
+fn pick_tighter_upper(a: &[Value], b: &[Value]) -> Vec<Value> {
+    if a.len() == 1 && b.len() == 1 {
+        if value_lt(&a[0], &b[0]) { a.to_vec() } else { b.to_vec() }
+    } else {
+        a.to_vec()
+    }
+}
+
 fn explain_plan(plan: &Plan) -> Vec<Row> {
     let mut props: Vec<(&str, String)> = Vec::new();
 
@@ -1848,6 +1930,194 @@ mod tests {
         assert_eq!(result.rows[0].values.get("city"), Some(&Value::String("London".into())));
         assert_eq!(result.rows[0].values.get("id"), Some(&Value::String("v1".into())));
         assert_eq!(result.stats.tier, "FieldIndex");
+    }
+
+    #[tokio::test]
+    async fn fetch_via_field_index_range() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score >= 30 using FieldIndexRange strategy
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Gte("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 3); // scores 30, 40, 50
+        assert_eq!(result.stats.tier, "FieldIndex");
+        assert_eq!(result.stats.mode, QueryMode::Deterministic);
+
+        // Verify all returned scores are >= 30
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v >= 30, "score {} should be >= 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_via_field_index_range_strict_gt() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score > 30 (strict) — should exclude score=30
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Gt("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2); // scores 40, 50 only
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v > 30, "score {} should be > 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_via_field_index_range_and_bounds() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score >= 20 AND score <= 40
+        let filter = WhereClause::And(
+            Box::new(WhereClause::Gte("score".into(), Literal::Int(20))),
+            Box::new(WhereClause::Lte("score".into(), Literal::Int(40))),
+        );
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(filter),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 3); // scores 20, 30, 40
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v >= 20 && *v <= 40, "score {} should be in [20,40]", v),
+                _ => panic!("expected Int score"),
+            }
+        }
     }
 
     #[tokio::test]
