@@ -3,6 +3,7 @@ use std::path::Path;
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
 use crate::error::EngineError;
+use crate::location::Tier;
 use crate::types::{CollectionSchema, Entity, LogicalId};
 
 const META_PARTITION: &str = "_meta";
@@ -293,6 +294,102 @@ impl FjallStore {
         }
         count
     }
+
+    /// Get the Fjall partition name for a given collection and tier.
+    pub fn tier_partition_name(collection: &str, tier: Tier) -> String {
+        match tier {
+            Tier::Fjall | Tier::Ram => collection.to_string(),
+            Tier::NVMe => format!("warm.{collection}"),
+            Tier::Archive => format!("archive.{collection}"),
+        }
+    }
+
+    /// Read entity data from a specific tier's partition.
+    pub fn read_tiered(
+        &self,
+        collection: &str,
+        entity_id: &LogicalId,
+        tier: Tier,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        let part_name = Self::tier_partition_name(collection, tier);
+        let partition = self
+            .keyspace
+            .open_partition(&part_name, Default::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let key = format!("entity:{}", entity_id.as_str());
+        match partition.get(key.as_bytes()) {
+            Ok(Some(val)) => Ok(Some(val.to_vec())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(EngineError::Storage(e.to_string())),
+        }
+    }
+
+    /// Write entity data to a specific tier's partition.
+    pub fn write_tiered(
+        &self,
+        collection: &str,
+        entity_id: &LogicalId,
+        tier: Tier,
+        data: &[u8],
+    ) -> Result<(), EngineError> {
+        let part_name = Self::tier_partition_name(collection, tier);
+        let partition = self
+            .keyspace
+            .open_partition(&part_name, Default::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let key = format!("entity:{}", entity_id.as_str());
+        partition
+            .insert(key.as_bytes(), data)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        self.keyspace
+            .persist(fjall::PersistMode::SyncAll)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete entity from a specific tier's partition.
+    pub fn delete_from_tier(
+        &self,
+        collection: &str,
+        entity_id: &LogicalId,
+        tier: Tier,
+    ) -> Result<(), EngineError> {
+        let part_name = Self::tier_partition_name(collection, tier);
+        let partition = self
+            .keyspace
+            .open_partition(&part_name, Default::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let key = format!("entity:{}", entity_id.as_str());
+        partition
+            .remove(key.as_bytes())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        self.keyspace
+            .persist(fjall::PersistMode::SyncAll)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Count entities in a specific tier's partition for a collection.
+    pub fn tier_entity_count(
+        &self,
+        collection: &str,
+        tier: Tier,
+    ) -> Result<usize, EngineError> {
+        let part_name = Self::tier_partition_name(collection, tier);
+        let partition = self
+            .keyspace
+            .open_partition(&part_name, Default::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let prefix = b"entity:";
+        let count = partition.prefix(prefix).count();
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -414,5 +511,76 @@ mod tests {
                 Some(&Value::String("The Shard".into()))
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+    use crate::location::Tier;
+    use crate::types::LogicalId;
+
+    fn temp_store() -> (FjallStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStore::open(dir.path()).unwrap();
+        (store, dir)
+    }
+
+    #[test]
+    fn write_and_read_warm_tier() {
+        let (store, _dir) = temp_store();
+        let id = LogicalId::from_string("e1");
+        let data = b"int8 quantised data";
+
+        store.write_tiered("venues", &id, Tier::NVMe, data).unwrap();
+        let result = store.read_tiered("venues", &id, Tier::NVMe).unwrap();
+        assert_eq!(result.as_deref(), Some(data.as_slice()));
+    }
+
+    #[test]
+    fn write_and_read_archive_tier() {
+        let (store, _dir) = temp_store();
+        let id = LogicalId::from_string("e1");
+        let data = b"binary quantised data";
+
+        store.write_tiered("venues", &id, Tier::Archive, data).unwrap();
+        let result = store.read_tiered("venues", &id, Tier::Archive).unwrap();
+        assert_eq!(result.as_deref(), Some(data.as_slice()));
+    }
+
+    #[test]
+    fn read_nonexistent_returns_none() {
+        let (store, _dir) = temp_store();
+        let id = LogicalId::from_string("nope");
+        let result = store.read_tiered("venues", &id, Tier::NVMe).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn delete_from_tier() {
+        let (store, _dir) = temp_store();
+        let id = LogicalId::from_string("e1");
+        store.write_tiered("venues", &id, Tier::NVMe, b"data").unwrap();
+        store.delete_from_tier("venues", &id, Tier::NVMe).unwrap();
+        let result = store.read_tiered("venues", &id, Tier::NVMe).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tier_entity_count() {
+        let (store, _dir) = temp_store();
+        let id1 = LogicalId::from_string("e1");
+        let id2 = LogicalId::from_string("e2");
+        store.write_tiered("venues", &id1, Tier::NVMe, b"data1").unwrap();
+        store.write_tiered("venues", &id2, Tier::NVMe, b"data2").unwrap();
+        assert_eq!(store.tier_entity_count("venues", Tier::NVMe).unwrap(), 2);
+        assert_eq!(store.tier_entity_count("venues", Tier::Archive).unwrap(), 0);
+    }
+
+    #[test]
+    fn tier_partition_names() {
+        assert_eq!(FjallStore::tier_partition_name("venues", Tier::Fjall), "venues");
+        assert_eq!(FjallStore::tier_partition_name("venues", Tier::NVMe), "warm.venues");
+        assert_eq!(FjallStore::tier_partition_name("venues", Tier::Archive), "archive.venues");
     }
 }
