@@ -166,7 +166,7 @@ impl FjallStore {
             .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?;
 
         // Create partition for this edge type's edges
-        let partition_name = format!("edges:{}", edge_type.name);
+        let partition_name = format!("edges.{}", edge_type.name);
         self.keyspace
             .open_partition(&partition_name, PartitionCreateOptions::default())
             .map_err(|e| EngineError::Storage(e.to_string()))?;
@@ -203,7 +203,7 @@ impl FjallStore {
     // --- Edge methods ---
 
     pub fn insert_edge(&self, edge: &crate::edge::Edge) -> Result<(), EngineError> {
-        let partition_name = format!("edges:{}", edge.edge_type);
+        let partition_name = format!("edges.{}", edge.edge_type);
         let partition = self.keyspace
             .open_partition(&partition_name, PartitionCreateOptions::default())
             .map_err(|e| EngineError::Storage(e.to_string()))?;
@@ -218,7 +218,7 @@ impl FjallStore {
     }
 
     pub fn delete_edge(&self, edge_type: &str, from_id: &str, to_id: &str) -> Result<(), EngineError> {
-        let partition_name = format!("edges:{edge_type}");
+        let partition_name = format!("edges.{edge_type}");
         let partition = self.keyspace
             .open_partition(&partition_name, PartitionCreateOptions::default())
             .map_err(|e| EngineError::Storage(e.to_string()))?;
@@ -230,7 +230,7 @@ impl FjallStore {
     }
 
     pub fn scan_edges(&self, edge_type: &str) -> Result<Vec<crate::edge::Edge>, EngineError> {
-        let partition_name = format!("edges:{edge_type}");
+        let partition_name = format!("edges.{edge_type}");
         let partition = self.keyspace
             .open_partition(&partition_name, PartitionCreateOptions::default())
             .map_err(|e| EngineError::Storage(e.to_string()))?;

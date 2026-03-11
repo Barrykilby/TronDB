@@ -84,8 +84,37 @@ impl Executor {
                     self.location.register(key, desc);
                     replayed += 1;
                 }
+                RecordType::SchemaCreateEdgeType => {
+                    let edge_type: crate::edge::EdgeType = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    if !self.store.has_edge_type(&edge_type.name) {
+                        self.store.create_edge_type(&edge_type)?;
+                        replayed += 1;
+                    }
+                    self.edge_types.insert(edge_type.name.clone(), edge_type);
+                }
+                RecordType::EdgeWrite => {
+                    let edge: crate::edge::Edge = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    if self.store.has_edge_type(&edge.edge_type) {
+                        self.store.insert_edge(&edge)?;
+                        replayed += 1;
+                    }
+                }
+                RecordType::EdgeDelete => {
+                    #[derive(serde::Deserialize)]
+                    struct EdgeDeletePayload {
+                        edge_type: String,
+                        from_id: String,
+                        to_id: String,
+                    }
+                    let payload: EdgeDeletePayload = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    self.store.delete_edge(&payload.edge_type, &payload.from_id, &payload.to_id)?;
+                    replayed += 1;
+                }
                 _ => {
-                    // Other record types (ReprWrite, EdgeWrite, etc.) are future phases
+                    // Other record types (ReprWrite, etc.) are future phases
                 }
             }
         }

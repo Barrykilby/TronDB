@@ -86,6 +86,22 @@ impl Engine {
             }
         }
 
+        // Rebuild AdjacencyIndex from Fjall
+        let edge_type_list = executor.list_edge_types();
+        for et in &edge_type_list {
+            if let Ok(edges) = executor.scan_edges(&et.name) {
+                for edge in &edges {
+                    executor.adjacency().insert(
+                        &edge.from_id,
+                        &edge.edge_type,
+                        &edge.to_id,
+                        edge.confidence,
+                    );
+                }
+            }
+            executor.edge_types().insert(et.name.clone(), et.clone());
+        }
+
         // Spawn background snapshot task
         let snapshot_handle = if config.snapshot_interval_secs > 0 {
             let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
