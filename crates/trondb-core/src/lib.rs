@@ -96,7 +96,7 @@ impl Engine {
                         let sparse_key = format!("{}:{}", collection_name, repr.name);
                         executor.sparse_indexes()
                             .entry(sparse_key)
-                            .or_insert_with(crate::sparse_index::SparseIndex::new);
+                            .or_default();
                     }
                 }
                 // Instantiate FieldIndexes for declared indexes
@@ -864,6 +864,171 @@ mod tests {
             ).await.unwrap();
             assert!(!result.rows.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn create_collection_with_fields_and_indexes() {
+        let (engine, _dir) = test_engine().await;
+        engine.execute_tql("CREATE COLLECTION venues (
+            REPRESENTATION identity DIMENSIONS 3 METRIC COSINE,
+            FIELD city TEXT,
+            FIELD active BOOL,
+            INDEX idx_city ON (city)
+        );").await.unwrap();
+
+        engine.execute_tql("INSERT INTO venues (id, city, active) VALUES ('v1', 'London', true)
+            REPRESENTATION identity VECTOR [0.1, 0.2, 0.3];").await.unwrap();
+        engine.execute_tql("INSERT INTO venues (id, city, active) VALUES ('v2', 'Paris', true)
+            REPRESENTATION identity VECTOR [0.4, 0.5, 0.6];").await.unwrap();
+
+        let result = engine.execute_tql("FETCH * FROM venues WHERE city = 'London';").await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values.get("city"), Some(&Value::String("London".into())));
+    }
+
+    #[tokio::test]
+    async fn sparse_search_returns_ranked() {
+        let (engine, _dir) = test_engine().await;
+        engine.execute_tql("CREATE COLLECTION docs (
+            REPRESENTATION keywords METRIC INNER_PRODUCT SPARSE true
+        );").await.unwrap();
+
+        engine.execute_tql("INSERT INTO docs (id, title) VALUES ('d1', 'Rust')
+            REPRESENTATION keywords SPARSE [1:0.9, 2:0.1];").await.unwrap();
+        engine.execute_tql("INSERT INTO docs (id, title) VALUES ('d2', 'Python')
+            REPRESENTATION keywords SPARSE [1:0.1, 3:0.8];").await.unwrap();
+        engine.execute_tql("INSERT INTO docs (id, title) VALUES ('d3', 'Go')
+            REPRESENTATION keywords SPARSE [2:0.5, 3:0.5];").await.unwrap();
+
+        let result = engine.execute_tql("SEARCH docs NEAR SPARSE [1:1.0] LIMIT 2;").await.unwrap();
+        assert_eq!(result.rows.len(), 2);
+        // d1 should rank higher (weight 0.9 on dim 1)
+        assert_eq!(result.rows[0].values.get("id"), Some(&Value::String("d1".into())));
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_merges_dense_sparse() {
+        let (engine, _dir) = test_engine().await;
+        engine.execute_tql("CREATE COLLECTION docs (
+            REPRESENTATION dense DIMENSIONS 3 METRIC COSINE,
+            REPRESENTATION sparse METRIC INNER_PRODUCT SPARSE true
+        );").await.unwrap();
+
+        engine.execute_tql("INSERT INTO docs (id) VALUES ('d1')
+            REPRESENTATION dense VECTOR [1.0, 0.0, 0.0]
+            REPRESENTATION sparse SPARSE [1:0.9];").await.unwrap();
+        engine.execute_tql("INSERT INTO docs (id) VALUES ('d2')
+            REPRESENTATION dense VECTOR [0.0, 1.0, 0.0]
+            REPRESENTATION sparse SPARSE [1:0.1];").await.unwrap();
+
+        // Hybrid search: both dense and sparse signals point to d1
+        let result = engine.execute_tql(
+            "SEARCH docs NEAR VECTOR [1.0, 0.0, 0.0] NEAR SPARSE [1:1.0] LIMIT 5;"
+        ).await.unwrap();
+        assert!(!result.rows.is_empty());
+        // d1 should rank first (strong signal in both)
+        assert_eq!(result.rows[0].values.get("id"), Some(&Value::String("d1".into())));
+    }
+
+    #[tokio::test]
+    async fn scalar_prefilter_narrows_search() {
+        let (engine, _dir) = test_engine().await;
+        engine.execute_tql("CREATE COLLECTION venues (
+            REPRESENTATION identity DIMENSIONS 3 METRIC COSINE,
+            FIELD city TEXT,
+            INDEX idx_city ON (city)
+        );").await.unwrap();
+
+        engine.execute_tql("INSERT INTO venues (id, city) VALUES ('v1', 'London')
+            REPRESENTATION identity VECTOR [1.0, 0.0, 0.0];").await.unwrap();
+        engine.execute_tql("INSERT INTO venues (id, city) VALUES ('v2', 'Paris')
+            REPRESENTATION identity VECTOR [0.9, 0.1, 0.0];").await.unwrap();
+        engine.execute_tql("INSERT INTO venues (id, city) VALUES ('v3', 'London')
+            REPRESENTATION identity VECTOR [0.8, 0.2, 0.0];").await.unwrap();
+
+        // SEARCH with WHERE narrows to London only
+        let result = engine.execute_tql(
+            "SEARCH venues WHERE city = 'London' NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 10;"
+        ).await.unwrap();
+        // Should only return London entities
+        for row in &result.rows {
+            assert_eq!(row.values.get("city"), Some(&Value::String("London".into())));
+        }
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn error_duplicate_representation() {
+        let (engine, _dir) = test_engine().await;
+        let result = engine.execute_tql("CREATE COLLECTION test (
+            REPRESENTATION dup DIMENSIONS 3 METRIC COSINE,
+            REPRESENTATION dup DIMENSIONS 3 METRIC COSINE
+        );").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("duplicate representation"), "error should mention duplicate: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn error_duplicate_field() {
+        let (engine, _dir) = test_engine().await;
+        let result = engine.execute_tql("CREATE COLLECTION test (
+            REPRESENTATION r DIMENSIONS 3 METRIC COSINE,
+            FIELD status TEXT,
+            FIELD status TEXT
+        );").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("duplicate field"), "error should mention duplicate: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn error_duplicate_index() {
+        let (engine, _dir) = test_engine().await;
+        let result = engine.execute_tql("CREATE COLLECTION test (
+            REPRESENTATION r DIMENSIONS 3 METRIC COSINE,
+            FIELD status TEXT,
+            INDEX idx ON (status),
+            INDEX idx ON (status)
+        );").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("duplicate index"), "error should mention duplicate: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn error_sparse_vector_on_dense_only_collection() {
+        let (engine, _dir) = test_engine().await;
+        engine.execute_tql("CREATE COLLECTION venues (
+            REPRESENTATION identity DIMENSIONS 3 METRIC COSINE
+        );").await.unwrap();
+        engine.execute_tql("INSERT INTO venues (id) VALUES ('v1')
+            REPRESENTATION identity VECTOR [0.1, 0.2, 0.3];").await.unwrap();
+
+        // SEARCH with SPARSE on a collection that has no sparse representation
+        let result = engine.execute_tql("SEARCH venues NEAR SPARSE [1:1.0] LIMIT 5;").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("sparse"), "error should mention sparse: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn error_field_not_indexed() {
+        let (engine, _dir) = test_engine().await;
+        engine.execute_tql("CREATE COLLECTION venues (
+            REPRESENTATION identity DIMENSIONS 3 METRIC COSINE
+        );").await.unwrap();
+        engine.execute_tql("INSERT INTO venues (id, city) VALUES ('v1', 'London')
+            REPRESENTATION identity VECTOR [0.1, 0.2, 0.3];").await.unwrap();
+
+        // SEARCH WHERE on a field that has no index
+        let result = engine.execute_tql(
+            "SEARCH venues WHERE city = 'London' NEAR VECTOR [0.1, 0.2, 0.3] LIMIT 5;"
+        ).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not indexed") || err_msg.contains("FieldNotIndexed"),
+            "error should mention not indexed: {err_msg}");
     }
 
     #[tokio::test]

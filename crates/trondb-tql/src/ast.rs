@@ -30,16 +30,11 @@ pub struct RepresentationDecl {
     pub sparse: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum Metric {
+    #[default]
     Cosine,
     InnerProduct,
-}
-
-impl Default for Metric {
-    fn default() -> Self {
-        Metric::Cosine
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
