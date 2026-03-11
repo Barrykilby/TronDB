@@ -7,6 +7,7 @@ pub mod edge;
 pub mod field_index;
 pub mod index;
 pub mod location;
+pub mod sparse_index;
 pub mod types;
 
 use std::path::PathBuf;
