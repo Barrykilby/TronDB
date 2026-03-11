@@ -49,6 +49,7 @@ pub enum Plan {
     Demote(DemotePlan),
     Promote(PromotePlan),
     ExplainTiers(ExplainTiersPlan),
+    UpdateEntity(UpdateEntityPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +155,13 @@ pub struct PromotePlan {
 #[derive(Debug, Clone)]
 pub struct ExplainTiersPlan {
     pub collection: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateEntityPlan {
+    pub entity_id: String,
+    pub collection: String,
+    pub assignments: Vec<(String, trondb_tql::Literal)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +376,11 @@ pub fn plan(
         })),
         Statement::ExplainTiers(e) => Ok(Plan::ExplainTiers(ExplainTiersPlan {
             collection: e.collection.clone(),
+        })),
+        Statement::Update(s) => Ok(Plan::UpdateEntity(UpdateEntityPlan {
+            entity_id: s.entity_id.clone(),
+            collection: s.collection.clone(),
+            assignments: s.assignments.clone(),
         })),
     }
 }
@@ -648,6 +661,26 @@ mod tests {
                 assert_eq!(fp.strategy, FetchStrategy::FieldIndexRange("idx_score".into()));
             }
             _ => panic!("expected FetchPlan"),
+        }
+    }
+
+    #[test]
+    fn plan_update_entity() {
+        use trondb_tql::{UpdateStmt, Literal};
+
+        let stmt = Statement::Update(UpdateStmt {
+            entity_id: "v1".into(),
+            collection: "venues".into(),
+            assignments: vec![("name".into(), Literal::String("New".into()))],
+        });
+        let p = plan(&stmt, &empty_schemas()).unwrap();
+        match p {
+            Plan::UpdateEntity(up) => {
+                assert_eq!(up.entity_id, "v1");
+                assert_eq!(up.collection, "venues");
+                assert_eq!(up.assignments.len(), 1);
+            }
+            _ => panic!("expected UpdateEntityPlan"),
         }
     }
 

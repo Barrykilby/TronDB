@@ -1129,6 +1129,9 @@ impl Executor {
                     },
                 })
             }
+            Plan::UpdateEntity(_) => {
+                Err(EngineError::UnsupportedOperation("UPDATE execution not yet implemented".into()))
+            }
         }
     }
 
@@ -1575,6 +1578,12 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
         }
         Plan::ExplainTiers(_) => {
             props.push(("operation", "ExplainTiers".into()));
+        }
+        Plan::UpdateEntity(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "UPDATE".into()));
+            props.push(("collection", p.collection.clone()));
+            props.push(("tier", "Fjall".into()));
         }
     }
 
