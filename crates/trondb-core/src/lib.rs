@@ -765,6 +765,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sparse_index_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("data"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        // Phase 1: Create collection with sparse repr, insert entity
+        {
+            let engine = Engine::open(config.clone()).await.unwrap();
+            engine.execute_tql("CREATE COLLECTION docs (
+                REPRESENTATION sparse_title METRIC INNER_PRODUCT SPARSE true
+            );").await.unwrap();
+            engine.execute_tql("INSERT INTO docs (id, title) VALUES ('d1', 'Hello')
+                REPRESENTATION sparse_title SPARSE [1:0.8, 42:0.5];").await.unwrap();
+        }
+
+        // Phase 2: Reopen — sparse index should be rebuilt
+        {
+            let engine = Engine::open(config).await.unwrap();
+            let result = engine.execute_tql("SEARCH docs NEAR SPARSE [1:1.0] LIMIT 5;").await.unwrap();
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(
+                result.rows[0].values.get("id"),
+                Some(&Value::String("d1".into()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn field_index_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("data"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        {
+            let engine = Engine::open(config.clone()).await.unwrap();
+            engine.execute_tql("CREATE COLLECTION venues (
+                REPRESENTATION identity DIMENSIONS 3 METRIC COSINE,
+                FIELD city TEXT,
+                INDEX idx_city ON (city)
+            );").await.unwrap();
+            engine.execute_tql("INSERT INTO venues (id, city) VALUES ('v1', 'London')
+                REPRESENTATION identity VECTOR [0.1, 0.2, 0.3];").await.unwrap();
+            engine.execute_tql("INSERT INTO venues (id, city) VALUES ('v2', 'Paris')
+                REPRESENTATION identity VECTOR [0.4, 0.5, 0.6];").await.unwrap();
+        }
+
+        {
+            let engine = Engine::open(config).await.unwrap();
+            let result = engine.execute_tql("FETCH * FROM venues WHERE city = 'London';").await.unwrap();
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(
+                result.rows[0].values.get("id"),
+                Some(&Value::String("v1".into()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_works_after_restart() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("data"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        {
+            let engine = Engine::open(config.clone()).await.unwrap();
+            engine.execute_tql("CREATE COLLECTION docs (
+                REPRESENTATION dense DIMENSIONS 3 METRIC COSINE,
+                REPRESENTATION sparse METRIC INNER_PRODUCT SPARSE true
+            );").await.unwrap();
+            engine.execute_tql("INSERT INTO docs (id) VALUES ('d1')
+                REPRESENTATION dense VECTOR [0.1, 0.2, 0.3]
+                REPRESENTATION sparse SPARSE [1:0.8];").await.unwrap();
+        }
+
+        {
+            let engine = Engine::open(config).await.unwrap();
+            let result = engine.execute_tql(
+                "SEARCH docs NEAR VECTOR [0.1, 0.2, 0.3] NEAR SPARSE [1:1.0] LIMIT 5;"
+            ).await.unwrap();
+            assert!(!result.rows.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn location_table_snapshot_and_restore() {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("data");

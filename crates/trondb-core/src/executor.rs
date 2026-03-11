@@ -61,40 +61,16 @@ impl Executor {
         for record in records {
             match record.record_type {
                 RecordType::SchemaCreateColl => {
-                    // Try to deserialize as CollectionSchema first (new format)
-                    if let Ok(schema) = rmp_serde::from_slice::<CollectionSchema>(&record.payload) {
-                        if !self.store.has_collection(&schema.name) {
-                            self.store.create_collection_schema(&schema)?;
-                            self.schemas.insert(schema.name.clone(), schema);
-                            replayed += 1;
-                        }
-                    } else {
-                        // Legacy format — try old {name, dimensions} struct
-                        #[derive(serde::Deserialize)]
-                        struct LegacyPayload {
-                            name: String,
-                            dimensions: usize,
-                        }
-                        if let Ok(payload) = rmp_serde::from_slice::<LegacyPayload>(&record.payload) {
-                            if !self.store.has_collection(&payload.name) {
-                                let schema = CollectionSchema {
-                                    name: payload.name.clone(),
-                                    representations: vec![StoredRepresentation {
-                                        name: "default".into(),
-                                        model: None,
-                                        dimensions: Some(payload.dimensions),
-                                        metric: Metric::Cosine,
-                                        sparse: false,
-                                    }],
-                                    fields: vec![],
-                                    indexes: vec![],
-                                };
-                                self.store.create_collection_schema(&schema)?;
-                                self.schemas.insert(schema.name.clone(), schema);
-                                replayed += 1;
-                            }
-                        }
+                    let schema: CollectionSchema = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(
+                            format!("failed to deserialize CollectionSchema from WAL: {}. \
+                                     If upgrading from pre-Phase 5a, delete trondb_data/wal/ and restart.", e)
+                        ))?;
+                    if !self.store.has_collection(&schema.name) {
+                        self.store.create_collection_schema(&schema)?;
+                        replayed += 1;
                     }
+                    self.schemas.insert(schema.name.clone(), schema);
                 }
                 RecordType::EntityWrite => {
                     let entity: Entity = rmp_serde::from_slice(&record.payload)
