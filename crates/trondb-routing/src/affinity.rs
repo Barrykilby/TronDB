@@ -4,6 +4,8 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use trondb_wal::{RecordType, WalWriter};
 
+use trondb_core::error::EngineError;
+
 use crate::config::ColocationConfig;
 use crate::error::RouterError;
 use crate::node::{AffinityGroupId, EntityId, NodeId};
@@ -228,17 +230,23 @@ impl AffinityIndex {
         id: AffinityGroupId,
         wal: &WalWriter,
     ) -> Result<(), RouterError> {
-        self.create_group(id.clone())?;
+        // Pre-check: fail fast if group already exists (before WAL write)
+        if self.groups.contains_key(&id) {
+            return Err(RouterError::AffinityGroupAlreadyExists(id.as_str().to_owned()));
+        }
+        // WAL-first: serialize and commit before applying in-memory mutation
         let payload = rmp_serde::to_vec_named(&AffinityGroupCreatePayload {
             group_id: id.as_str().to_owned(),
         })
-        .unwrap();
+        .map_err(|e| RouterError::Engine(EngineError::Storage(e.to_string())))?;
         let tx = wal.next_tx_id();
         wal.append(RecordType::TxBegin, "affinity", tx, 1, vec![]);
         wal.append(RecordType::AffinityGroupCreate, "affinity", tx, 1, payload);
         wal.commit(tx)
             .await
             .map_err(|e| RouterError::Engine(e.into()))?;
+        // WAL committed — now apply in-memory
+        self.create_group(id)?;
         Ok(())
     }
 
@@ -249,18 +257,33 @@ impl AffinityIndex {
         max_size: usize,
         wal: &WalWriter,
     ) -> Result<(), RouterError> {
-        self.add_to_group(entity, group_id, max_size)?;
+        // Pre-check: validate group exists and is not full (before WAL write)
+        {
+            let group = self
+                .groups
+                .get(group_id)
+                .ok_or_else(|| RouterError::AffinityGroupNotFound(group_id.as_str().to_owned()))?;
+            if group.members.len() >= max_size {
+                return Err(RouterError::AffinityGroupFull(
+                    group_id.as_str().to_owned(),
+                    max_size,
+                ));
+            }
+        }
+        // WAL-first: serialize and commit before applying in-memory mutation
         let payload = rmp_serde::to_vec_named(&AffinityGroupMemberPayload {
             group_id: group_id.as_str().to_owned(),
             entity_id: entity.as_str().to_owned(),
         })
-        .unwrap();
+        .map_err(|e| RouterError::Engine(EngineError::Storage(e.to_string())))?;
         let tx = wal.next_tx_id();
         wal.append(RecordType::TxBegin, "affinity", tx, 1, vec![]);
         wal.append(RecordType::AffinityGroupMember, "affinity", tx, 1, payload);
         wal.commit(tx)
             .await
             .map_err(|e| RouterError::Engine(e.into()))?;
+        // WAL committed — now apply in-memory
+        self.add_to_group(entity, group_id, max_size)?;
         Ok(())
     }
 
@@ -270,19 +293,21 @@ impl AffinityIndex {
         wal: &WalWriter,
     ) -> Result<(), RouterError> {
         let group_id = self.group_for(entity);
-        self.remove_from_group(entity);
         if let Some(gid) = group_id {
+            // WAL-first: serialize and commit before applying in-memory mutation
             let payload = rmp_serde::to_vec_named(&AffinityGroupRemovePayload {
                 entity_id: entity.as_str().to_owned(),
                 group_id: gid.as_str().to_owned(),
             })
-            .unwrap();
+            .map_err(|e| RouterError::Engine(EngineError::Storage(e.to_string())))?;
             let tx = wal.next_tx_id();
             wal.append(RecordType::TxBegin, "affinity", tx, 1, vec![]);
             wal.append(RecordType::AffinityGroupRemove, "affinity", tx, 1, payload);
             wal.commit(tx)
                 .await
                 .map_err(|e| RouterError::Engine(e.into()))?;
+            // WAL committed — now apply in-memory
+            self.remove_from_group(entity);
         }
         Ok(())
     }

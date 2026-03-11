@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::sync::watch;
@@ -7,12 +9,13 @@ use tokio::task::JoinHandle;
 use trondb_core::planner::Plan;
 use trondb_core::result::QueryResult;
 use trondb_core::types::LogicalId;
+use trondb_wal::WalWriter;
 
 use crate::affinity::AffinityIndex;
 use crate::config::RouterConfig;
 use crate::error::RouterError;
 use crate::health::{compute_load_score, HealthCache, HealthSignal, NodeStatus};
-use crate::node::{EntityId, NodeHandle, NodeId, QueryVerb, RoutingStrategy};
+use crate::node::{AffinityGroupId, EntityId, NodeHandle, NodeId, QueryVerb, RoutingStrategy};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -159,6 +162,7 @@ pub struct SemanticRouter {
     affinity: Arc<AffinityIndex>,
     nodes: Arc<DashMap<NodeId, Arc<dyn NodeHandle>>>,
     config: RouterConfig,
+    wal: Option<Arc<WalWriter>>,
     shutdown_tx: watch::Sender<bool>,
     _poll_handle: JoinHandle<()>,
     last_decision: Arc<std::sync::Mutex<Option<RoutingDecision>>>,
@@ -168,6 +172,14 @@ impl SemanticRouter {
     pub fn new(
         nodes: Vec<Arc<dyn NodeHandle>>,
         config: RouterConfig,
+    ) -> Self {
+        Self::with_wal(nodes, config, None)
+    }
+
+    pub fn with_wal(
+        nodes: Vec<Arc<dyn NodeHandle>>,
+        config: RouterConfig,
+        wal: Option<Arc<WalWriter>>,
     ) -> Self {
         let health = Arc::new(HealthCache::new(
             config.health.push_interval_ms,
@@ -194,6 +206,7 @@ impl SemanticRouter {
             affinity,
             nodes: node_map,
             config,
+            wal,
             shutdown_tx,
             _poll_handle: poll_handle,
             last_decision: Arc::new(std::sync::Mutex::new(None)),
@@ -237,12 +250,67 @@ impl SemanticRouter {
             return Ok(result);
         }
 
+        // Intercept routing-layer operations before general dispatch.
+        match plan {
+            Plan::CreateAffinityGroup(ref p) => {
+                if let Some(ref wal) = self.wal {
+                    self.affinity
+                        .create_group_logged(AffinityGroupId::from_string(&p.name), wal)
+                        .await?;
+                } else {
+                    self.affinity
+                        .create_group(AffinityGroupId::from_string(&p.name))?;
+                }
+                return Ok(ok_result("Affinity group created"));
+            }
+            Plan::AlterEntityDropAffinity(ref p) => {
+                let entity_id = EntityId::from_string(&p.entity_id);
+                if let Some(ref wal) = self.wal {
+                    self.affinity
+                        .remove_from_group_logged(&entity_id, wal)
+                        .await?;
+                } else {
+                    self.affinity.remove_from_group(&entity_id);
+                }
+                return Ok(ok_result("Affinity dropped"));
+            }
+            _ => {}
+        }
+
         let annotated = self.annotate(plan);
         let decision = self.route(&annotated)?;
         *self.last_decision.lock().unwrap() = Some(decision.clone());
         let node = self.nodes.get(&decision.node)
             .ok_or(RouterError::NoCandidates)?;
         let result = node.execute(plan).await?;
+
+        // After successful INSERT, handle affinity group assignment.
+        if let Plan::Insert(ref p) = plan {
+            if let Some(ref group_name) = p.affinity_group {
+                let entity_id = find_entity_id_from_insert(p);
+                let group_id = AffinityGroupId::from_string(group_name);
+                let max_size = self.config.colocation.max_group_size;
+                if let Some(ref wal) = self.wal {
+                    self.affinity
+                        .add_to_group_logged(&entity_id, &group_id, max_size, wal)
+                        .await?;
+                } else {
+                    self.affinity
+                        .add_to_group(&entity_id, &group_id, max_size)?;
+                }
+            }
+            if let Some(ref collocate_ids) = p.collocate_with {
+                let entity_id = find_entity_id_from_insert(p);
+                let collocate_entities: Vec<EntityId> = collocate_ids
+                    .iter()
+                    .map(|id| EntityId::from_string(id))
+                    .collect();
+                let mut all = vec![entity_id];
+                all.extend(collocate_entities);
+                self.affinity.record_cooccurrence(&all);
+            }
+        }
+
         Ok(result)
     }
 
@@ -302,11 +370,49 @@ impl Drop for SemanticRouter {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build a simple success QueryResult with a status message.
+fn ok_result(msg: &str) -> QueryResult {
+    use trondb_core::result::{QueryMode, QueryStats, Row};
+    use trondb_core::types::Value;
+
+    QueryResult {
+        columns: vec!["status".into()],
+        rows: vec![Row {
+            values: HashMap::from([("status".into(), Value::String(msg.to_owned()))]),
+            score: None,
+        }],
+        stats: QueryStats {
+            elapsed: Duration::ZERO,
+            entities_scanned: 0,
+            mode: QueryMode::Deterministic,
+            tier: "Routing".into(),
+        },
+    }
+}
+
+/// Extract the entity ID from an INSERT plan by looking for an "id" field.
+fn find_entity_id_from_insert(p: &trondb_core::planner::InsertPlan) -> EntityId {
+    use trondb_tql::Literal;
+
+    for (i, field) in p.fields.iter().enumerate() {
+        if field.eq_ignore_ascii_case("id") {
+            if let Some(Literal::String(ref s)) = p.values.get(i) {
+                return LogicalId::from_string(s);
+            }
+        }
+    }
+    // Fallback: generate a deterministic ID from collection + first value
+    LogicalId::default()
+}
+
+// ---------------------------------------------------------------------------
 // Routing rows helper
 // ---------------------------------------------------------------------------
 
 fn routing_rows(decision: &RoutingDecision) -> Vec<trondb_core::result::Row> {
-    use std::collections::HashMap;
     use trondb_core::types::Value;
     use trondb_core::result::Row;
 
@@ -355,18 +461,48 @@ async fn health_poll_loop(
                     .collect();
 
                 for node in &snapshot {
-                    let mut signal = node.health_snapshot().await;
-                    signal.load_score = compute_load_score(&signal, &config);
-                    if signal.load_score >= config.load_shed_threshold {
-                        signal.status = NodeStatus::Overloaded;
-                    } else if signal.cpu_utilisation >= config.cpu_warn_threshold
-                        || signal.ram_pressure >= config.ram_warn_threshold
-                        || signal.queue_depth >= config.queue_depth_alert
-                        || signal.hnsw_p99_ms >= config.hnsw_baseline_p99_ms * 2.0
+                    let node_id = node.node_id().clone();
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        node.health_snapshot(),
+                    )
+                    .await
                     {
-                        signal.status = NodeStatus::Degraded;
+                        Ok(mut signal) => {
+                            signal.load_score = compute_load_score(&signal, &config);
+                            if signal.load_score >= config.load_shed_threshold {
+                                signal.status = NodeStatus::Overloaded;
+                            } else if signal.cpu_utilisation >= config.cpu_warn_threshold
+                                || signal.ram_pressure >= config.ram_warn_threshold
+                                || signal.queue_depth >= config.queue_depth_alert
+                                || signal.hnsw_p99_ms >= config.hnsw_baseline_p99_ms * 2.0
+                            {
+                                signal.status = NodeStatus::Degraded;
+                            }
+                            health.update(signal);
+                        }
+                        Err(_) => {
+                            // Node is unresponsive — mark as faulted
+                            let signal = HealthSignal {
+                                node_id,
+                                node_role: crate::node::NodeRole::HotNode,
+                                signal_ts: 0,
+                                sequence: 0,
+                                cpu_utilisation: 0.0,
+                                ram_pressure: 0.0,
+                                hot_entity_count: 0,
+                                hot_tier_capacity: 0,
+                                queue_depth: 0,
+                                queue_capacity: 0,
+                                hnsw_p99_ms: 0.0,
+                                hnsw_p50_ms: 0.0,
+                                replica_lag_ms: None,
+                                load_score: 1.0,
+                                status: NodeStatus::Faulted,
+                            };
+                            health.update(signal);
+                        }
                     }
-                    health.update(signal);
                 }
             }
             _ = shutdown.changed() => {

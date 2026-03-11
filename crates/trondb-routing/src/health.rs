@@ -114,12 +114,13 @@ impl HealthCache {
         }
     }
 
-    /// Returns all non-Faulted nodes sorted by load_score ascending.
+    /// Returns all non-Faulted, non-stale nodes sorted by load_score ascending.
     pub fn healthy_nodes(&self) -> Vec<(NodeId, f32)> {
         let mut nodes: Vec<(NodeId, f32)> = self
             .signals
             .iter()
             .filter(|entry| entry.signal.status != NodeStatus::Faulted)
+            .filter(|entry| entry.received_at.elapsed() <= self.stale_after)
             .map(|entry| (entry.key().clone(), entry.signal.load_score))
             .collect();
         nodes.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));

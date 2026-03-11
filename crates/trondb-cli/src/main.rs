@@ -40,9 +40,10 @@ async fn main() {
         }
     };
 
+    let wal = engine.wal_writer();
     let local_node = Arc::new(LocalNode::new(engine.clone(), NodeId::from_string("local")))
         as Arc<dyn trondb_routing::NodeHandle>;
-    let router = SemanticRouter::new(vec![local_node], RouterConfig::default());
+    let router = SemanticRouter::with_wal(vec![local_node], RouterConfig::default(), Some(wal));
 
     let mut rl = DefaultEditor::new().expect("failed to create editor");
     let mut buffer = String::new();

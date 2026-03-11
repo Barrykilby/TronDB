@@ -28,7 +28,7 @@ use trondb_wal::{RecordType, WalRecord, WalWriter};
 
 pub struct Executor {
     store: FjallStore,
-    wal: WalWriter,
+    wal: Arc<WalWriter>,
     location: Arc<LocationTable>,
     indexes: DashMap<String, HnswIndex>,
     sparse_indexes: DashMap<String, SparseIndex>,
@@ -42,7 +42,7 @@ impl Executor {
     pub fn new(store: FjallStore, wal: WalWriter, location: Arc<LocationTable>) -> Self {
         Self {
             store,
-            wal,
+            wal: Arc::new(wal),
             location,
             indexes: DashMap::new(),
             sparse_indexes: DashMap::new(),
@@ -901,6 +901,10 @@ impl Executor {
 
     pub fn wal_head_lsn(&self) -> u64 {
         self.wal.head_lsn()
+    }
+
+    pub fn wal_writer(&self) -> Arc<WalWriter> {
+        Arc::clone(&self.wal)
     }
 
     pub fn indexes(&self) -> &DashMap<String, HnswIndex> {

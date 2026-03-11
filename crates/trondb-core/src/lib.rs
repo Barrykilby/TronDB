@@ -239,6 +239,11 @@ impl Engine {
     pub fn wal_head_lsn(&self) -> u64 {
         self.executor.wal_head_lsn()
     }
+
+    /// Expose the WAL writer for the routing layer to log affinity mutations.
+    pub fn wal_writer(&self) -> std::sync::Arc<WalWriter> {
+        self.executor.wal_writer()
+    }
 }
 
 // ---------------------------------------------------------------------------
