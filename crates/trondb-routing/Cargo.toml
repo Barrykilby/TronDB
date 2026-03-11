@@ -1,0 +1,16 @@
+[package]
+name = "trondb-routing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+trondb-core = { path = "../trondb-core" }
+trondb-tql = { path = "../trondb-tql" }
+async-trait.workspace = true
+tokio.workspace = true
+dashmap.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
