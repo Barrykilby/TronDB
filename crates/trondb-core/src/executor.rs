@@ -472,6 +472,10 @@ impl Executor {
                             },
                         })
                     }
+                    FetchStrategy::FieldIndexRange(_index_name) => {
+                        // TODO(Task 3): implement range scan via FieldIndex
+                        unimplemented!("FieldIndexRange execution is implemented in Task 3")
+                    }
                     FetchStrategy::FullScan => {
                         // Read directly from Fjall — no WAL involvement
                         let entities = self.store.scan(&p.collection)?;
@@ -1228,6 +1232,10 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
                 }
                 FetchStrategy::FieldIndexLookup(index_name) => {
                     props.push(("strategy", format!("FieldIndexLookup ({})", index_name)));
+                    props.push(("tier", "FieldIndex".into()));
+                }
+                FetchStrategy::FieldIndexRange(index_name) => {
+                    props.push(("strategy", format!("FieldIndexRange ({})", index_name)));
                     props.push(("tier", "FieldIndex".into()));
                 }
             }
