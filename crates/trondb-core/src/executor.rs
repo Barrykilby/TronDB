@@ -373,6 +373,14 @@ impl Executor {
     pub fn indexes(&self) -> &DashMap<String, HnswIndex> {
         &self.indexes
     }
+
+    pub fn scan_collection(&self, name: &str) -> Result<Vec<crate::types::Entity>, EngineError> {
+        self.store.scan(name)
+    }
+
+    pub fn get_collection_dimensions(&self, name: &str) -> Result<usize, EngineError> {
+        self.store.get_dimensions(name)
+    }
 }
 
 // ---------------------------------------------------------------------------

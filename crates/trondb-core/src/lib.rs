@@ -67,6 +67,24 @@ impl Engine {
             eprintln!("WAL recovery: replayed {replayed} records");
         }
 
+        // Rebuild HNSW indexes from Fjall
+        for collection_name in executor.collections() {
+            if let Ok(entities) = executor.scan_collection(&collection_name) {
+                if let Ok(dims) = executor.get_collection_dimensions(&collection_name) {
+                    for entity in &entities {
+                        if !entity.representations.is_empty() {
+                            let index = executor.indexes()
+                                .entry(collection_name.clone())
+                                .or_insert_with(|| crate::index::HnswIndex::new(dims));
+                            for repr in &entity.representations {
+                                index.insert(&entity.id, &repr.vector);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Spawn background snapshot task
         let snapshot_handle = if config.snapshot_interval_secs > 0 {
             let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
