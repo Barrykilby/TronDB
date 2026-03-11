@@ -225,6 +225,61 @@ impl LocationTable {
     pub fn mutation_counter(&self) -> u64 {
         self.mutation_counter.load(Ordering::SeqCst)
     }
+
+    /// Snapshot the Location Table to bytes.
+    /// The caller provides the current WAL head LSN.
+    pub fn snapshot(&self, wal_head_lsn: u64) -> Result<Vec<u8>, EngineError> {
+        let entries: Vec<(ReprKey, LocationDescriptor)> = self
+            .descriptors
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect();
+
+        let body = rmp_serde::to_vec_named(&entries)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let count = entries.len() as u64;
+
+        let mut out = Vec::with_capacity(24 + body.len());
+        out.extend_from_slice(b"TRONLOC1");
+        out.extend_from_slice(&wal_head_lsn.to_be_bytes());
+        out.extend_from_slice(&count.to_be_bytes());
+        out.extend_from_slice(&body);
+
+        Ok(out)
+    }
+
+    /// Restore a LocationTable from snapshot bytes.
+    /// Returns (LocationTable, wal_head_lsn_at_snapshot).
+    pub fn restore(bytes: &[u8]) -> Result<(Self, u64), EngineError> {
+        if bytes.len() < 24 {
+            return Err(EngineError::Storage("snapshot too short".into()));
+        }
+        if &bytes[0..8] != b"TRONLOC1" {
+            return Err(EngineError::Storage("invalid snapshot magic".into()));
+        }
+
+        let wal_head_lsn = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let count = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+
+        let entries: Vec<(ReprKey, LocationDescriptor)> =
+            rmp_serde::from_slice(&bytes[24..])
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        if entries.len() != count as usize {
+            return Err(EngineError::Storage(format!(
+                "snapshot count mismatch: header says {count}, body has {}",
+                entries.len()
+            )));
+        }
+
+        let lt = Self::new();
+        for (key, desc) in entries {
+            lt.register(key, desc);
+        }
+
+        Ok((lt, wal_head_lsn))
+    }
 }
 
 #[cfg(test)]
@@ -419,5 +474,47 @@ mod tests {
         assert_eq!(Tier::Ram.as_str(), "Ram");
         assert_eq!(Tier::NVMe.as_str(), "NVMe");
         assert_eq!(Tier::Archive.as_str(), "Archive");
+    }
+
+    #[test]
+    fn snapshot_and_restore_round_trip() {
+        let lt = LocationTable::new();
+        lt.register(make_key("e1", 0), make_descriptor());
+        lt.register(make_key("e1", 1), make_descriptor());
+        lt.register(make_key("e2", 0), make_descriptor());
+
+        let bytes = lt.snapshot(42).unwrap();
+        let (restored, lsn) = LocationTable::restore(&bytes).unwrap();
+
+        assert_eq!(lsn, 42);
+        assert_eq!(restored.len(), 3);
+        assert!(restored.get(&make_key("e1", 0)).is_some());
+        assert!(restored.get(&make_key("e1", 1)).is_some());
+        assert!(restored.get(&make_key("e2", 0)).is_some());
+
+        // Secondary index should be rebuilt
+        let loc = restored.get_entity(&LogicalId::from_string("e1"));
+        assert_eq!(loc.representations.len(), 2);
+    }
+
+    #[test]
+    fn restore_rejects_bad_magic() {
+        let bytes = b"BADMAGIC00000000000000001234";
+        assert!(LocationTable::restore(bytes).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_truncated() {
+        let bytes = b"TRONLOC1";
+        assert!(LocationTable::restore(bytes).is_err());
+    }
+
+    #[test]
+    fn snapshot_empty_table() {
+        let lt = LocationTable::new();
+        let bytes = lt.snapshot(0).unwrap();
+        let (restored, lsn) = LocationTable::restore(&bytes).unwrap();
+        assert_eq!(lsn, 0);
+        assert_eq!(restored.len(), 0);
     }
 }
