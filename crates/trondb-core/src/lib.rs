@@ -37,6 +37,7 @@ pub struct EngineConfig {
 
 pub struct Engine {
     executor: Executor,
+    data_dir: PathBuf,
     _snapshot_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -80,17 +81,56 @@ impl Engine {
             executor.schemas().insert(schema.name.clone(), schema);
         }
 
+        // Try loading HNSW snapshots before full Fjall scan
+        let hnsw_snap_dir = config.data_dir.join("hnsw_snapshots");
+        let mut hnsw_snapshot_lsns: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+
         // Rebuild HNSW indexes and SparseIndexes from Fjall
         for collection_name in executor.collections() {
             if let Some(schema_ref) = executor.schemas().get(&collection_name) {
                 // Instantiate HNSW indexes for dense representations
+                // Try snapshot first, fall back to empty index
                 for repr in &schema_ref.representations {
                     if !repr.sparse {
                         if let Some(dims) = repr.dimensions {
                             let hnsw_key = format!("{}:{}", collection_name, repr.name);
-                            executor.indexes()
-                                .entry(hnsw_key)
-                                .or_insert_with(|| crate::index::HnswIndex::new(dims));
+                            if !executor.indexes().contains_key(&hnsw_key) {
+                                // Try loading from snapshot
+                                let mut loaded = false;
+                                if hnsw_snap_dir.exists() {
+                                    match hnsw_snapshot::load_snapshot(
+                                        &hnsw_snap_dir,
+                                        &collection_name,
+                                        &repr.name,
+                                    ) {
+                                        Ok(Some((index, meta))) => {
+                                            eprintln!(
+                                                "HNSW snapshot: restored {}:{} ({} entities, LSN {})",
+                                                collection_name, repr.name, meta.entity_count, meta.lsn
+                                            );
+                                            hnsw_snapshot_lsns.insert(hnsw_key.clone(), meta.lsn);
+                                            executor.indexes().insert(hnsw_key.clone(), index);
+                                            loaded = true;
+                                        }
+                                        Ok(None) => {
+                                            // No snapshot files — fall through to empty index
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "HNSW snapshot: failed to load {}:{}: {e} — rebuilding from scratch",
+                                                collection_name, repr.name
+                                            );
+                                        }
+                                    }
+                                }
+                                if !loaded {
+                                    executor.indexes().insert(
+                                        hnsw_key,
+                                        crate::index::HnswIndex::new(dims),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -154,6 +194,71 @@ impl Engine {
             }
         }
 
+        // Incremental WAL catch-up for snapshot-loaded HNSW indexes.
+        // For each snapshot-loaded index, replay EntityWrite/EntityDelete WAL
+        // records with LSN > snapshot LSN to bring the index up to date.
+        if !hnsw_snapshot_lsns.is_empty() {
+            for record in &records_to_replay {
+                match record.record_type {
+                    trondb_wal::RecordType::EntityWrite => {
+                        // Check if any snapshot-loaded index covers this collection
+                        let has_snapshot = hnsw_snapshot_lsns.keys().any(|k| {
+                            k.starts_with(&format!("{}:", record.collection))
+                        });
+                        if !has_snapshot {
+                            continue;
+                        }
+                        if let Ok(entity) = rmp_serde::from_slice::<types::Entity>(&record.payload) {
+                            for repr in &entity.representations {
+                                if let types::VectorData::Dense(ref vec_f32) = repr.vector {
+                                    let hnsw_key =
+                                        format!("{}:{}", record.collection, repr.name);
+                                    if let Some(&snap_lsn) = hnsw_snapshot_lsns.get(&hnsw_key)
+                                    {
+                                        if record.lsn > snap_lsn {
+                                            if let Some(index) =
+                                                executor.indexes().get(&hnsw_key)
+                                            {
+                                                index.insert(&entity.id, vec_f32);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    trondb_wal::RecordType::EntityDelete => {
+                        let has_snapshot = hnsw_snapshot_lsns.keys().any(|k| {
+                            k.starts_with(&format!("{}:", record.collection))
+                        });
+                        if !has_snapshot {
+                            continue;
+                        }
+                        #[derive(serde::Deserialize)]
+                        struct DeletePayload {
+                            entity_id: String,
+                            collection: String,
+                        }
+                        if let Ok(payload) =
+                            rmp_serde::from_slice::<DeletePayload>(&record.payload)
+                        {
+                            let entity_id = LogicalId::from_string(&payload.entity_id);
+                            for (key, snap_lsn) in &hnsw_snapshot_lsns {
+                                if key.starts_with(&format!("{}:", payload.collection))
+                                    && record.lsn > *snap_lsn
+                                {
+                                    if let Some(index) = executor.indexes().get(key) {
+                                        index.remove(&entity_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Rebuild AdjacencyIndex from Fjall
         let edge_type_list = executor.list_edge_types();
         for et in &edge_type_list {
@@ -202,6 +307,7 @@ impl Engine {
 
         Ok((Self {
             executor,
+            data_dir: config.data_dir.clone(),
             _snapshot_handle: snapshot_handle,
         }, unhandled_records))
     }
@@ -243,6 +349,28 @@ impl Engine {
 
     pub fn wal_head_lsn(&self) -> u64 {
         self.executor.wal_head_lsn()
+    }
+
+    /// Save all HNSW index snapshots to disk.
+    pub fn save_hnsw_snapshots(&self) -> Result<(), EngineError> {
+        let snap_dir = self.data_dir.join("hnsw_snapshots");
+        std::fs::create_dir_all(&snap_dir)
+            .map_err(|e| EngineError::Storage(format!("create snapshot dir: {e}")))?;
+
+        let lsn = self.executor.wal_head_lsn();
+
+        for entry in self.executor.indexes().iter() {
+            let key = entry.key();
+            // Key format: "collection:repr_name"
+            if let Some((collection, repr_name)) = key.split_once(':') {
+                if let Err(e) = hnsw_snapshot::save_snapshot(
+                    &snap_dir, collection, repr_name, entry.value(), lsn,
+                ) {
+                    eprintln!("[hnsw_snapshot] save failed for {key}: {e}");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Expose the WAL writer for the routing layer to log affinity mutations.
@@ -1261,5 +1389,46 @@ mod tests {
         let (engine, _) = Engine::open(config).await.unwrap();
         let result = engine.execute_tql("FETCH * FROM venues;").await.unwrap();
         assert_eq!(result.rows.len(), 0, "entity should not exist after WAL replay of delete");
+    }
+
+    #[tokio::test]
+    async fn hnsw_snapshot_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        // Insert entities and create snapshot
+        {
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
+            engine.execute_tql(
+                "CREATE COLLECTION venues (\
+                    REPRESENTATION default DIMENSIONS 3 METRIC COSINE\
+                );"
+            ).await.unwrap();
+            engine.execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'A') \
+                 REPRESENTATION default VECTOR [1.0, 0.0, 0.0];"
+            ).await.unwrap();
+            engine.execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v2', 'B') \
+                 REPRESENTATION default VECTOR [0.0, 1.0, 0.0];"
+            ).await.unwrap();
+
+            // Trigger manual snapshot
+            engine.save_hnsw_snapshots().unwrap();
+        }
+
+        // Reopen — should load from snapshot instead of full rebuild
+        let (engine, _) = Engine::open(config).await.unwrap();
+        let result = engine.execute_tql(
+            "SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 2;"
+        ).await.unwrap();
+        assert!(result.rows.len() >= 1, "SEARCH should find entities after snapshot restore");
     }
 }
