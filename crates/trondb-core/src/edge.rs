@@ -58,12 +58,14 @@ pub struct AdjEntry {
 
 pub struct AdjacencyIndex {
     forward: DashMap<(LogicalId, String), Vec<AdjEntry>>,
+    backward: DashMap<(LogicalId, String), Vec<LogicalId>>,
 }
 
 impl AdjacencyIndex {
     pub fn new() -> Self {
         Self {
             forward: DashMap::new(),
+            backward: DashMap::new(),
         }
     }
 
@@ -77,6 +79,13 @@ impl AdjacencyIndex {
             .entry(key)
             .or_default()
             .push(entry);
+
+        // Maintain backward index: (to_id, edge_type) → from_id
+        let bkey = (to_id.clone(), edge_type.to_string());
+        self.backward
+            .entry(bkey)
+            .or_default()
+            .push(from_id.clone());
     }
 
     pub fn remove(&self, from_id: &LogicalId, edge_type: &str, to_id: &LogicalId) {
@@ -88,6 +97,16 @@ impl AdjacencyIndex {
                 self.forward.remove(&key);
             }
         }
+
+        // Clean backward index
+        let bkey = (to_id.clone(), edge_type.to_string());
+        if let Some(mut sources) = self.backward.get_mut(&bkey) {
+            sources.retain(|id| id != from_id);
+            if sources.is_empty() {
+                drop(sources);
+                self.backward.remove(&bkey);
+            }
+        }
     }
 
     pub fn get(&self, from_id: &LogicalId, edge_type: &str) -> Vec<AdjEntry> {
@@ -96,6 +115,46 @@ impl AdjacencyIndex {
             .get(&key)
             .map(|v| v.clone())
             .unwrap_or_default()
+    }
+
+    /// Returns all source entity IDs that have an edge of `edge_type` pointing TO `to_id`.
+    pub fn get_backward(&self, to_id: &LogicalId, edge_type: &str) -> Vec<LogicalId> {
+        let key = (to_id.clone(), edge_type.to_string());
+        self.backward
+            .get(&key)
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns all edges involving `entity_id` as either source or target.
+    ///
+    /// Returns `(forward_edges, backward_edges)` where:
+    /// - `forward_edges`: `(edge_type, to_id)` pairs where `entity_id` is the source
+    /// - `backward_edges`: `(edge_type, from_id)` pairs where `entity_id` is the target
+    pub fn edges_involving(&self, entity_id: &LogicalId) -> (Vec<(String, LogicalId)>, Vec<(String, LogicalId)>) {
+        // Forward: all (edge_type, to_id) pairs where entity_id is the source
+        let mut forward_edges = Vec::new();
+        for entry in self.forward.iter() {
+            let (from_id, edge_type) = entry.key();
+            if from_id == entity_id {
+                for adj in entry.value() {
+                    forward_edges.push((edge_type.clone(), adj.to_id.clone()));
+                }
+            }
+        }
+
+        // Backward: all (edge_type, from_id) pairs where entity_id is the target
+        let mut backward_edges = Vec::new();
+        for entry in self.backward.iter() {
+            let (to_id, edge_type) = entry.key();
+            if to_id == entity_id {
+                for from_id in entry.value() {
+                    backward_edges.push((edge_type.clone(), from_id.clone()));
+                }
+            }
+        }
+
+        (forward_edges, backward_edges)
     }
 
     pub fn len(&self) -> usize {
@@ -179,5 +238,35 @@ mod tests {
         idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0);
         idx.insert(&make_id("v2"), "likes", &make_id("v1"), 0.5);
         assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn backward_index_populated_on_insert() {
+        let idx = AdjacencyIndex::new();
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
+        let backwards = idx.get_backward(&make_id("v2"), "knows");
+        assert_eq!(backwards.len(), 1);
+        assert_eq!(backwards[0], make_id("v1"));
+    }
+
+    #[test]
+    fn backward_index_remove() {
+        let idx = AdjacencyIndex::new();
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
+        idx.remove(&make_id("v1"), "knows", &make_id("v2"));
+        let backwards = idx.get_backward(&make_id("v2"), "knows");
+        assert!(backwards.is_empty());
+    }
+
+    #[test]
+    fn edges_involving_entity() {
+        let idx = AdjacencyIndex::new();
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0);
+        idx.insert(&make_id("v3"), "knows", &make_id("v1"), 1.0);
+        idx.insert(&make_id("v1"), "likes", &make_id("v4"), 1.0);
+
+        let (forward, backward) = idx.edges_involving(&make_id("v1"));
+        assert_eq!(forward.len(), 2); // knows->v2, likes->v4
+        assert_eq!(backward.len(), 1); // v3->knows->v1
     }
 }
