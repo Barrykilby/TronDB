@@ -163,6 +163,7 @@ impl Engine {
                         &edge.edge_type,
                         &edge.to_id,
                         edge.confidence,
+                        edge.created_at,
                     );
                 }
             }
@@ -300,6 +301,14 @@ impl Engine {
         if let Some(idx) = self.executor.indexes().get(collection) {
             idx.insert(entity_id, vector);
         }
+    }
+
+    pub fn list_edge_types(&self) -> Vec<crate::edge::EdgeType> {
+        self.executor.list_edge_types()
+    }
+
+    pub fn scan_edges(&self, edge_type: &str) -> Result<Vec<crate::edge::Edge>, EngineError> {
+        self.executor.scan_edges(edge_type)
     }
 }
 
@@ -776,14 +785,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn traverse_depth_gt_1_fails() {
+    async fn traverse_depth_gt_1_returns_multi_hop_results() {
         let (engine, _dir) = test_engine().await;
 
         create_simple_collection(&engine, "people", 3).await;
-        engine.execute_tql("CREATE EDGE knows FROM people TO people;").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('a', 'Alice');").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('b', 'Bob');").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('c', 'Carol');").await.unwrap();
 
-        let result = engine.execute_tql("TRAVERSE knows FROM 'p1' DEPTH 2;").await;
-        assert!(result.is_err());
+        engine.execute_tql("CREATE EDGE knows FROM people TO people;").await.unwrap();
+        engine.execute_tql("INSERT EDGE knows FROM 'a' TO 'b';").await.unwrap();
+        engine.execute_tql("INSERT EDGE knows FROM 'b' TO 'c';").await.unwrap();
+
+        // Depth 2 from 'a' should reach both b (hop 1) and c (hop 2)
+        let result = engine.execute_tql("TRAVERSE knows FROM 'a' DEPTH 2;").await.unwrap();
+        assert_eq!(result.rows.len(), 2);
     }
 
     #[tokio::test]

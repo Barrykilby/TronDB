@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
-use crate::edge::{AdjacencyIndex, Edge, EdgeType, DecayConfig};
+use crate::edge::{AdjacencyIndex, Edge, EdgeType};
 use crate::error::EngineError;
 use crate::field_index::FieldIndex;
 use crate::index::HnswIndex;
@@ -472,6 +472,50 @@ impl Executor {
                             },
                         })
                     }
+                    FetchStrategy::FieldIndexRange(index_name) => {
+                        let fidx_key = format!("{}:{}", p.collection, index_name);
+                        let fidx = self.field_indexes.get(&fidx_key)
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                format!("field index '{}' not found", index_name),
+                            ))?;
+
+                        // Compute range bounds from the filter
+                        let entity_ids = match &p.filter {
+                            Some(clause) => {
+                                let (lower, upper) = range_bounds_from_clause(clause);
+                                fidx.lookup_range(&lower, &upper)?
+                            }
+                            None => {
+                                return Err(EngineError::InvalidQuery(
+                                    "FieldIndexRange requires a range filter".into(),
+                                ));
+                            }
+                        };
+
+                        let mut rows = Vec::new();
+                        for eid in &entity_ids {
+                            if let Ok(entity) = self.store.get(&p.collection, eid) {
+                                // Post-filter: entity_matches handles strict Gt/Lt boundary exclusion
+                                if p.filter.as_ref().map(|c| entity_matches(&entity, c)).unwrap_or(true) {
+                                    rows.push(entity_to_row(&entity, &p.fields));
+                                }
+                            }
+                        }
+                        if let Some(limit) = p.limit {
+                            rows.truncate(limit);
+                        }
+                        let columns = build_columns(&rows, &p.fields);
+                        Ok(QueryResult {
+                            columns,
+                            rows,
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: entity_ids.len(),
+                                mode: QueryMode::Deterministic,
+                                tier: "FieldIndex".into(),
+                            },
+                        })
+                    }
                     FetchStrategy::FullScan => {
                         // Read directly from Fjall — no WAL involvement
                         let entities = self.store.scan(&p.collection)?;
@@ -668,11 +712,25 @@ impl Executor {
                     return Err(EngineError::CollectionNotFound(p.to_collection.clone()));
                 }
 
+                let decay_config = p.decay_config.as_ref().map(|dc| {
+                    crate::edge::DecayConfig {
+                        decay_fn: dc.decay_fn.as_ref().map(|f| match f {
+                            trondb_tql::DecayFnDecl::Exponential => crate::edge::DecayFn::Exponential,
+                            trondb_tql::DecayFnDecl::Linear => crate::edge::DecayFn::Linear,
+                            trondb_tql::DecayFnDecl::Step => crate::edge::DecayFn::Step,
+                        }),
+                        decay_rate: dc.decay_rate,
+                        floor: dc.floor,
+                        promote_threshold: dc.promote_threshold,
+                        prune_threshold: dc.prune_threshold,
+                    }
+                }).unwrap_or_default();
+
                 let edge_type = EdgeType {
                     name: p.name.clone(),
                     from_collection: p.from_collection.clone(),
                     to_collection: p.to_collection.clone(),
-                    decay_config: DecayConfig::default(),
+                    decay_config,
                 };
 
                 // WAL: TxBegin -> SchemaCreateEdgeType -> commit
@@ -726,12 +784,18 @@ impl Executor {
                     metadata.insert(key.clone(), literal_to_value(lit));
                 }
 
+                let now_millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
                 let edge = Edge {
                     from_id: from_id.clone(),
                     to_id: to_id.clone(),
                     edge_type: p.edge_type.clone(),
                     confidence: 1.0,
                     metadata,
+                    created_at: now_millis,
                 };
 
                 // WAL: TxBegin -> EdgeWrite -> commit
@@ -747,7 +811,7 @@ impl Executor {
                 self.store.persist()?;
 
                 // Apply to AdjacencyIndex
-                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0);
+                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0, now_millis);
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
@@ -824,25 +888,70 @@ impl Executor {
                 // Validate edge type exists
                 let edge_type = self.store.get_edge_type(&p.edge_type)?;
 
-                // Gate multi-hop
-                if p.depth > 1 {
-                    return Err(EngineError::UnsupportedOperation(
-                        "TRAVERSE DEPTH > 1 requires Phase 6+".into(),
-                    ));
-                }
+                // Cap depth at 10
+                let max_depth = p.depth.min(10);
 
                 let from_id = LogicalId::from_string(&p.from_id);
-                let entries = self.adjacency.get(&from_id, &p.edge_type);
+                let mut visited: HashSet<LogicalId> = HashSet::new();
+                visited.insert(from_id.clone());
 
+                let mut frontier = vec![from_id];
                 let mut rows = Vec::new();
-                for entry in &entries {
-                    if let Ok(entity) = self.store.get(&edge_type.to_collection, &entry.to_id) {
-                        rows.push(entity_to_row(&entity, &FieldList::All));
-                    }
-                }
+                let limit = p.limit.unwrap_or(usize::MAX);
 
-                if let Some(limit) = p.limit {
-                    rows.truncate(limit);
+                for _hop in 0..max_depth {
+                    if frontier.is_empty() || rows.len() >= limit {
+                        break;
+                    }
+
+                    let mut next_frontier = Vec::new();
+
+                    for node_id in &frontier {
+                        let entries = self.adjacency.get(node_id, &p.edge_type);
+                        for entry in &entries {
+                            if visited.contains(&entry.to_id) {
+                                continue;
+                            }
+
+                            // Apply edge decay if edge type has decay config
+                            let effective_conf = if entry.created_at > 0 {
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as u64;
+                                let elapsed = now_ms.saturating_sub(entry.created_at);
+                                crate::edge::effective_confidence(
+                                    entry.confidence,
+                                    elapsed,
+                                    &edge_type.decay_config,
+                                )
+                            } else {
+                                entry.confidence
+                            };
+
+                            // Skip edges below prune threshold
+                            if let Some(prune) = edge_type.decay_config.prune_threshold {
+                                if effective_conf < prune as f32 {
+                                    continue;
+                                }
+                            }
+
+                            visited.insert(entry.to_id.clone());
+
+                            if let Ok(entity) = self.store.get(&edge_type.to_collection, &entry.to_id) {
+                                rows.push(entity_to_row(&entity, &FieldList::All));
+                                if rows.len() >= limit {
+                                    break;
+                                }
+                            }
+                            next_frontier.push(entry.to_id.clone());
+                        }
+                        if rows.len() >= limit {
+                            break;
+                        }
+                    }
+
+                    frontier = next_frontier;
                 }
 
                 let scanned = rows.len();
@@ -893,6 +1002,101 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Routing".into(),
+                    },
+                })
+            }
+
+            Plan::DeleteEntity(p) => {
+                let entity_id = LogicalId::from_string(&p.entity_id);
+
+                // Step 1: Read entity before deletion (needed for index cleanup)
+                let entity = self.store.get(&p.collection, &entity_id)?;
+
+                // Step 2: WAL log
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+                #[derive(serde::Serialize)]
+                struct EntityDeletePayload<'a> {
+                    entity_id: &'a str,
+                    collection: &'a str,
+                }
+                let payload = rmp_serde::to_vec_named(&EntityDeletePayload {
+                    entity_id: &p.entity_id,
+                    collection: &p.collection,
+                })
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::EntityDelete, &p.collection, tx_id, 1, payload);
+                self.wal.commit(tx_id).await?;
+
+                // Step 3: HNSW tombstone — indexes keyed as "{collection}:{repr_name}"
+                let hnsw_prefix = format!("{}:", p.collection);
+                for entry in self.indexes.iter() {
+                    if entry.key().starts_with(&hnsw_prefix) {
+                        entry.value().remove(&entity_id);
+                    }
+                }
+
+                // Step 4: Field index removal
+                let schema = self.schemas.get(&p.collection);
+                if let Some(schema) = &schema {
+                    for idx_def in &schema.indexes {
+                        let fidx_key = format!("{}:{}", p.collection, idx_def.name);
+                        if let Some(fidx) = self.field_indexes.get(&fidx_key) {
+                            let values: Vec<Value> = idx_def.fields.iter()
+                                .map(|f| entity.metadata.get(f).cloned().unwrap_or(Value::Null))
+                                .collect();
+                            let _ = fidx.remove(&entity_id, &values);
+                        }
+                    }
+                }
+
+                // Step 5: Sparse index removal — keyed as "{collection}:{repr_name}"
+                for repr in &entity.representations {
+                    if let VectorData::Sparse(ref sv) = repr.vector {
+                        let sparse_key = format!("{}:{}", p.collection, repr.name);
+                        if let Some(sparse_idx) = self.sparse_indexes.get(&sparse_key) {
+                            sparse_idx.remove(&entity_id, sv);
+                        }
+                    }
+                }
+
+                // Step 6: Location table removal (remove_entity removes all reprs)
+                self.location.remove_entity(&entity_id);
+
+                // Step 7: Fjall delete
+                self.store.delete_entity(&p.collection, &entity_id)?;
+
+                // Step 8: Edge cleanup — find and delete all edges involving this entity
+                let (forward_edges, backward_edges) = self.adjacency.edges_involving(&entity_id);
+                for (edge_type, to_id) in &forward_edges {
+                    self.store.delete_edge(edge_type, entity_id.as_str(), to_id.as_str())?;
+                    self.adjacency.remove(&entity_id, edge_type, to_id);
+                }
+                for (edge_type, from_id) in &backward_edges {
+                    self.store.delete_edge(edge_type, from_id.as_str(), entity_id.as_str())?;
+                    self.adjacency.remove(from_id, edge_type, &entity_id);
+                }
+
+                // Step 9: Tiered storage cleanup
+                let _ = self.store.delete_from_tier(&p.collection, &entity_id, Tier::NVMe);
+                let _ = self.store.delete_from_tier(&p.collection, &entity_id, Tier::Archive);
+
+                self.store.persist()?;
+
+                Ok(QueryResult {
+                    columns: vec!["result".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([(
+                            "result".into(),
+                            Value::String(format!("Entity '{}' deleted from '{}'", p.entity_id, p.collection)),
+                        )]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 1,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
                     },
                 })
             }
@@ -1141,6 +1345,22 @@ fn entity_matches(entity: &Entity, clause: &WhereClause) -> bool {
                 .map(|v| value_lt(v, &threshold))
                 .unwrap_or(false)
         }
+        WhereClause::Gte(field, lit) => {
+            let threshold = literal_to_value(lit);
+            entity
+                .metadata
+                .get(field)
+                .map(|v| value_gt(v, &threshold) || v == &threshold)
+                .unwrap_or(false)
+        }
+        WhereClause::Lte(field, lit) => {
+            let threshold = literal_to_value(lit);
+            entity
+                .metadata
+                .get(field)
+                .map(|v| value_lt(v, &threshold) || v == &threshold)
+                .unwrap_or(false)
+        }
         WhereClause::And(a, b) => entity_matches(entity, a) && entity_matches(entity, b),
         WhereClause::Or(a, b) => entity_matches(entity, a) || entity_matches(entity, b),
     }
@@ -1197,6 +1417,48 @@ fn build_columns(rows: &[Row], fields: &FieldList) -> Vec<String> {
     }
 }
 
+/// Extract approximate lower/upper bound `Value` vectors from a `WhereClause`
+/// for use with `FieldIndex::lookup_range()`. The bounds are intentionally
+/// inclusive — strict Gt/Lt exclusion is handled by the post-filter
+/// (`entity_matches`).
+fn range_bounds_from_clause(clause: &WhereClause) -> (Vec<Value>, Vec<Value>) {
+    match clause {
+        WhereClause::Gt(_, lit) | WhereClause::Gte(_, lit) => {
+            (vec![literal_to_value(lit)], vec![Value::Int(i64::MAX)])
+        }
+        WhereClause::Lt(_, lit) | WhereClause::Lte(_, lit) => {
+            (vec![Value::Int(i64::MIN)], vec![literal_to_value(lit)])
+        }
+        WhereClause::And(left, right) => {
+            let (l_lower, l_upper) = range_bounds_from_clause(left);
+            let (r_lower, r_upper) = range_bounds_from_clause(right);
+            // Take the tighter (more restrictive) bound from each side
+            let lower = pick_tighter_lower(&l_lower, &r_lower);
+            let upper = pick_tighter_upper(&l_upper, &r_upper);
+            (lower, upper)
+        }
+        _ => (vec![Value::Int(i64::MIN)], vec![Value::Int(i64::MAX)]),
+    }
+}
+
+/// Pick the larger (more restrictive) lower bound.
+fn pick_tighter_lower(a: &[Value], b: &[Value]) -> Vec<Value> {
+    if a.len() == 1 && b.len() == 1 {
+        if value_gt(&a[0], &b[0]) { a.to_vec() } else { b.to_vec() }
+    } else {
+        a.to_vec()
+    }
+}
+
+/// Pick the smaller (more restrictive) upper bound.
+fn pick_tighter_upper(a: &[Value], b: &[Value]) -> Vec<Value> {
+    if a.len() == 1 && b.len() == 1 {
+        if value_lt(&a[0], &b[0]) { a.to_vec() } else { b.to_vec() }
+    } else {
+        a.to_vec()
+    }
+}
+
 fn explain_plan(plan: &Plan) -> Vec<Row> {
     let mut props: Vec<(&str, String)> = Vec::new();
 
@@ -1212,6 +1474,10 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
                 }
                 FetchStrategy::FieldIndexLookup(index_name) => {
                     props.push(("strategy", format!("FieldIndexLookup ({})", index_name)));
+                    props.push(("tier", "FieldIndex".into()));
+                }
+                FetchStrategy::FieldIndexRange(index_name) => {
+                    props.push(("strategy", format!("FieldIndexRange ({})", index_name)));
                     props.push(("tier", "FieldIndex".into()));
                 }
             }
@@ -1301,6 +1567,12 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("operation", "Promote".into()));
             props.push(("tier", "Routing".into()));
         }
+        Plan::DeleteEntity(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "DELETE".into()));
+            props.push(("collection", p.collection.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
         Plan::ExplainTiers(_) => {
             props.push(("operation", "ExplainTiers".into()));
         }
@@ -1327,7 +1599,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{CreateCollectionPlan, FetchPlan, FetchStrategy, InsertPlan, PreFilter, SearchPlan};
+    use crate::planner::{CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, FetchPlan, FetchStrategy, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -1827,6 +2099,371 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_via_field_index_range() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score >= 30 using FieldIndexRange strategy
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Gte("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 3); // scores 30, 40, 50
+        assert_eq!(result.stats.tier, "FieldIndex");
+        assert_eq!(result.stats.mode, QueryMode::Deterministic);
+
+        // Verify all returned scores are >= 30
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v >= 30, "score {} should be >= 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_via_field_index_range_strict_gt() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score > 30 (strict) — should exclude score=30
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Gt("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2); // scores 40, 50 only
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v > 30, "score {} should be > 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_via_field_index_range_and_bounds() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score >= 20 AND score <= 40
+        let filter = WhereClause::And(
+            Box::new(WhereClause::Gte("score".into(), Literal::Int(20))),
+            Box::new(WhereClause::Lte("score".into(), Literal::Int(40))),
+        );
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(filter),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 3); // scores 20, 30, 40
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v >= 20 && *v <= 40, "score {} should be in [20,40]", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_lt_excludes_boundary() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score < 30 (strict) — should exclude score=30
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Lt("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2); // scores 10, 20 only
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v < 30, "score {} should be < 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_lte_includes_boundary() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score <= 30 — should include score=30
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Lte("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 3); // scores 10, 20, 30
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v <= 30, "score {} should be <= 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_gte_lte_fullscan_fallback() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection WITHOUT an index on score
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "scores".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "scores".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score >= 30 via FullScan (no index available)
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "scores".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Gte("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 3); // scores 30, 40, 50
+        assert_eq!(result.stats.tier, "Fjall"); // FullScan reads from Fjall tier
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v >= 30, "score {} should be >= 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn search_sparse_returns_ranked() {
         let (exec, _dir) = setup_executor().await;
 
@@ -2131,6 +2768,645 @@ mod tests {
         assert_eq!(
             pf_row.values.get("value"),
             Some(&Value::String("ScalarPreFilter (idx_city)".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn traverse_multi_hop_depth_3() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Insert 4 people: a, b, c, d
+        for (id, name) in [("a", "Alice"), ("b", "Bob"), ("c", "Carol"), ("d", "Dave")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        // Create edge type: knows (people → people)
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+        }))
+        .await
+        .unwrap();
+
+        // Insert chain: a→b→c→d
+        for (from, to) in [("a", "b"), ("b", "c"), ("c", "d")] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "knows".into(),
+                from_id: from.into(),
+                to_id: to.into(),
+                metadata: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Traverse depth 3 from "a" — should reach b, c, d
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 3,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 3); // b, c, d
+    }
+
+    #[tokio::test]
+    async fn traverse_cycle_detection() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a "name" TEXT field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Insert 3 people: a, b, c
+        for (id, name) in [("a", "Alice"), ("b", "Bob"), ("c", "Carol")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        // Create edge type
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+        }))
+        .await
+        .unwrap();
+
+        // Build cycle: a→b→c→a
+        for (from, to) in [("a", "b"), ("b", "c"), ("c", "a")] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "knows".into(),
+                from_id: from.into(),
+                to_id: to.into(),
+                metadata: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Traverse from a with DEPTH 10 — should not loop, start node excluded
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 10,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2); // b, c — no infinite loop, a excluded
+    }
+
+    #[tokio::test]
+    async fn traverse_depth_1_single_hop() {
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Insert chain: a→b→c
+        for (id, name) in [("a", "Alice"), ("b", "Bob"), ("c", "Carol")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+        }))
+        .await
+        .unwrap();
+
+        for (from, to) in [("a", "b"), ("b", "c")] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "knows".into(),
+                from_id: from.into(),
+                to_id: to.into(),
+                metadata: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Traverse from a with DEPTH 1 — should return only b
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 1,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1); // b only
+    }
+
+    #[tokio::test]
+    async fn traverse_with_limit() {
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Fan-out: a→b, a→c, a→d
+        for (id, name) in [("a", "Alice"), ("b", "Bob"), ("c", "Carol"), ("d", "Dave")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+        }))
+        .await
+        .unwrap();
+
+        for to in ["b", "c", "d"] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                to_id: to.into(),
+                metadata: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+
+        // Traverse from a with DEPTH 1 LIMIT 2 — should return exactly 2
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 1,
+                limit: Some(2),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn traverse_depth_exceeds_graph() {
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Only a→b, no further edges
+        for (id, name) in [("a", "Alice"), ("b", "Bob")] {
+            insert_entity(
+                &exec,
+                "people",
+                id,
+                vec![("name", Literal::String(name.into()))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "a".into(),
+            to_id: "b".into(),
+            metadata: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Traverse from a with DEPTH 10 — should return just b, no error
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "a".into(),
+                depth: 10,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1); // just b
+    }
+
+    #[tokio::test]
+    async fn delete_entity_cascading() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert two entities
+        insert_entity(
+            &exec,
+            "venues",
+            "v1",
+            vec![("name", Literal::String("Venue A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        )
+        .await;
+        insert_entity(
+            &exec,
+            "venues",
+            "v2",
+            vec![("name", Literal::String("Venue B".into()))],
+            Some(vec![0.0, 1.0, 0.0]),
+        )
+        .await;
+
+        // Verify both exist
+        let fetch = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: None,
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(fetch.rows.len(), 2);
+
+        // Delete v1
+        let result = exec
+            .execute(&Plan::DeleteEntity(DeleteEntityPlan {
+                entity_id: "v1".into(),
+                collection: "venues".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        match &result.rows[0].values["result"] {
+            Value::String(s) => assert!(s.contains("deleted"), "expected 'deleted' in: {s}"),
+            other => panic!("expected Value::String, got: {other:?}"),
+        }
+
+        // Verify only v2 remains
+        let fetch = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: None,
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(fetch.rows.len(), 1);
+        assert_eq!(
+            fetch.rows[0].values["id"],
+            Value::String("v2".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_entity_removes_edges() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "people", 3).await;
+
+        insert_entity(&exec, "people", "p1", vec![], Some(vec![1.0, 0.0, 0.0])).await;
+        insert_entity(&exec, "people", "p2", vec![], Some(vec![0.0, 1.0, 0.0])).await;
+        insert_entity(&exec, "people", "p3", vec![], Some(vec![0.0, 0.0, 1.0])).await;
+
+        // Create edge type and edges: p1 -> p2, p3 -> p1
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "p1".into(),
+            to_id: "p2".into(),
+            metadata: vec![],
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "p3".into(),
+            to_id: "p1".into(),
+            metadata: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Delete p1 — should cascade-remove both edges
+        exec.execute(&Plan::DeleteEntity(DeleteEntityPlan {
+            entity_id: "p1".into(),
+            collection: "people".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Traverse from p3 should find no outgoing edges (p3 -> p1 was removed)
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "knows".into(),
+                from_id: "p3".into(),
+                depth: 1,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_entity_errors() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        let result = exec
+            .execute(&Plan::DeleteEntity(DeleteEntityPlan {
+                entity_id: "nonexistent".into(),
+                collection: "venues".into(),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_entity_removes_from_hnsw() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert two entities with dense vectors
+        insert_entity(
+            &exec,
+            "venues",
+            "v1",
+            vec![("name", Literal::String("Alpha".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        )
+        .await;
+        insert_entity(
+            &exec,
+            "venues",
+            "v2",
+            vec![("name", Literal::String("Beta".into()))],
+            Some(vec![0.9, 0.1, 0.0]),
+        )
+        .await;
+
+        // SEARCH should return both (query near v1)
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: Some(vec![1.0, 0.0, 0.0]),
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::Hnsw,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        // Delete v1
+        exec.execute(&Plan::DeleteEntity(DeleteEntityPlan {
+            entity_id: "v1".into(),
+            collection: "venues".into(),
+        }))
+        .await
+        .unwrap();
+
+        // SEARCH should now return only v2
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: Some(vec![1.0, 0.0, 0.0]),
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::Hnsw,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v2".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_entity_removes_from_field_index() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection_with_field_index(&exec, "venues", 3).await;
+
+        // Insert two entities with city field
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![
+                Literal::String("v1".into()),
+                Literal::String("London".into()),
+            ],
+            vectors: vec![(
+                "default".to_string(),
+                VectorLiteral::Dense(vec![1.0, 0.0, 0.0]),
+            )],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "city".into()],
+            values: vec![
+                Literal::String("v2".into()),
+                Literal::String("London".into()),
+            ],
+            vectors: vec![(
+                "default".to_string(),
+                VectorLiteral::Dense(vec![0.0, 1.0, 0.0]),
+            )],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+
+        // FETCH via field index should find both London entities
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::Eq(
+                    "city".into(),
+                    Literal::String("London".into()),
+                )),
+                limit: None,
+                strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        // Delete v1
+        exec.execute(&Plan::DeleteEntity(DeleteEntityPlan {
+            entity_id: "v1".into(),
+            collection: "venues".into(),
+        }))
+        .await
+        .unwrap();
+
+        // FETCH via field index should now find only v2
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::Eq(
+                    "city".into(),
+                    Literal::String("London".into()),
+                )),
+                limit: None,
+                strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v2".into()))
         );
     }
 }

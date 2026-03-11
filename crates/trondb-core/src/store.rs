@@ -275,6 +275,24 @@ impl FjallStore {
         Ok(edges)
     }
 
+    pub fn delete_entity(&self, collection: &str, id: &LogicalId) -> Result<(), EngineError> {
+        if !self.has_collection(collection) {
+            return Err(EngineError::CollectionNotFound(collection.to_owned()));
+        }
+
+        let partition = self
+            .keyspace
+            .open_partition(collection, PartitionCreateOptions::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let key = format!("{ENTITY_PREFIX}{id}");
+        partition
+            .remove(&key)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
     pub fn persist(&self) -> Result<(), EngineError> {
         self.keyspace
             .persist(PersistMode::SyncAll)
@@ -483,6 +501,23 @@ mod tests {
         let retrieved = store.get_collection_schema("docs").unwrap();
         assert_eq!(retrieved.name, "docs");
         assert_eq!(retrieved.representations[0].dimensions, Some(1408));
+    }
+
+    #[test]
+    fn delete_entity_removes_from_fjall() {
+        let (store, _dir) = open_store();
+        let schema = make_schema("venues", 3);
+        store.create_collection_schema(&schema).unwrap();
+
+        let entity = Entity::new(LogicalId::from_string("e1"))
+            .with_metadata("name", Value::String("Test".into()));
+        store.insert("venues", entity).unwrap();
+        store.persist().unwrap();
+
+        store.delete_entity("venues", &LogicalId::from_string("e1")).unwrap();
+        store.persist().unwrap();
+
+        assert!(store.get("venues", &LogicalId::from_string("e1")).is_err());
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub enum Statement {
     Explain(Box<Statement>),
     CreateEdgeType(CreateEdgeTypeStmt),
     InsertEdge(InsertEdgeStmt),
+    Delete(DeleteStmt),
     DeleteEdge(DeleteEdgeStmt),
     Traverse(TraverseStmt),
     CreateAffinityGroup(CreateAffinityGroupStmt),
@@ -119,6 +120,8 @@ pub enum WhereClause {
     Eq(String, Literal),
     Gt(String, Literal),
     Lt(String, Literal),
+    Gte(String, Literal),
+    Lte(String, Literal),
     And(Box<WhereClause>, Box<WhereClause>),
     Or(Box<WhereClause>, Box<WhereClause>),
 }
@@ -132,13 +135,32 @@ pub enum Literal {
     Null,
 }
 
-// --- Edge types (unchanged from Phase 5) ---
+// --- Decay declarations (parser-side, no core dependency) ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecayFnDecl {
+    Exponential,
+    Linear,
+    Step,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecayConfigDecl {
+    pub decay_fn: Option<DecayFnDecl>,
+    pub decay_rate: Option<f64>,
+    pub floor: Option<f64>,
+    pub promote_threshold: Option<f64>,
+    pub prune_threshold: Option<f64>,
+}
+
+// --- Edge types ---
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateEdgeTypeStmt {
     pub name: String,
     pub from_collection: String,
     pub to_collection: String,
+    pub decay_config: Option<DecayConfigDecl>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +169,12 @@ pub struct InsertEdgeStmt {
     pub from_id: String,
     pub to_id: String,
     pub metadata: Vec<(String, Literal)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStmt {
+    pub entity_id: String,
+    pub collection: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

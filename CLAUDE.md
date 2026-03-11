@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 7a: Tiered Storage + Vector Quantisation.
+Inference-first storage engine. Phase 7b: Graph Depth, Entity Lifecycle, Range Queries, Edge Decay.
 
 ## Project Structure
 
@@ -54,13 +54,20 @@ Inference-first storage engine. Phase 7a: Tiered Storage + Vector Quantisation.
   - Edge types declared via CREATE EDGE, stored in Fjall
   - Edges stored in Fjall per-type partitions (edges.{type})
   - AdjacencyIndex (DashMap) in RAM for fast TRAVERSE, rebuilt from Fjall on startup
+  - AdjacencyIndex backward index for efficient reverse edge lookup
+  - Edge created_at timestamp (u64 millis) for decay computation
   - Structural edges have confidence=1.0, no decay
-  - TRAVERSE returns connected entities (single-hop, DEPTH > 1 gated)
-  - DecayConfig fields defined but not driven until Phase 6
+  - TRAVERSE: BFS multi-hop (depth cap 10), cycle detection via HashSet, forward-only
+  - Edge confidence decay: lazy computation on TRAVERSE, exponential/linear/step functions
+  - DecaySweeper background task: periodic edge pruning (60s interval)
+  - CREATE EDGE DECAY syntax: EXPONENTIAL/LINEAR/STEP with RATE/FLOOR/PRUNE
+  - Entity deletion: cascading 9-step cleanup (WAL, HNSW, field index, sparse index, location table, Fjall, edges, tiered storage)
+  - DELETE 'id' FROM collection syntax for entity removal
 - Field Index: Fjall-backed sortable byte encoding, compound/partial indexes
   - One Fjall partition per declared index (fidx.{collection}.{index_name})
   - Sortable encoding: Text=UTF-8, Int=sign-bit-flipped BE, Float=IEEE754 manipulated, Bool=0x00/0x01
   - Compound keys: null-byte separated, prefix scan on leading fields
+  - Range queries: Gt/Lt/Gte/Lte → FieldIndexRange strategy, uses lookup_range()
 - Sparse Vector Index: RAM-resident inverted index (DashMap), SPLADE-style sparse vectors
   - SparseIndex rebuilt from Fjall on startup
   - Inner product scoring, min_weight=0.001 filter

@@ -88,6 +88,19 @@ impl Parser {
         }
     }
 
+    fn expect_float_or_int(&mut self) -> Result<f64, ParseError> {
+        match self.advance() {
+            Some((Token::FloatLit(f), _)) => Ok(f),
+            Some((Token::IntLit(n), _)) => Ok(n as f64),
+            Some((tok, pos)) => Err(ParseError::UnexpectedToken {
+                pos,
+                expected: "number".to_string(),
+                got: format!("{tok:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEof("expected number".to_string())),
+        }
+    }
+
     fn expect_string_lit(&mut self) -> Result<String, ParseError> {
         match self.advance() {
             Some((Token::StringLit(s), _)) => Ok(s),
@@ -313,11 +326,69 @@ impl Parser {
         let from_collection = self.expect_ident()?;
         self.expect(&Token::To)?;
         let to_collection = self.expect_ident()?;
+
+        // Optional DECAY clause
+        let decay_config = if self.peek() == Some(&Token::Decay) {
+            self.advance(); // DECAY
+
+            let decay_fn = match self.advance() {
+                Some((Token::Exponential, _)) => DecayFnDecl::Exponential,
+                Some((Token::Linear, _)) => DecayFnDecl::Linear,
+                Some((Token::Step, _)) => DecayFnDecl::Step,
+                Some((tok, pos)) => {
+                    return Err(ParseError::UnexpectedToken {
+                        pos,
+                        expected: "EXPONENTIAL, LINEAR, or STEP".to_string(),
+                        got: format!("{tok:?}"),
+                    });
+                }
+                None => {
+                    return Err(ParseError::UnexpectedEof(
+                        "expected decay function (EXPONENTIAL, LINEAR, or STEP)".to_string(),
+                    ));
+                }
+            };
+
+            let mut rate = None;
+            let mut floor = None;
+            let mut prune = None;
+
+            // Parse optional RATE, FLOOR, PRUNE in any order
+            loop {
+                match self.peek() {
+                    Some(Token::Rate) => {
+                        self.advance();
+                        rate = Some(self.expect_float_or_int()?);
+                    }
+                    Some(Token::TokenFloor) => {
+                        self.advance();
+                        floor = Some(self.expect_float_or_int()?);
+                    }
+                    Some(Token::Prune) => {
+                        self.advance();
+                        prune = Some(self.expect_float_or_int()?);
+                    }
+                    _ => break,
+                }
+            }
+
+            Some(DecayConfigDecl {
+                decay_fn: Some(decay_fn),
+                decay_rate: rate,
+                floor,
+                promote_threshold: None,
+                prune_threshold: prune,
+            })
+        } else {
+            None
+        };
+
         self.expect(&Token::Semicolon)?;
         Ok(Statement::CreateEdgeType(CreateEdgeTypeStmt {
             name,
             from_collection,
             to_collection,
+            decay_config,
         }))
     }
 
@@ -455,7 +526,15 @@ impl Parser {
 
     fn parse_delete(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // DELETE
-        self.expect(&Token::Edge)?;
+        if self.peek() == Some(&Token::Edge) {
+            self.parse_delete_edge()
+        } else {
+            self.parse_delete_entity()
+        }
+    }
+
+    fn parse_delete_edge(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // EDGE
         let edge_type = self.expect_ident()?;
         self.expect(&Token::From)?;
         let from_id = self.expect_string_lit()?;
@@ -466,6 +545,17 @@ impl Parser {
             edge_type,
             from_id,
             to_id,
+        }))
+    }
+
+    fn parse_delete_entity(&mut self) -> Result<Statement, ParseError> {
+        let entity_id = self.expect_string_lit()?;
+        self.expect(&Token::From)?;
+        let collection = self.expect_ident()?;
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::Delete(DeleteStmt {
+            entity_id,
+            collection,
         }))
     }
 
@@ -736,9 +826,11 @@ impl Parser {
             Some((Token::Eq, _)) => Ok(WhereClause::Eq(field, self.parse_literal()?)),
             Some((Token::Gt, _)) => Ok(WhereClause::Gt(field, self.parse_literal()?)),
             Some((Token::Lt, _)) => Ok(WhereClause::Lt(field, self.parse_literal()?)),
+            Some((Token::Gte, _)) => Ok(WhereClause::Gte(field, self.parse_literal()?)),
+            Some((Token::Lte, _)) => Ok(WhereClause::Lte(field, self.parse_literal()?)),
             Some((tok, pos)) => Err(ParseError::UnexpectedToken {
                 pos,
-                expected: "comparison operator (=, >, <)".to_string(),
+                expected: "comparison operator (=, >, <, >=, <=)".to_string(),
                 got: format!("{tok:?}"),
             }),
             None => Err(ParseError::UnexpectedEof(
@@ -1056,6 +1148,7 @@ mod tests {
                 name: "knows".to_string(),
                 from_collection: "people".to_string(),
                 to_collection: "people".to_string(),
+                decay_config: None,
             })
         );
     }
@@ -1092,6 +1185,18 @@ mod tests {
                 to_id: "v2".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn parse_delete_entity() {
+        let stmt = parse("DELETE 'e1' FROM venues;").unwrap();
+        match stmt {
+            Statement::Delete(d) => {
+                assert_eq!(d.entity_id, "e1");
+                assert_eq!(d.collection, "venues");
+            }
+            _ => panic!("expected Delete"),
+        }
     }
 
     #[test]
@@ -1210,6 +1315,105 @@ mod tests {
                 assert_eq!(e.collection, "venues");
             }
             _ => panic!("expected ExplainTiers"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_gte_filter() {
+        let stmt = parse("FETCH * FROM venues WHERE score >= 80;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.filter, Some(WhereClause::Gte("score".into(), Literal::Int(80))));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_lte_filter() {
+        let stmt = parse("FETCH * FROM venues WHERE score <= 20;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.filter, Some(WhereClause::Lte("score".into(), Literal::Int(20))));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_range_and() {
+        let stmt = parse("FETCH * FROM venues WHERE score >= 10 AND score <= 90;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => match f.filter {
+                Some(WhereClause::And(left, right)) => {
+                    assert!(matches!(*left, WhereClause::Gte(..)));
+                    assert!(matches!(*right, WhereClause::Lte(..)));
+                }
+                _ => panic!("expected And(Gte, Lte)"),
+            },
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_create_edge_with_decay() {
+        let stmt = parse(
+            "CREATE EDGE knows FROM people TO people DECAY EXPONENTIAL RATE 0.001 FLOOR 0.1 PRUNE 0.05;"
+        ).unwrap();
+        match stmt {
+            Statement::CreateEdgeType(s) => {
+                assert_eq!(s.name, "knows");
+                let dc = s.decay_config.unwrap();
+                assert!(matches!(dc.decay_fn, Some(DecayFnDecl::Exponential)));
+                assert!((dc.decay_rate.unwrap() - 0.001).abs() < 1e-6);
+                assert!((dc.floor.unwrap() - 0.1).abs() < 1e-6);
+                assert!((dc.prune_threshold.unwrap() - 0.05).abs() < 1e-6);
+            }
+            _ => panic!("expected CreateEdgeType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_edge_without_decay() {
+        let stmt = parse("CREATE EDGE likes FROM people TO people;").unwrap();
+        match stmt {
+            Statement::CreateEdgeType(s) => {
+                assert!(s.decay_config.is_none());
+            }
+            _ => panic!("expected CreateEdgeType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_edge_decay_linear() {
+        let stmt = parse(
+            "CREATE EDGE knows FROM people TO people DECAY LINEAR RATE 0.01 FLOOR 0.2;"
+        ).unwrap();
+        match stmt {
+            Statement::CreateEdgeType(s) => {
+                let dc = s.decay_config.unwrap();
+                assert!(matches!(dc.decay_fn, Some(DecayFnDecl::Linear)));
+                assert!((dc.decay_rate.unwrap() - 0.01).abs() < 1e-6);
+                assert!((dc.floor.unwrap() - 0.2).abs() < 1e-6);
+                assert!(dc.prune_threshold.is_none());
+            }
+            _ => panic!("expected CreateEdgeType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_edge_decay_step() {
+        let stmt = parse(
+            "CREATE EDGE knows FROM people TO people DECAY STEP RATE 3600;"
+        ).unwrap();
+        match stmt {
+            Statement::CreateEdgeType(s) => {
+                let dc = s.decay_config.unwrap();
+                assert!(matches!(dc.decay_fn, Some(DecayFnDecl::Step)));
+                assert!((dc.decay_rate.unwrap() - 3600.0).abs() < 1e-6);
+                assert!(dc.floor.is_none());
+            }
+            _ => panic!("expected CreateEdgeType"),
         }
     }
 }

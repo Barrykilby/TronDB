@@ -10,6 +10,7 @@ use trondb_routing::config::TierConfig;
 use trondb_routing::migrator::TierMigrator;
 use trondb_routing::node::{LocalNode, NodeId};
 use trondb_routing::router::SemanticRouter;
+use trondb_routing::sweeper::DecaySweeper;
 use trondb_routing::RouterConfig;
 use trondb_wal::WalConfig;
 
@@ -56,6 +57,9 @@ async fn main() {
         router.affinity_index().clone(),
     ));
     router.set_migrator(migrator);
+
+    let sweeper = Arc::new(DecaySweeper::new(Arc::clone(&engine), 60));
+    let _sweeper_handle = Arc::clone(&sweeper).spawn();
 
     let mut rl = DefaultEditor::new().expect("failed to create editor");
     let mut buffer = String::new();

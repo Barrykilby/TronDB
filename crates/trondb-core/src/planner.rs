@@ -19,6 +19,7 @@ pub enum SearchStrategy {
 pub enum FetchStrategy {
     FullScan,
     FieldIndexLookup(String), // index name
+    FieldIndexRange(String),  // index name — for Gt/Lt/Gte/Lte/And range scans
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ pub enum Plan {
     Explain(Box<Plan>),
     CreateEdgeType(CreateEdgeTypePlan),
     InsertEdge(InsertEdgePlan),
+    DeleteEntity(DeleteEntityPlan),
     DeleteEdge(DeleteEdgePlan),
     Traverse(TraversePlan),
     CreateAffinityGroup(CreateAffinityGroupPlan),
@@ -94,6 +96,7 @@ pub struct CreateEdgeTypePlan {
     pub name: String,
     pub from_collection: String,
     pub to_collection: String,
+    pub decay_config: Option<trondb_tql::DecayConfigDecl>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +105,12 @@ pub struct InsertEdgePlan {
     pub from_id: String,
     pub to_id: String,
     pub metadata: Vec<(String, trondb_tql::Literal)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteEntityPlan {
+    pub entity_id: String,
+    pub collection: String,
 }
 
 #[derive(Debug, Clone)]
@@ -165,16 +174,23 @@ fn select_search_strategy(
 }
 
 /// Determine the fetch strategy.
-/// Returns `FieldIndexLookup` when there is an `Eq` filter on a field covered
-/// by a declared index; otherwise falls back to `FullScan`.
+/// Returns `FieldIndexLookup` for `Eq` filters, `FieldIndexRange` for
+/// `Gt`/`Lt`/`Gte`/`Lte`/`And` filters on indexed fields; otherwise `FullScan`.
 fn select_fetch_strategy(
     filter: &Option<WhereClause>,
     schema: Option<&CollectionSchema>,
 ) -> FetchStrategy {
-    if let (Some(WhereClause::Eq(field, _)), Some(schema)) = (filter, schema) {
+    if let (Some(clause), Some(schema)) = (filter, schema) {
+        let field_name = first_field_in_clause(clause);
         for idx in &schema.indexes {
-            if idx.fields.first().map(|f| f == field).unwrap_or(false) {
-                return FetchStrategy::FieldIndexLookup(idx.name.clone());
+            if idx.fields.first().map(|f| f == &field_name).unwrap_or(false) {
+                return match clause {
+                    WhereClause::Eq(_, _) => FetchStrategy::FieldIndexLookup(idx.name.clone()),
+                    WhereClause::Gt(_, _) | WhereClause::Lt(_, _)
+                    | WhereClause::Gte(_, _) | WhereClause::Lte(_, _)
+                    | WhereClause::And(_, _) => FetchStrategy::FieldIndexRange(idx.name.clone()),
+                    _ => FetchStrategy::FullScan,
+                };
             }
         }
     }
@@ -220,6 +236,8 @@ fn first_field_in_clause(clause: &WhereClause) -> String {
         WhereClause::Eq(field, _) => field.clone(),
         WhereClause::Gt(field, _) => field.clone(),
         WhereClause::Lt(field, _) => field.clone(),
+        WhereClause::Gte(field, _) => field.clone(),
+        WhereClause::Lte(field, _) => field.clone(),
         WhereClause::And(left, _) => first_field_in_clause(left),
         WhereClause::Or(left, _) => first_field_in_clause(left),
     }
@@ -298,6 +316,7 @@ pub fn plan(
             name: s.name.clone(),
             from_collection: s.from_collection.clone(),
             to_collection: s.to_collection.clone(),
+            decay_config: s.decay_config.clone(),
         })),
 
         Statement::InsertEdge(s) => Ok(Plan::InsertEdge(InsertEdgePlan {
@@ -305,6 +324,11 @@ pub fn plan(
             from_id: s.from_id.clone(),
             to_id: s.to_id.clone(),
             metadata: s.metadata.clone(),
+        })),
+
+        Statement::Delete(s) => Ok(Plan::DeleteEntity(DeleteEntityPlan {
+            entity_id: s.entity_id.clone(),
+            collection: s.collection.clone(),
         })),
 
         Statement::DeleteEdge(s) => Ok(Plan::DeleteEdge(DeleteEdgePlan {
@@ -582,6 +606,86 @@ mod tests {
             Plan::Fetch(fp) => {
                 assert_eq!(fp.strategy, FetchStrategy::FieldIndexLookup("idx_city".into()));
                 assert_eq!(fp.collection, "venues");
+            }
+            _ => panic!("expected FetchPlan"),
+        }
+    }
+
+    #[test]
+    fn plan_fetch_gt_uses_field_index_range() {
+        use crate::types::{Metric, StoredField, StoredIndex, StoredRepresentation, FieldType};
+
+        let schemas = DashMap::new();
+        schemas.insert("venues".into(), CollectionSchema {
+            name: "venues".into(),
+            representations: vec![StoredRepresentation {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![StoredField {
+                name: "score".into(),
+                field_type: FieldType::Int,
+            }],
+            indexes: vec![StoredIndex {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        });
+
+        let stmt = Statement::Fetch(FetchStmt {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Gt("score".into(), Literal::Int(50))),
+            limit: None,
+        });
+        let p = plan(&stmt, &schemas).unwrap();
+        match p {
+            Plan::Fetch(fp) => {
+                assert_eq!(fp.strategy, FetchStrategy::FieldIndexRange("idx_score".into()));
+            }
+            _ => panic!("expected FetchPlan"),
+        }
+    }
+
+    #[test]
+    fn plan_fetch_gte_uses_field_index_range() {
+        use crate::types::{Metric, StoredField, StoredIndex, StoredRepresentation, FieldType};
+
+        let schemas = DashMap::new();
+        schemas.insert("venues".into(), CollectionSchema {
+            name: "venues".into(),
+            representations: vec![StoredRepresentation {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![StoredField {
+                name: "score".into(),
+                field_type: FieldType::Int,
+            }],
+            indexes: vec![StoredIndex {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        });
+
+        let stmt = Statement::Fetch(FetchStmt {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Gte("score".into(), Literal::Int(80))),
+            limit: None,
+        });
+        let p = plan(&stmt, &schemas).unwrap();
+        match p {
+            Plan::Fetch(fp) => {
+                assert_eq!(fp.strategy, FetchStrategy::FieldIndexRange("idx_score".into()));
             }
             _ => panic!("expected FetchPlan"),
         }
