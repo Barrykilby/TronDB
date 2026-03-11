@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 5a: Indexes + Structural edges + TRAVERSE.
+Inference-first storage engine. Phase 6: Routing Intelligence.
 
 ## Project Structure
 
@@ -8,6 +8,16 @@ Inference-first storage engine. Phase 5a: Indexes + Structural edges + TRAVERSE.
 - `crates/trondb-core/` — Engine: types, Fjall-backed store, Location Table (DashMap), HNSW index (hnsw_rs), edges (AdjacencyIndex), planner, async executor. Depends on trondb-wal + trondb-tql.
 - `crates/trondb-tql/` — TQL parser (logos lexer + recursive descent). No engine dependency.
 - `crates/trondb-cli/` — Interactive REPL binary (Tokio + rustyline). Depends on all crates.
+- Routing Intelligence: SemanticRouter with health signals, co-location, semantic routing
+  - `crates/trondb-routing/` — Routing layer: health signals, co-location, semantic router. Depends on trondb-core + trondb-wal + trondb-tql.
+  - NodeHandle trait: LocalNode (in-process), SimulatedNode (tests), RemoteNode (Phase 6b)
+  - HealthSignal + HealthCache: load score computation (RAM 0.35, queue 0.30, CPU 0.20, HNSW 0.10, lag 0.05)
+  - AffinityIndex: explicit groups (WAL-logged, Fjall-persisted) + implicit co-occurrence (RAM-only)
+  - Candidate scoring: health (40%) + verb fit (30%) + entity affinity (30%)
+  - Soft eviction: ungrouped LRU → implicit groups → explicit groups
+  - Background tasks: health polling (200ms), implicit affinity promotion (30s)
+  - TQL: COLLOCATE WITH, AFFINITY GROUP, CREATE AFFINITY GROUP, ALTER ENTITY DROP AFFINITY GROUP
+  - EXPLAIN shows routing section (selected node, score breakdown, candidates)
 
 ## Conventions
 
