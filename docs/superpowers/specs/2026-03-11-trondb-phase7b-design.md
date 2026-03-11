@@ -16,6 +16,7 @@
 - **Max depth:** Hard cap at 10 (prevents runaway queries). Configurable via future `SET` command.
 - **Direction:** Forward-only (from→to). Bidirectional is future work.
 - **Result shape:** Flat entity set (all entities reachable within DEPTH hops). No path tracking.
+- **Single edge type per TRAVERSE:** Each TRAVERSE uses one edge type across all hops. The `to_collection` of that edge type determines which collection entities are fetched from at each hop. Cross-edge-type graph walks are future work.
 - **Each hop:** `AdjacencyIndex::get(frontier_id, edge_type)` → filter visited → add to next frontier → fetch entities from Fjall
 
 ### TQL (unchanged syntax)
@@ -57,15 +58,16 @@ pub struct AdjacencyIndex {
 - Rebuilt from Fjall on startup (same scan as forward index)
 - Enables efficient cascade: "find all edges pointing to this entity"
 
-#### Deletion Protocol (8 steps)
+#### Deletion Protocol (9 steps)
 1. **WAL log** — `EntityDelete` record (0x11) with entity_id + collection
-2. **Fjall delete** — Remove all representation keys for this entity
+2. **Read entity** — Fetch full entity (fields + representations) from Fjall BEFORE any deletes. Needed for field/sparse index cleanup.
 3. **HNSW tombstone** — Use existing `HnswIndex::remove()` from Phase 7a
-4. **Field index removal** — Remove all field index entries for this entity
-5. **Sparse index removal** — Remove from SparseIndex
+4. **Field index removal** — Remove all field index entries using the entity's field values (from step 2)
+5. **Sparse index removal** — Remove from SparseIndex using original sparse vectors (from step 2)
 6. **Location table removal** — Remove all LocationDescriptor entries
-7. **Edge cleanup** — Using backward index, find+delete all edges TO this entity; using forward index, find+delete all edges FROM this entity. WAL-log each edge deletion.
-8. **Tiered storage cleanup** — Delete from warm/archive Fjall partitions if present
+7. **Fjall delete** — Remove all representation keys for this entity (after indexes are cleaned)
+8. **Edge cleanup** — Iterate all registered edge types. For each type: use backward index `(entity_id, edge_type)` to find+delete all edges TO this entity; use forward index to find+delete all edges FROM this entity. WAL-log each edge deletion.
+9. **Tiered storage cleanup** — Delete from warm/archive Fjall partitions if present
 
 #### Error Handling
 - `DELETE` of nonexistent entity returns `EntityNotFound` error
@@ -74,8 +76,8 @@ pub struct AdjacencyIndex {
 ### Implementation Notes
 - New `Statement::Delete`, `Plan::DeleteEntity`, `DeleteEntityPlan`
 - Executor calls cascading cleanup methods on store, indexes, adjacency
-- Field index removal needs entity's field values — read entity from Fjall first, then delete
-- Sparse index removal: existing `SparseIndex` has per-entity cleanup if we track which entities are in which terms (may need small addition)
+- Entity data (fields + sparse vectors) must be read from Fjall BEFORE deletion — needed for index cleanup
+- SparseIndex removal requires original sparse vector: `SparseIndex::remove(entity_id, vector)`. The vector is obtained from the entity read in step 2.
 
 ## 3. Range FETCH
 
@@ -118,7 +120,7 @@ For FieldIndexRange:
 - Compute lower/upper bounds from the WhereClause
 - Open-ended ranges use type min/max (e.g., `i64::MIN` for unbounded lower)
 - Call `FieldIndex::lookup_range(lower, upper)`
-- Post-filter for exclusive bounds (Gt/Lt) — lookup_range is inclusive, so strip boundary matches
+- Post-filter for exclusive bounds (Gt/Lt): `lookup_range` returns entity IDs; re-read entity field values to check boundary exclusion, or over-fetch with inclusive bounds and filter via `entity_matches()`
 
 #### entity_matches() Extension
 Add Gte/Lte handling for FullScan path (same pattern as existing Gt/Lt).
@@ -139,8 +141,19 @@ Add `created_at: u64` (epoch millis) to Edge struct. Set to current time at INSE
 
 Backward-compatible: `#[serde(default)]` for Fjall deserialisation of existing edges.
 
+#### AdjEntry Extension
+Add `created_at: u64` to `AdjEntry` so TRAVERSE can compute decay without Fjall reads:
+```rust
+pub struct AdjEntry {
+    pub to_id: LogicalId,
+    pub confidence: f32,
+    pub created_at: u64,  // NEW — epoch millis, 0 for legacy
+}
+```
+Populated from Edge.created_at during edge insert and startup rebuild.
+
 #### Lazy Decay on Read
-During TRAVERSE, compute effective confidence:
+During TRAVERSE, compute effective confidence using AdjEntry data (no Fjall read needed):
 ```rust
 fn effective_confidence(edge: &Edge, config: &DecayConfig) -> f32 {
     if edge.created_at == 0 || config.decay_fn.is_none() {
@@ -178,7 +191,11 @@ CREATE EDGE knows FROM people TO people
     FLOOR 0.1
     PRUNE 0.05
 ```
-Parser already scaffolds DecayConfig fields — need to wire the syntax.
+The `DecayConfig` struct exists in core but `CreateEdgeTypeStmt` and `CreateEdgeTypePlan` lack decay fields. Both need extending:
+- `CreateEdgeTypeStmt` gains `decay_config: Option<DecayConfig>` (from AST)
+- `CreateEdgeTypePlan` gains matching field (from planner)
+- Parser adds DECAY/FLOOR/PRUNE keyword handling after FROM...TO clause
+- Executor passes decay_config to EdgeType construction
 
 ### Implementation Notes
 - `created_at` uses `std::time::SystemTime::now().duration_since(UNIX_EPOCH).as_millis() as u64`
@@ -189,11 +206,11 @@ Parser already scaffolds DecayConfig fields — need to wire the syntax.
 
 | File | Changes |
 |------|---------|
-| `trondb-tql/src/ast.rs` | Add Gte, Lte to WhereClause; DeleteStmt; TierTarget already exists |
+| `trondb-tql/src/ast.rs` | Add Gte, Lte to WhereClause; DeleteStmt; CreateEdgeTypeStmt decay fields |
 | `trondb-tql/src/token.rs` | No changes (Gte/Lte tokens exist) |
 | `trondb-tql/src/parser.rs` | Parse Gte/Lte in WHERE; parse DELETE stmt; parse DECAY in CREATE EDGE |
 | `trondb-core/src/edge.rs` | Add backward index to AdjacencyIndex; add created_at to Edge; decay functions |
-| `trondb-core/src/planner.rs` | DeleteEntityPlan; FieldIndexRange strategy; route range queries |
+| `trondb-core/src/planner.rs` | DeleteEntityPlan; FieldIndexRange strategy; route range queries; add Gte/Lte to first_field_in_clause() |
 | `trondb-core/src/executor.rs` | Multi-hop BFS; DELETE handler; FieldIndexRange handler; Gte/Lte in entity_matches |
 | `trondb-core/src/store.rs` | delete_entity() method |
 | `trondb-core/src/lib.rs` | Engine delete_entity() method |
