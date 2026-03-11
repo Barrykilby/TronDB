@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
+use crate::edge::{AdjacencyIndex, Edge, EdgeType, DecayConfig};
 use crate::error::EngineError;
 use crate::index::HnswIndex;
 use crate::location::{
@@ -25,6 +26,8 @@ pub struct Executor {
     wal: WalWriter,
     location: Arc<LocationTable>,
     indexes: DashMap<String, HnswIndex>,
+    adjacency: AdjacencyIndex,
+    edge_types: DashMap<String, EdgeType>,
 }
 
 impl Executor {
@@ -34,6 +37,8 @@ impl Executor {
             wal,
             location,
             indexes: DashMap::new(),
+            adjacency: AdjacencyIndex::new(),
+            edge_types: DashMap::new(),
         }
     }
 
@@ -352,12 +357,199 @@ impl Executor {
                 })
             }
 
-            Plan::CreateEdgeType(_)
-            | Plan::InsertEdge(_)
-            | Plan::DeleteEdge(_)
-            | Plan::Traverse(_) => Err(EngineError::UnsupportedOperation(
-                "edge operations not yet implemented".into(),
-            )),
+            Plan::CreateEdgeType(p) => {
+                // Validate from/to collections exist
+                if !self.store.has_collection(&p.from_collection) {
+                    return Err(EngineError::CollectionNotFound(p.from_collection.clone()));
+                }
+                if !self.store.has_collection(&p.to_collection) {
+                    return Err(EngineError::CollectionNotFound(p.to_collection.clone()));
+                }
+
+                let edge_type = EdgeType {
+                    name: p.name.clone(),
+                    from_collection: p.from_collection.clone(),
+                    to_collection: p.to_collection.clone(),
+                    decay_config: DecayConfig::default(),
+                };
+
+                // WAL: TxBegin → SchemaCreateEdgeType → commit
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.name, tx_id, 1, vec![]);
+                let payload = rmp_serde::to_vec_named(&edge_type)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::SchemaCreateEdgeType, &p.name, tx_id, 1, payload);
+                self.wal.commit(tx_id).await?;
+
+                // Apply to Fjall
+                self.store.create_edge_type(&edge_type)?;
+
+                // Register in memory
+                self.edge_types.insert(p.name.clone(), edge_type);
+
+                Ok(QueryResult {
+                    columns: vec!["result".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([(
+                            "result".into(),
+                            Value::String(format!(
+                                "Edge type '{}' created ({} → {})",
+                                p.name, p.from_collection, p.to_collection
+                            )),
+                        )]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                    },
+                })
+            }
+
+            Plan::InsertEdge(p) => {
+                // Validate edge type exists
+                let edge_type = self.store.get_edge_type(&p.edge_type)?;
+
+                // Validate from/to entities exist
+                let from_id = LogicalId::from_string(&p.from_id);
+                let to_id = LogicalId::from_string(&p.to_id);
+                self.store.get(&edge_type.from_collection, &from_id)?;
+                self.store.get(&edge_type.to_collection, &to_id)?;
+
+                // Build metadata
+                let mut metadata = HashMap::new();
+                for (key, lit) in &p.metadata {
+                    metadata.insert(key.clone(), literal_to_value(lit));
+                }
+
+                let edge = Edge {
+                    from_id: from_id.clone(),
+                    to_id: to_id.clone(),
+                    edge_type: p.edge_type.clone(),
+                    confidence: 1.0,
+                    metadata,
+                };
+
+                // WAL: TxBegin → EdgeWrite → commit
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.edge_type, tx_id, 1, vec![]);
+                let payload = rmp_serde::to_vec_named(&edge)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::EdgeWrite, &p.edge_type, tx_id, 1, payload);
+                self.wal.commit(tx_id).await?;
+
+                // Apply to Fjall
+                self.store.insert_edge(&edge)?;
+                self.store.persist()?;
+
+                // Apply to AdjacencyIndex
+                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0);
+
+                Ok(QueryResult {
+                    columns: vec!["result".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([(
+                            "result".into(),
+                            Value::String(format!(
+                                "Edge '{}' created: {} → {}",
+                                p.edge_type, p.from_id, p.to_id
+                            )),
+                        )]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                    },
+                })
+            }
+
+            Plan::DeleteEdge(p) => {
+                let from_id = LogicalId::from_string(&p.from_id);
+                let to_id = LogicalId::from_string(&p.to_id);
+
+                // WAL: TxBegin → EdgeDelete → commit
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.edge_type, tx_id, 1, vec![]);
+                let payload = rmp_serde::to_vec_named(&serde_json::json!({
+                    "edge_type": p.edge_type,
+                    "from_id": p.from_id,
+                    "to_id": p.to_id,
+                }))
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::EdgeDelete, &p.edge_type, tx_id, 1, payload);
+                self.wal.commit(tx_id).await?;
+
+                // Apply to Fjall
+                self.store.delete_edge(&p.edge_type, &p.from_id, &p.to_id)?;
+                self.store.persist()?;
+
+                // Apply to AdjacencyIndex
+                self.adjacency.remove(&from_id, &p.edge_type, &to_id);
+
+                Ok(QueryResult {
+                    columns: vec!["result".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([(
+                            "result".into(),
+                            Value::String(format!(
+                                "Edge '{}' deleted: {} → {}",
+                                p.edge_type, p.from_id, p.to_id
+                            )),
+                        )]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                    },
+                })
+            }
+
+            Plan::Traverse(p) => {
+                // Validate edge type exists
+                let edge_type = self.store.get_edge_type(&p.edge_type)?;
+
+                // Gate multi-hop
+                if p.depth > 1 {
+                    return Err(EngineError::UnsupportedOperation(
+                        "TRAVERSE DEPTH > 1 requires Phase 6+".into(),
+                    ));
+                }
+
+                let from_id = LogicalId::from_string(&p.from_id);
+                let entries = self.adjacency.get(&from_id, &p.edge_type);
+
+                let mut rows = Vec::new();
+                for entry in &entries {
+                    if let Ok(entity) = self.store.get(&edge_type.to_collection, &entry.to_id) {
+                        rows.push(entity_to_row(&entity, &FieldList::All));
+                    }
+                }
+
+                if let Some(limit) = p.limit {
+                    rows.truncate(limit);
+                }
+
+                let scanned = rows.len();
+
+                Ok(QueryResult {
+                    columns: build_columns(&rows, &FieldList::All),
+                    rows,
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: scanned,
+                        mode: QueryMode::Deterministic,
+                        tier: "Ram".into(),
+                    },
+                })
+            }
         }
     }
 
@@ -387,6 +579,22 @@ impl Executor {
 
     pub fn get_collection_dimensions(&self, name: &str) -> Result<usize, EngineError> {
         self.store.get_dimensions(name)
+    }
+
+    pub fn adjacency(&self) -> &AdjacencyIndex {
+        &self.adjacency
+    }
+
+    pub fn edge_types(&self) -> &DashMap<String, EdgeType> {
+        &self.edge_types
+    }
+
+    pub fn list_edge_types(&self) -> Vec<EdgeType> {
+        self.store.list_edge_types()
+    }
+
+    pub fn scan_edges(&self, edge_type: &str) -> Result<Vec<Edge>, EngineError> {
+        self.store.scan_edges(edge_type)
     }
 }
 
@@ -573,31 +781,31 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("verb", "EXPLAIN".into()));
         }
         Plan::CreateEdgeType(p) => {
-            props.push(("verb", "CREATE EDGE TYPE".into()));
-            props.push(("name", p.name.clone()));
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "CREATE EDGE".into()));
+            props.push(("edge_type", p.name.clone()));
             props.push(("from_collection", p.from_collection.clone()));
             props.push(("to_collection", p.to_collection.clone()));
         }
         Plan::InsertEdge(p) => {
+            props.push(("mode", "Deterministic".into()));
             props.push(("verb", "INSERT EDGE".into()));
             props.push(("edge_type", p.edge_type.clone()));
-            props.push(("from_id", p.from_id.clone()));
-            props.push(("to_id", p.to_id.clone()));
+            props.push(("tier", "Fjall".into()));
         }
         Plan::DeleteEdge(p) => {
+            props.push(("mode", "Deterministic".into()));
             props.push(("verb", "DELETE EDGE".into()));
             props.push(("edge_type", p.edge_type.clone()));
-            props.push(("from_id", p.from_id.clone()));
-            props.push(("to_id", p.to_id.clone()));
+            props.push(("tier", "Fjall".into()));
         }
         Plan::Traverse(p) => {
+            props.push(("mode", "Deterministic".into()));
             props.push(("verb", "TRAVERSE".into()));
             props.push(("edge_type", p.edge_type.clone()));
-            props.push(("from_id", p.from_id.clone()));
+            props.push(("tier", "Ram".into()));
+            props.push(("strategy", "AdjacencyIndex".into()));
             props.push(("depth", p.depth.to_string()));
-            if let Some(limit) = p.limit {
-                props.push(("limit", limit.to_string()));
-            }
         }
     }
 
