@@ -30,7 +30,7 @@ pub struct Executor {
     store: FjallStore,
     wal: Arc<WalWriter>,
     location: Arc<LocationTable>,
-    indexes: DashMap<String, HnswIndex>,
+    indexes: Arc<DashMap<String, HnswIndex>>,
     sparse_indexes: DashMap<String, SparseIndex>,
     field_indexes: DashMap<String, FieldIndex>,
     schemas: DashMap<String, CollectionSchema>,
@@ -44,7 +44,7 @@ impl Executor {
             store,
             wal: Arc::new(wal),
             location,
-            indexes: DashMap::new(),
+            indexes: Arc::new(DashMap::new()),
             sparse_indexes: DashMap::new(),
             field_indexes: DashMap::new(),
             schemas: DashMap::new(),
@@ -1251,7 +1251,7 @@ impl Executor {
         Arc::clone(&self.wal)
     }
 
-    pub fn indexes(&self) -> &DashMap<String, HnswIndex> {
+    pub fn indexes(&self) -> &Arc<DashMap<String, HnswIndex>> {
         &self.indexes
     }
 

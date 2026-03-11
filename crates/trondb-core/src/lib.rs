@@ -39,6 +39,7 @@ pub struct Engine {
     executor: Executor,
     data_dir: PathBuf,
     _snapshot_handle: Option<tokio::task::JoinHandle<()>>,
+    _hnsw_snapshot_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Engine {
@@ -305,10 +306,43 @@ impl Engine {
             None
         };
 
+        // Spawn background HNSW snapshot task
+        let hnsw_snapshot_handle = if config.snapshot_interval_secs > 0 {
+            let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
+            let snap_dir = config.data_dir.join("hnsw_snapshots");
+            let indexes_arc = Arc::clone(executor.indexes());
+
+            Some(tokio::spawn(async move {
+                let _ = std::fs::create_dir_all(&snap_dir);
+                let mut ticker = tokio::time::interval(interval);
+                ticker.tick().await; // skip first immediate tick
+                loop {
+                    ticker.tick().await;
+                    // LSN 0 is a known limitation — the periodic task doesn't have a live
+                    // LSN accessor. This means incremental WAL catch-up on next restart will
+                    // replay more records than strictly necessary, but is safe because HNSW
+                    // insert is idempotent. A live LSN accessor is a future improvement.
+                    let lsn = 0;
+                    for entry in indexes_arc.iter() {
+                        if let Some((collection, repr_name)) = entry.key().split_once(':') {
+                            if let Err(e) = crate::hnsw_snapshot::save_snapshot(
+                                &snap_dir, collection, repr_name, entry.value(), lsn,
+                            ) {
+                                eprintln!("[hnsw_snapshot] periodic save failed for {}: {e}", entry.key());
+                            }
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
         Ok((Self {
             executor,
             data_dir: config.data_dir.clone(),
             _snapshot_handle: snapshot_handle,
+            _hnsw_snapshot_handle: hnsw_snapshot_handle,
         }, unhandled_records))
     }
 
@@ -438,6 +472,22 @@ impl Engine {
 
     pub fn scan_edges(&self, edge_type: &str) -> Result<Vec<crate::edge::Edge>, EngineError> {
         self.executor.scan_edges(edge_type)
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Abort background snapshot tasks to prevent them running on a dropping engine
+        if let Some(h) = self._hnsw_snapshot_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self._snapshot_handle.take() {
+            h.abort();
+        }
+        // Save final HNSW snapshot
+        if let Err(e) = self.save_hnsw_snapshots() {
+            eprintln!("[hnsw_snapshot] shutdown save failed: {e}");
+        }
     }
 }
 
@@ -1430,5 +1480,73 @@ mod tests {
             "SEARCH venues NEAR VECTOR [1.0, 0.0, 0.0] LIMIT 2;"
         ).await.unwrap();
         assert!(result.rows.len() >= 1, "SEARCH should find entities after snapshot restore");
+    }
+
+    #[tokio::test]
+    async fn hnsw_snapshot_periodic_creates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 1, // 1 second for testing
+        };
+
+        let (engine, _) = Engine::open(config.clone()).await.unwrap();
+        engine.execute_tql(
+            "CREATE COLLECTION venues (\
+                REPRESENTATION default DIMENSIONS 3 METRIC COSINE\
+            );"
+        ).await.unwrap();
+        engine.execute_tql(
+            "INSERT INTO venues (id, name) VALUES ('v1', 'Test') \
+             REPRESENTATION default VECTOR [1.0, 0.0, 0.0];"
+        ).await.unwrap();
+
+        // Wait for periodic snapshot to fire
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let snap_dir = config.data_dir.join("hnsw_snapshots");
+        assert!(snap_dir.exists(), "hnsw_snapshots directory should exist");
+        assert!(
+            snap_dir.join("venues_default.hnsw.meta").exists(),
+            "snapshot meta should exist after periodic snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn hnsw_snapshot_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0, // no periodic — rely on Drop
+        };
+
+        {
+            let (engine, _) = Engine::open(config.clone()).await.unwrap();
+            engine.execute_tql(
+                "CREATE COLLECTION venues (\
+                    REPRESENTATION default DIMENSIONS 3 METRIC COSINE\
+                );"
+            ).await.unwrap();
+            engine.execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'Test') \
+                 REPRESENTATION default VECTOR [1.0, 0.0, 0.0];"
+            ).await.unwrap();
+            // Engine dropped here — Drop should save HNSW snapshots
+        }
+
+        let snap_dir = config.data_dir.join("hnsw_snapshots");
+        assert!(snap_dir.exists(), "hnsw_snapshots directory should exist after drop");
+        assert!(
+            snap_dir.join("venues_default.hnsw.meta").exists(),
+            "snapshot meta should exist after drop"
+        );
     }
 }
