@@ -632,6 +632,47 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Task 6: AffinityGroup WAL records appear in unhandled collection
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn affinity_group_records_returned_as_unhandled() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = trondb_core::EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        // Create an engine and write an AffinityGroup WAL record
+        {
+            let (engine, _) = trondb_core::Engine::open(cfg.clone()).await.unwrap();
+            let wal = engine.wal_writer();
+            // Construct a simple payload using rmp_serde with a map (no serde_json needed)
+            let mut payload_map = std::collections::HashMap::new();
+            payload_map.insert("group_id", "g1");
+            let payload = rmp_serde::to_vec_named(&payload_map).unwrap();
+            let tx = wal.next_tx_id();
+            wal.append(trondb_wal::RecordType::AffinityGroupCreate, "affinity", tx, 1, payload);
+            wal.commit(tx).await.unwrap();
+        }
+
+        // Reopen — the AffinityGroupCreate record should appear in unhandled
+        let (_, pending) = trondb_core::Engine::open(cfg).await.unwrap();
+        let affinity_records: Vec<_> = pending.iter()
+            .filter(|r| matches!(r.record_type,
+                trondb_wal::RecordType::AffinityGroupCreate
+                | trondb_wal::RecordType::AffinityGroupMember
+                | trondb_wal::RecordType::AffinityGroupRemove
+            ))
+            .collect();
+        assert!(!affinity_records.is_empty(), "AffinityGroupCreate should be in unhandled records");
+    }
+
+    // -----------------------------------------------------------------------
     // Tier integration test 4: quantisation roundtrip preserves vector approx.
     // -----------------------------------------------------------------------
 
