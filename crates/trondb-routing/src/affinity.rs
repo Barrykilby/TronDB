@@ -1,10 +1,33 @@
 use std::collections::HashSet;
 
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use trondb_wal::{RecordType, WalWriter};
 
 use crate::config::ColocationConfig;
 use crate::error::RouterError;
 use crate::node::{AffinityGroupId, EntityId, NodeId};
+
+// ---------------------------------------------------------------------------
+// WAL payload types (explicit groups only; implicit is RAM-only)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+pub struct AffinityGroupCreatePayload {
+    pub group_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AffinityGroupMemberPayload {
+    pub group_id: String,
+    pub entity_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AffinityGroupRemovePayload {
+    pub entity_id: String,
+    pub group_id: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AffinitySource {
@@ -195,6 +218,113 @@ impl AffinityIndex {
     pub fn group_count(&self) -> usize {
         self.groups.len()
     }
+
+    // -----------------------------------------------------------------------
+    // WAL-logged mutations (explicit groups only)
+    // -----------------------------------------------------------------------
+
+    pub async fn create_group_logged(
+        &self,
+        id: AffinityGroupId,
+        wal: &WalWriter,
+    ) -> Result<(), RouterError> {
+        self.create_group(id.clone())?;
+        let payload = rmp_serde::to_vec_named(&AffinityGroupCreatePayload {
+            group_id: id.as_str().to_owned(),
+        })
+        .unwrap();
+        let tx = wal.next_tx_id();
+        wal.append(RecordType::TxBegin, "affinity", tx, 1, vec![]);
+        wal.append(RecordType::AffinityGroupCreate, "affinity", tx, 1, payload);
+        wal.commit(tx)
+            .await
+            .map_err(|e| RouterError::Engine(e.into()))?;
+        Ok(())
+    }
+
+    pub async fn add_to_group_logged(
+        &self,
+        entity: &EntityId,
+        group_id: &AffinityGroupId,
+        max_size: usize,
+        wal: &WalWriter,
+    ) -> Result<(), RouterError> {
+        self.add_to_group(entity, group_id, max_size)?;
+        let payload = rmp_serde::to_vec_named(&AffinityGroupMemberPayload {
+            group_id: group_id.as_str().to_owned(),
+            entity_id: entity.as_str().to_owned(),
+        })
+        .unwrap();
+        let tx = wal.next_tx_id();
+        wal.append(RecordType::TxBegin, "affinity", tx, 1, vec![]);
+        wal.append(RecordType::AffinityGroupMember, "affinity", tx, 1, payload);
+        wal.commit(tx)
+            .await
+            .map_err(|e| RouterError::Engine(e.into()))?;
+        Ok(())
+    }
+
+    pub async fn remove_from_group_logged(
+        &self,
+        entity: &EntityId,
+        wal: &WalWriter,
+    ) -> Result<(), RouterError> {
+        let group_id = self.group_for(entity);
+        self.remove_from_group(entity);
+        if let Some(gid) = group_id {
+            let payload = rmp_serde::to_vec_named(&AffinityGroupRemovePayload {
+                entity_id: entity.as_str().to_owned(),
+                group_id: gid.as_str().to_owned(),
+            })
+            .unwrap();
+            let tx = wal.next_tx_id();
+            wal.append(RecordType::TxBegin, "affinity", tx, 1, vec![]);
+            wal.append(RecordType::AffinityGroupRemove, "affinity", tx, 1, payload);
+            wal.commit(tx)
+                .await
+                .map_err(|e| RouterError::Engine(e.into()))?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL replay (called during startup recovery)
+    // -----------------------------------------------------------------------
+
+    pub fn replay_affinity_record(
+        &self,
+        record_type: RecordType,
+        payload: &[u8],
+        max_group_size: usize,
+    ) {
+        match record_type {
+            RecordType::AffinityGroupCreate => {
+                if let Ok(p) =
+                    rmp_serde::from_slice::<AffinityGroupCreatePayload>(payload)
+                {
+                    let _ = self.create_group(AffinityGroupId::from_string(&p.group_id));
+                }
+            }
+            RecordType::AffinityGroupMember => {
+                if let Ok(p) =
+                    rmp_serde::from_slice::<AffinityGroupMemberPayload>(payload)
+                {
+                    let gid = AffinityGroupId::from_string(&p.group_id);
+                    let eid = EntityId::from_string(&p.entity_id);
+                    let _ = self.add_to_group(&eid, &gid, max_group_size);
+                }
+            }
+            RecordType::AffinityGroupRemove => {
+                if let Ok(p) =
+                    rmp_serde::from_slice::<AffinityGroupRemovePayload>(payload)
+                {
+                    let eid = EntityId::from_string(&p.entity_id);
+                    self.remove_from_group(&eid);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Default for AffinityIndex {
@@ -338,5 +468,39 @@ mod tests {
             idx.preferred_node(&eid("e1")),
             Some(crate::node::NodeId::from_string("node-1"))
         );
+    }
+
+    #[test]
+    fn affinity_group_wal_replay() {
+        use trondb_wal::RecordType;
+
+        let idx = AffinityIndex::new();
+        let gid = AffinityGroupId::from_string("g1");
+
+        // Simulate WAL replay: create group
+        let create_payload = rmp_serde::to_vec_named(&AffinityGroupCreatePayload {
+            group_id: "g1".into(),
+        })
+        .unwrap();
+        idx.replay_affinity_record(RecordType::AffinityGroupCreate, &create_payload, 500);
+        assert!(idx.get_group(&gid).is_some());
+
+        // Simulate WAL replay: add member
+        let member_payload = rmp_serde::to_vec_named(&AffinityGroupMemberPayload {
+            group_id: "g1".into(),
+            entity_id: "e1".into(),
+        })
+        .unwrap();
+        idx.replay_affinity_record(RecordType::AffinityGroupMember, &member_payload, 500);
+        assert_eq!(idx.group_for(&eid("e1")), Some(gid.clone()));
+
+        // Simulate WAL replay: remove member
+        let remove_payload = rmp_serde::to_vec_named(&AffinityGroupRemovePayload {
+            entity_id: "e1".into(),
+            group_id: "g1".into(),
+        })
+        .unwrap();
+        idx.replay_affinity_record(RecordType::AffinityGroupRemove, &remove_payload, 500);
+        assert_eq!(idx.group_for(&eid("e1")), None);
     }
 }
