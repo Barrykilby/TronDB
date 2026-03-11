@@ -2121,6 +2121,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_lt_excludes_boundary() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score < 30 (strict) — should exclude score=30
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Lt("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2); // scores 10, 20 only
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v < 30, "score {} should be < 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_lte_includes_boundary() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with INT score field + index
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_score".into(),
+                fields: vec!["score".into()],
+                partial_condition: None,
+            }],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score <= 30 — should include score=30
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Lte("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 3); // scores 10, 20, 30
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v <= 30, "score {} should be <= 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_gte_lte_fullscan_fallback() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection WITHOUT an index on score
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "scores".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "score".into(),
+                field_type: trondb_tql::FieldType::Int,
+            }],
+            indexes: vec![],
+        })).await.unwrap();
+
+        // Insert entities with scores 10, 20, 30, 40, 50
+        for i in 1..=5 {
+            let score = i * 10;
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "scores".into(),
+                fields: vec!["id".into(), "score".into()],
+                values: vec![
+                    Literal::String(format!("item{}", i)),
+                    Literal::Int(score),
+                ],
+                vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // FETCH WHERE score >= 30 via FullScan (no index available)
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "scores".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Gte("score".into(), Literal::Int(30))),
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 3); // scores 30, 40, 50
+        assert_eq!(result.stats.tier, "Fjall"); // FullScan reads from Fjall tier
+        for row in &result.rows {
+            let score = row.values.get("score").unwrap();
+            match score {
+                Value::Int(v) => assert!(*v >= 30, "score {} should be >= 30", v),
+                _ => panic!("expected Int score"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn search_sparse_returns_ranked() {
         let (exec, _dir) = setup_executor().await;
 
