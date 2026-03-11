@@ -105,6 +105,12 @@ pub struct LocationTable {
     mutation_counter: AtomicU64,
 }
 
+impl Default for LocationTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocationTable {
     pub fn new() -> Self {
         Self {
