@@ -48,12 +48,17 @@ New `Plan::UpdateEntity` variant. No strategy selection needed — always a poin
 
 1. Read entity from Fjall by `(collection, entity_id)`
 2. Validate entity exists (error if not)
-3. Apply assignments to `entity.metadata` map
-4. WAL append `RecordType::EntityWrite` with the updated entity (reuses existing record type — no new WAL format)
-5. WAL commit
-6. Write updated entity to Fjall
-7. Update affected field indexes: remove old values, insert new values
-8. Return `QueryResult` with "updated" status
+3. **Capture old field values** for all indexed fields (needed for step 8's remove operation — must happen before mutation)
+4. Apply assignments to `entity.metadata` map
+5. WAL append `RecordType::EntityWrite` with the updated entity (reuses existing record type — no new WAL format)
+6. WAL commit — crash between here and step 7 is safe because replay of `EntityWrite` re-applies the full entity blob
+7. Write updated entity to Fjall
+8. Update affected field indexes: remove old entries using captured pre-mutation values, insert new entries using post-mutation values
+9. Return `QueryResult` with "updated" status
+
+### NULL handling
+
+`SET field = NULL` is out of scope for Phase 8. Only concrete values (string, int, float, bool) are supported. Removing a metadata key requires DELETE + re-INSERT.
 
 ### Why EntityWrite, not a new record type
 
@@ -73,7 +78,7 @@ The WAL payload is the full entity blob. Whether it was created by INSERT or mod
 
 | Record Type | Code | Current | Fix |
 |---|---|---|---|
-| EntityDelete | 0x11 | Placeholder (empty arm) | Deserialise entity_id, call `store.delete_entity()`. HNSW/field index cleanup unnecessary — indexes rebuilt from Fjall after replay. |
+| EntityDelete | 0x11 | Placeholder (empty arm) | Deserialise entity_id, call `store.delete_entity()`. Also call `delete_from_tier(NVMe)` and `delete_from_tier(Archive)` to clean up warm/archive tier data. HNSW/field index cleanup unnecessary — indexes rebuilt from Fjall after replay. |
 
 **Category B — Routing layer (Phase 8):**
 
@@ -92,12 +97,18 @@ The WAL payload is the full entity blob. Whether it was created by INSERT or mod
 | EdgeConfidenceUpdate | 0x32 | Not yet written anywhere |
 | EdgeConfirm | 0x33 | Not yet written anywhere |
 
-**Category D — No action needed:**
+**Category D — Already handled or no action needed:**
 
 | Record Type | Code | Reason |
 |---|---|---|
 | TxBegin/Commit/Abort | 0x01-0x03 | Recovery already filters to committed records |
+| EntityWrite | 0x10 | Already handled in replay |
 | ReprWrite/ReprDirty | 0x20-0x21 | No separate representation write path exists |
+| EdgeWrite | 0x30 | Already handled in replay |
+| EdgeDelete | 0x34 | Already handled in replay |
+| LocationUpdate | 0x40 | Already handled in replay |
+| SchemaCreateColl | 0x50 | Already handled in replay |
+| SchemaCreateEdgeType | 0x51 | Already handled in replay |
 | Checkpoint | 0xFF | Control record, not a data mutation |
 
 ### Wiring: Engine returns unhandled records
@@ -105,6 +116,30 @@ The WAL payload is the full entity blob. Whether it was created by INSERT or mod
 `replay_wal_records` returns `(usize, Vec<WalRecord>)` — replayed count + unhandled records. `Engine::open()` returns `(Engine, Vec<WalRecord>)` instead of just `Engine`.
 
 The caller (routing layer) **must** process the unhandled records before constructing the queryable system. This enforces correct startup sequencing at the type level — no window of inconsistent state, no "remember to call" API.
+
+**Call site wiring:** `SemanticRouter::new()` in `trondb-routing` currently calls `Engine::open(config).await?`. This becomes:
+
+```rust
+let (engine, pending_records) = Engine::open(config).await?;
+// Process routing-layer WAL records before exposing engine
+let affinity = AffinityIndex::new();
+let mut tier_recovery = Vec::new();
+for record in &pending_records {
+    match record.record_type {
+        RecordType::AffinityGroupCreate
+        | RecordType::AffinityGroupMember
+        | RecordType::AffinityGroupRemove => {
+            affinity.replay_affinity_record(record.record_type, &record.payload, record.lsn);
+        }
+        RecordType::TierMigration => tier_recovery.push(record),
+        _ => {} // Unknown future records — safe to skip
+    }
+}
+// Process tier recovery (state-inspection, see below)
+// ... then construct SemanticRouter with engine + affinity
+```
+
+`trondb-cli` also calls `Engine::open()` directly (without routing). This call site simply discards the unhandled records: `let (engine, _pending) = Engine::open(config).await?;` — acceptable because the CLI doesn't use routing features.
 
 ### Startup Sequence (revised)
 
@@ -135,6 +170,8 @@ This is safe because each migration step is individually idempotent:
 - Update location: overwrite is safe
 - Delete from source: no-op if already gone
 
+**Constraint:** TierMigration currently operates on `repr_index: 0` only (hardcoded in migrator.rs:133-135). The `TierMigrationPayload` does not contain `repr_index`. Recovery logic matches this constraint — check tier state for `repr_index: 0` only. Multi-representation tier migration is deferred to a future phase.
+
 ---
 
 ## 3. HNSW Persistence
@@ -152,29 +189,42 @@ Snapshot HNSW indexes to disk. On startup, load from snapshot and apply incremen
 Directory: `{data_dir}/hnsw_snapshots/`
 
 Per HNSW index (one per collection+representation):
-- `{collection}_{repr_name}.hnsw.graph` — graph structure (neighbor lists, layers)
-- `{collection}_{repr_name}.hnsw.data` — vector data
+- `{collection}_{repr_name}.hnsw.graph` — graph structure (neighbor lists, layers) via `hnsw_rs` `hnswio` dump/load
+- `{collection}_{repr_name}.hnsw.data` — vector data via `hnsw_rs` `hnswio` dump/load
+- `{collection}_{repr_name}.hnsw.idmap` — TronDB's ID mapping state (bincode-serialised):
+  - `id_to_idx: HashMap<String, usize>` (LogicalId → HNSW internal index)
+  - `idx_to_id: HashMap<usize, String>` (reverse mapping)
+  - `next_idx: usize` (next available internal index)
+  - `tombstones: HashSet<String>` (deleted-but-not-yet-compacted entries)
 - `{collection}_{repr_name}.hnsw.meta` — JSON sidecar:
 
 ```json
 {
+  "version": 1,
   "entity_count": 42000,
   "lsn": 158923,
-  "checksum": "sha256:..."
+  "checksum": "sha256:...",
+  "max_nb_connection": 16,
+  "max_elements": 100000,
+  "ef_construction": 200
 }
 ```
 
-Uses `hnsw_rs` built-in `dump`/`load` via `hnswio` module.
+The `.idmap` file is critical — `hnsw_rs` dump/load only persists the graph structure and vector data, not TronDB's `HnswIndex` wrapper state (`id_to_idx`, `idx_to_id`, `next_idx`, `tombstones`). Without the ID maps, search results would return internal indices that cannot be resolved to `LogicalId`s.
+
+The `.meta` version field and HNSW parameter fingerprint (`max_nb_connection`, `max_elements`, `ef_construction`) enable safe rejection of snapshots created with incompatible parameters — triggering fallback rebuild rather than silent corruption.
 
 ### Startup: Snapshot Load + Incremental Catch-Up
 
 For each collection + dense representation:
 
-1. **Try load snapshot:** Read `.meta`, verify checksum, load `.graph` + `.data`
+1. **Try load snapshot:** Read `.meta`, verify checksum and parameter compatibility, load `.graph` + `.data` + `.idmap`
 2. **Incremental catch-up:** Scan WAL records where `lsn > meta.lsn`:
-   - `EntityWrite` in this collection: deserialise, insert vector into loaded graph
-   - `EntityDelete` in this collection: tombstone the HNSW slot
-3. **Fallback:** If snapshot missing, corrupt, or load fails — log warning, full Fjall scan rebuild (current behavior)
+   - `EntityWrite` in this collection: deserialise, insert vector into loaded graph + update ID maps
+   - `EntityDelete` in this collection: tombstone the HNSW slot + update ID maps
+3. **Fallback:** If snapshot missing, corrupt, parameter mismatch, or load fails — log warning, full Fjall scan rebuild (current behavior)
+
+**Atomicity:** Snapshot write captures the current WAL LSN, then serialises the graph and ID maps. The snapshot is written to temporary files first, then atomically renamed. This ensures a crash during snapshot write produces either the old snapshot or the new one, never a partial write. The LSN captured at the start means incremental catch-up may re-insert a few entities that are already in the snapshot — this is safe because `HnswIndex::insert()` checks `id_to_idx.contains_key(id)` and skips duplicates.
 
 This avoids the full Fjall scan when the snapshot is recent (the common case).
 
