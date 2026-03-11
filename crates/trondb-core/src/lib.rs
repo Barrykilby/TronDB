@@ -566,6 +566,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_edge_type_and_traverse() {
+        let (engine, _dir) = test_engine().await;
+
+        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
+
+        engine.execute_tql("CREATE EDGE knows FROM people TO people;").await.unwrap();
+        engine.execute_tql("INSERT EDGE knows FROM 'p1' TO 'p2';").await.unwrap();
+
+        let result = engine.execute_tql("TRAVERSE knows FROM 'p1';").await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Bob".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_edge_removes_from_traverse() {
+        let (engine, _dir) = test_engine().await;
+
+        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
+
+        engine.execute_tql("CREATE EDGE knows FROM people TO people;").await.unwrap();
+        engine.execute_tql("INSERT EDGE knows FROM 'p1' TO 'p2';").await.unwrap();
+        engine.execute_tql("DELETE EDGE knows FROM 'p1' TO 'p2';").await.unwrap();
+
+        let result = engine.execute_tql("TRAVERSE knows FROM 'p1';").await.unwrap();
+        assert!(result.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn insert_edge_with_metadata() {
+        let (engine, _dir) = test_engine().await;
+
+        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
+
+        engine.execute_tql("CREATE EDGE knows FROM people TO people;").await.unwrap();
+        engine.execute_tql("INSERT EDGE knows FROM 'p1' TO 'p2' WITH (since = '2024');").await.unwrap();
+
+        // Edge was created successfully (metadata stored in Fjall)
+        let result = engine.execute_tql("TRAVERSE knows FROM 'p1';").await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn insert_edge_nonexistent_type_fails() {
+        let (engine, _dir) = test_engine().await;
+
+        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
+        engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
+
+        let result = engine.execute_tql("INSERT EDGE knows FROM 'p1' TO 'p2';").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn traverse_nonexistent_edge_type_fails() {
+        let (engine, _dir) = test_engine().await;
+        let result = engine.execute_tql("TRAVERSE knows FROM 'p1';").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn traverse_depth_gt_1_fails() {
+        let (engine, _dir) = test_engine().await;
+
+        engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+        engine.execute_tql("CREATE EDGE knows FROM people TO people;").await.unwrap();
+
+        let result = engine.execute_tql("TRAVERSE knows FROM 'p1' DEPTH 2;").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn explain_traverse_shows_adjacency_index() {
+        let (engine, _dir) = test_engine().await;
+
+        let result = engine
+            .execute_tql("EXPLAIN TRAVERSE knows FROM 'p1';")
+            .await
+            .unwrap();
+
+        let strategy_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("strategy".into())))
+            .expect("should have 'strategy' property");
+        assert_eq!(
+            strategy_row.values.get("value"),
+            Some(&Value::String("AdjacencyIndex".into()))
+        );
+
+        let mode_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("mode".into())))
+            .expect("should have 'mode' property");
+        assert_eq!(
+            mode_row.values.get("value"),
+            Some(&Value::String("Deterministic".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn edges_survive_restart() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("data"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+        };
+
+        // Insert edge
+        {
+            let engine = Engine::open(config.clone()).await.unwrap();
+            engine.execute_tql("CREATE COLLECTION people WITH DIMENSIONS 3;").await.unwrap();
+            engine.execute_tql("INSERT INTO people (id, name) VALUES ('p1', 'Alice');").await.unwrap();
+            engine.execute_tql("INSERT INTO people (id, name) VALUES ('p2', 'Bob');").await.unwrap();
+            engine.execute_tql("CREATE EDGE knows FROM people TO people;").await.unwrap();
+            engine.execute_tql("INSERT EDGE knows FROM 'p1' TO 'p2';").await.unwrap();
+        }
+
+        // Reopen — AdjacencyIndex should be rebuilt
+        {
+            let engine = Engine::open(config).await.unwrap();
+            let result = engine.execute_tql("TRAVERSE knows FROM 'p1';").await.unwrap();
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(
+                result.rows[0].values.get("name"),
+                Some(&Value::String("Bob".into()))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn location_table_snapshot_and_restore() {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("data");
