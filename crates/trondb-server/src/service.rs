@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::{Request, Response, Status};
 use trondb_core::Engine;
 use trondb_core::planner::Plan;
@@ -8,6 +9,7 @@ use trondb_proto::pb::tron_node_server::TronNode;
 use trondb_routing::health::{HealthSignal, NodeStatus};
 use trondb_routing::node::{NodeId, NodeRole};
 use crate::config::NodeRoleConfig;
+use crate::stream_health::spawn_health_stream;
 
 pub struct TronNodeService {
     engine: Arc<Engine>,
@@ -65,8 +67,8 @@ impl TronNode for TronNodeService {
         Ok(Response::new(proto))
     }
 
-    // StreamHealth, StreamWal, StreamLocationUpdates — stub implementations
-    // (replaced by real impls in Tasks 8, 12, 15)
+    // StreamHealth — real implementation (Task 8)
+    // StreamWal, StreamLocationUpdates — stub implementations (Tasks 12, 15)
 
     type StreamHealthStream =
         tokio_stream::wrappers::ReceiverStream<Result<pb::HealthSignalResponse, Status>>;
@@ -75,7 +77,14 @@ impl TronNode for TronNodeService {
         &self,
         _: Request<pb::Empty>,
     ) -> Result<Response<Self::StreamHealthStream>, Status> {
-        Err(Status::unimplemented("implemented in Task 8"))
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        spawn_health_stream(
+            self.engine.clone(),
+            self.role.clone(),
+            tx,
+            Duration::from_millis(200),
+        );
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     type StreamWalStream =
