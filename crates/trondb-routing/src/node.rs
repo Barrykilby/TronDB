@@ -59,11 +59,25 @@ impl fmt::Display for AffinityGroupId {
 // NodeRole
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeRole {
+    Primary,
     HotNode,
     WarmNode,
     ReadReplica,
+    Router,
+}
+
+impl fmt::Display for NodeRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NodeRole::Primary => write!(f, "Primary"),
+            NodeRole::HotNode => write!(f, "HotNode"),
+            NodeRole::WarmNode => write!(f, "WarmNode"),
+            NodeRole::ReadReplica => write!(f, "ReadReplica"),
+            NodeRole::Router => write!(f, "Router"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,5 +275,22 @@ mod tests {
         let id = AffinityGroupId::from_string("cluster-1");
         assert_eq!(id.to_string(), "cluster-1");
         assert_eq!(id.as_str(), "cluster-1");
+    }
+
+    #[test]
+    fn node_role_primary_and_router_variants() {
+        let p = NodeRole::Primary;
+        let r = NodeRole::Router;
+        assert_ne!(p, r);
+        assert_eq!(p, NodeRole::Primary);
+        assert_eq!(r, NodeRole::Router);
+    }
+
+    #[test]
+    fn node_role_display() {
+        assert_eq!(format!("{}", NodeRole::Primary), "Primary");
+        assert_eq!(format!("{}", NodeRole::Router), "Router");
+        assert_eq!(format!("{}", NodeRole::HotNode), "HotNode");
+        assert_eq!(format!("{}", NodeRole::ReadReplica), "ReadReplica");
     }
 }
