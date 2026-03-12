@@ -7,15 +7,8 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 use trondb_proto::pb;
 
-pub mod config;
-pub mod location_stream;
-pub mod metrics;
-pub mod remote_node;
-pub mod replication;
-pub mod scatter;
-pub mod service;
-pub mod stream_health;
-pub mod write_forward;
+use trondb_server::config;
+use trondb_server::service;
 
 #[derive(Parser)]
 #[command(name = "trondb-server", about = "TronDB distributed node")]
