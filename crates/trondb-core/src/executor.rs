@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::{DashMap, DashSet};
 
@@ -2117,6 +2117,76 @@ impl Executor {
             processed += 1;
         }
         Ok(processed)
+    }
+
+    /// Prune Inferred edges whose effective confidence has decayed below the prune_threshold.
+    /// Only edges with `EdgeSource::Inferred` are considered; Structural and Confirmed edges
+    /// are always skipped. Returns the number of pruned edges.
+    pub async fn sweep_decayed_edges(&self) -> Result<usize, EngineError> {
+        let mut pruned = 0;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        for et_ref in self.edge_types.iter() {
+            let et = et_ref.value();
+            // Only process edge types with a prune threshold
+            let prune_threshold = match et.decay_config.prune_threshold {
+                Some(t) => t as f32,
+                None => continue,
+            };
+
+            // Scan all edges of this type
+            let edges = match self.store.scan_edges(&et.name) {
+                Ok(edges) => edges,
+                Err(_) => continue,
+            };
+
+            for edge in &edges {
+                // Only prune Inferred edges
+                if edge.source != EdgeSource::Inferred {
+                    continue;
+                }
+
+                let elapsed = now_ms.saturating_sub(edge.created_at);
+                let effective = crate::edge::effective_confidence(
+                    edge.confidence,
+                    elapsed,
+                    &et.decay_config,
+                );
+
+                if effective < prune_threshold {
+                    // WAL: TxBegin -> EdgeDelete -> commit
+                    let tx_id = self.wal.next_tx_id();
+                    self.wal.append(RecordType::TxBegin, &et.name, tx_id, 1, vec![]);
+
+                    #[derive(serde::Serialize)]
+                    struct EdgeDeletePayload<'a> {
+                        edge_type: &'a str,
+                        from_id: &'a str,
+                        to_id: &'a str,
+                    }
+                    let payload = rmp_serde::to_vec_named(&EdgeDeletePayload {
+                        edge_type: &et.name,
+                        from_id: edge.from_id.as_str(),
+                        to_id: edge.to_id.as_str(),
+                    })
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    self.wal.append(RecordType::EdgeDelete, &et.name, tx_id, 1, payload);
+                    self.wal.commit(tx_id).await?;
+
+                    // Fjall delete
+                    self.store.delete_edge(&et.name, edge.from_id.as_str(), edge.to_id.as_str())?;
+
+                    // AdjacencyIndex remove
+                    self.adjacency.remove(&edge.from_id, &et.name, &edge.to_id);
+
+                    pruned += 1;
+                }
+            }
+        }
+        Ok(pruned)
     }
 
     /// Look up which collection an entity belongs to (via the reverse map).
@@ -5972,5 +6042,200 @@ mod tests {
             .collect();
         assert_eq!(venue1_edges.len(), 1, "should not create duplicate edge to venue1");
         assert_eq!(venue1_edges[0].source, EdgeSource::Structural, "original edge should be Structural");
+    }
+
+    // -----------------------------------------------------------------------
+    // DecaySweeper tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn decay_sweeper_prunes_old_inferred_edges() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create source and target collections
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Create edge type with:
+        //  - Exponential decay with very aggressive rate
+        //  - prune_threshold high enough that even fresh edges decay below it quickly
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "performs_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: Some(trondb_tql::DecayConfigDecl {
+                decay_fn: Some(trondb_tql::DecayFnDecl::Exponential),
+                decay_rate: Some(10.0),  // very fast decay
+                floor: Some(0.0),
+                promote_threshold: None,
+                prune_threshold: Some(0.99),  // very high threshold — fresh edges will quickly fall below
+            }),
+            inference_config: Some(crate::edge::InferenceConfig {
+                auto: true,
+                confidence_floor: 0.0,
+                limit: 10,
+            }),
+        })).await.unwrap();
+
+        // Insert target venues
+        insert_entity(
+            &exec, "venues", "venue1",
+            vec![("name", Literal::String("Jazz Club".into()))],
+            Some(vec![0.95, 0.1, 0.0]),
+        ).await;
+        insert_entity(
+            &exec, "venues", "venue2",
+            vec![("name", Literal::String("Rock Bar".into()))],
+            Some(vec![0.5, 0.5, 0.0]),
+        ).await;
+
+        // Insert source artist — this enqueues for background inference
+        insert_entity(
+            &exec, "artists", "artist1",
+            vec![("name", Literal::String("Band A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Drain inference queue to create inferred edges
+        exec.drain_inference_queue().await.unwrap();
+
+        // Verify inferred edges were created
+        let edges_before = exec.adjacency().get(&LogicalId::from_string("artist1"), "performs_at");
+        assert!(!edges_before.is_empty(), "inferred edges should have been created");
+        for edge in &edges_before {
+            assert_eq!(edge.source, EdgeSource::Inferred, "edges should be Inferred");
+        }
+
+        // Small sleep to let decay accumulate (with rate=10.0, even 10ms is massive decay)
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Run the decay sweeper
+        let pruned = exec.sweep_decayed_edges().await.unwrap();
+        assert!(pruned > 0, "decay sweeper should have pruned at least one edge");
+
+        // Verify edges are gone from AdjacencyIndex
+        let edges_after = exec.adjacency().get(&LogicalId::from_string("artist1"), "performs_at");
+        assert!(edges_after.is_empty(), "all inferred edges should have been pruned");
+
+        // Verify edges are gone from Fjall
+        let stored_edges = exec.scan_edges("performs_at").unwrap();
+        let remaining_inferred: Vec<_> = stored_edges.iter()
+            .filter(|e| e.source == EdgeSource::Inferred)
+            .collect();
+        assert!(remaining_inferred.is_empty(), "no inferred edges should remain in Fjall");
+    }
+
+    #[tokio::test]
+    async fn decay_sweeper_skips_structural_and_confirmed_edges() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "people", 3).await;
+
+        // Create edge type with aggressive decay + prune threshold
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: Some(trondb_tql::DecayConfigDecl {
+                decay_fn: Some(trondb_tql::DecayFnDecl::Exponential),
+                decay_rate: Some(10.0),
+                floor: Some(0.0),
+                promote_threshold: None,
+                prune_threshold: Some(0.99),
+            }),
+            inference_config: None,
+        })).await.unwrap();
+
+        // Insert entities
+        insert_entity(
+            &exec, "people", "alice",
+            vec![("name", Literal::String("Alice".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+        insert_entity(
+            &exec, "people", "bob",
+            vec![("name", Literal::String("Bob".into()))],
+            Some(vec![0.0, 1.0, 0.0]),
+        ).await;
+
+        // Create a structural edge via INSERT EDGE
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "alice".into(),
+            to_id: "bob".into(),
+            metadata: vec![],
+        })).await.unwrap();
+
+        // Verify the structural edge exists
+        let edges_before = exec.adjacency().get(&LogicalId::from_string("alice"), "knows");
+        assert_eq!(edges_before.len(), 1);
+        assert_eq!(edges_before[0].source, EdgeSource::Structural);
+
+        // Sleep to let decay accumulate
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Run the decay sweeper
+        let pruned = exec.sweep_decayed_edges().await.unwrap();
+        assert_eq!(pruned, 0, "structural edges should not be pruned");
+
+        // Verify the structural edge still exists
+        let edges_after = exec.adjacency().get(&LogicalId::from_string("alice"), "knows");
+        assert_eq!(edges_after.len(), 1, "structural edge should remain after sweep");
+    }
+
+    #[tokio::test]
+    async fn decay_sweeper_skips_edge_types_without_prune_threshold() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Create edge type WITHOUT prune threshold
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "performs_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: Some(trondb_tql::DecayConfigDecl {
+                decay_fn: Some(trondb_tql::DecayFnDecl::Exponential),
+                decay_rate: Some(10.0),
+                floor: Some(0.0),
+                promote_threshold: None,
+                prune_threshold: None,  // no prune threshold
+            }),
+            inference_config: Some(crate::edge::InferenceConfig {
+                auto: true,
+                confidence_floor: 0.0,
+                limit: 10,
+            }),
+        })).await.unwrap();
+
+        // Insert target venue
+        insert_entity(
+            &exec, "venues", "venue1",
+            vec![("name", Literal::String("Jazz Club".into()))],
+            Some(vec![0.95, 0.1, 0.0]),
+        ).await;
+
+        // Insert source artist
+        insert_entity(
+            &exec, "artists", "artist1",
+            vec![("name", Literal::String("Band A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Drain inference queue
+        exec.drain_inference_queue().await.unwrap();
+
+        let edges_before = exec.adjacency().get(&LogicalId::from_string("artist1"), "performs_at");
+        assert!(!edges_before.is_empty(), "inferred edges should exist");
+
+        // Sleep then sweep
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let pruned = exec.sweep_decayed_edges().await.unwrap();
+        assert_eq!(pruned, 0, "should not prune when no prune_threshold is set");
+
+        // Edges should still be there
+        let edges_after = exec.adjacency().get(&LogicalId::from_string("artist1"), "performs_at");
+        assert_eq!(edges_before.len(), edges_after.len(), "edges should remain unchanged");
     }
 }

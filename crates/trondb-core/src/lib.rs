@@ -48,6 +48,7 @@ pub struct Engine {
     _snapshot_handle: Option<tokio::task::JoinHandle<()>>,
     _hnsw_snapshot_handle: Option<tokio::task::JoinHandle<()>>,
     _inference_sweeper_handle: Option<tokio::task::JoinHandle<()>>,
+    _decay_sweeper_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Engine {
@@ -370,6 +371,21 @@ impl Engine {
             }))
         };
 
+        // Spawn background DecaySweeper task
+        let decay_sweeper_handle = {
+            let executor = Arc::clone(&executor);
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = executor.sweep_decayed_edges().await {
+                        eprintln!("decay sweeper error: {e}");
+                    }
+                }
+            }))
+        };
+
         Ok((Self {
             executor,
             data_dir: config.data_dir.clone(),
@@ -378,6 +394,7 @@ impl Engine {
             _snapshot_handle: snapshot_handle,
             _hnsw_snapshot_handle: hnsw_snapshot_handle,
             _inference_sweeper_handle: inference_sweeper_handle,
+            _decay_sweeper_handle: decay_sweeper_handle,
         }, unhandled_records))
     }
 
@@ -630,6 +647,9 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         // Abort background tasks to prevent them running on a dropping engine
+        if let Some(h) = self._decay_sweeper_handle.take() {
+            h.abort();
+        }
         if let Some(h) = self._inference_sweeper_handle.take() {
             h.abort();
         }
