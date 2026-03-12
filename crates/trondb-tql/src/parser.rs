@@ -456,6 +456,7 @@ impl Parser {
             from_collection,
             to_collection,
             decay_config,
+            inference_config: None,
         }))
     }
 
@@ -1305,6 +1306,7 @@ mod tests {
                 from_collection: "people".to_string(),
                 to_collection: "people".to_string(),
                 decay_config: None,
+                inference_config: None,
             })
         );
     }

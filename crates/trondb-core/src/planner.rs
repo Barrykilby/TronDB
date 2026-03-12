@@ -102,6 +102,7 @@ pub struct CreateEdgeTypePlan {
     pub from_collection: String,
     pub to_collection: String,
     pub decay_config: Option<trondb_tql::DecayConfigDecl>,
+    pub inference_config: Option<trondb_tql::InferenceConfigDecl>,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +338,7 @@ pub fn plan(
             from_collection: s.from_collection.clone(),
             to_collection: s.to_collection.clone(),
             decay_config: s.decay_config.clone(),
+            inference_config: s.inference_config.clone(),
         })),
 
         Statement::InsertEdge(s) => Ok(Plan::InsertEdge(InsertEdgePlan {
@@ -394,6 +396,11 @@ pub fn plan(
             collection: s.collection.clone(),
             assignments: s.assignments.clone(),
         })),
+
+        // Inference statements — plan types added in a later task
+        Statement::Infer(_) => Err(EngineError::UnsupportedOperation("INFER plan not yet implemented".into())),
+        Statement::ConfirmEdge(_) => Err(EngineError::UnsupportedOperation("CONFIRM EDGE plan not yet implemented".into())),
+        Statement::ExplainHistory(_) => Err(EngineError::UnsupportedOperation("EXPLAIN HISTORY plan not yet implemented".into())),
     }
 }
 

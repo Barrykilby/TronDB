@@ -3343,6 +3343,7 @@ mod tests {
             from_collection: "people".into(),
             to_collection: "people".into(),
             decay_config: None,
+            inference_config: None,
         }))
         .await
         .unwrap();
@@ -3416,6 +3417,7 @@ mod tests {
             from_collection: "people".into(),
             to_collection: "people".into(),
             decay_config: None,
+            inference_config: None,
         }))
         .await
         .unwrap();
@@ -3487,6 +3489,7 @@ mod tests {
             from_collection: "people".into(),
             to_collection: "people".into(),
             decay_config: None,
+            inference_config: None,
         }))
         .await
         .unwrap();
@@ -3557,6 +3560,7 @@ mod tests {
             from_collection: "people".into(),
             to_collection: "people".into(),
             decay_config: None,
+            inference_config: None,
         }))
         .await
         .unwrap();
@@ -3627,6 +3631,7 @@ mod tests {
             from_collection: "people".into(),
             to_collection: "people".into(),
             decay_config: None,
+            inference_config: None,
         }))
         .await
         .unwrap();
@@ -3737,6 +3742,7 @@ mod tests {
             from_collection: "people".into(),
             to_collection: "people".into(),
             decay_config: None,
+            inference_config: None,
         }))
         .await
         .unwrap();

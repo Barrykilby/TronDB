@@ -217,6 +217,36 @@ pub enum Token {
     #[token("AUTH", priority = 10, ignore(ascii_case))]
     TokenAuth,
 
+    #[token("INFER", priority = 10, ignore(ascii_case))]
+    Infer,
+
+    #[token("CONFIRM", priority = 10, ignore(ascii_case))]
+    Confirm,
+
+    #[token("RETURNING", priority = 10, ignore(ascii_case))]
+    Returning,
+
+    #[token("TOP", priority = 10, ignore(ascii_case))]
+    Top,
+
+    #[token("HISTORY", priority = 10, ignore(ascii_case))]
+    History,
+
+    #[token("AUTO", priority = 10, ignore(ascii_case))]
+    Auto,
+
+    #[token("EDGES", priority = 10, ignore(ascii_case))]
+    Edges,
+
+    #[token("VIA", priority = 10, ignore(ascii_case))]
+    Via,
+
+    #[token("TYPE", priority = 10, ignore(ascii_case))]
+    Type,
+
+    #[token("ALL", priority = 10, ignore(ascii_case))]
+    All,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
@@ -449,5 +479,85 @@ mod tests {
         assert_eq!(tokens[1], Token::StringLit("/models/bge.onnx".to_string()));
         assert_eq!(tokens[2], Token::TokenDevice);
         assert_eq!(tokens[3], Token::StringLit("cpu".to_string()));
+    }
+
+    #[test]
+    fn lex_infer_keywords() {
+        let tokens = lex("INFER EDGES FROM 'x' RETURNING TOP 5");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Infer,
+                Token::Edges,
+                Token::From,
+                Token::StringLit("x".to_string()),
+                Token::Returning,
+                Token::Top,
+                Token::IntLit(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_confirm_keywords() {
+        let tokens = lex("CONFIRM EDGE FROM 'x' TO 'y' TYPE test CONFIDENCE 0.9");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Confirm,
+                Token::Edge,
+                Token::From,
+                Token::StringLit("x".to_string()),
+                Token::To,
+                Token::StringLit("y".to_string()),
+                Token::Type,
+                Token::Ident("test".to_string()),
+                Token::Confidence,
+                Token::FloatLit(0.9),
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_explain_history_keywords() {
+        let tokens = lex("EXPLAIN HISTORY 'entity1' LIMIT 10");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Explain,
+                Token::History,
+                Token::StringLit("entity1".to_string()),
+                Token::Limit,
+                Token::IntLit(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_infer_auto_keywords() {
+        let tokens = lex("INFER AUTO ALL VIA");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Infer,
+                Token::Auto,
+                Token::All,
+                Token::Via,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_inference_keywords_case_insensitive() {
+        assert_eq!(lex("infer"), vec![Token::Infer]);
+        assert_eq!(lex("CONFIRM"), vec![Token::Confirm]);
+        assert_eq!(lex("Returning"), vec![Token::Returning]);
+        assert_eq!(lex("top"), vec![Token::Top]);
+        assert_eq!(lex("history"), vec![Token::History]);
+        assert_eq!(lex("auto"), vec![Token::Auto]);
+        assert_eq!(lex("edges"), vec![Token::Edges]);
+        assert_eq!(lex("via"), vec![Token::Via]);
+        assert_eq!(lex("TYPE"), vec![Token::Type]);
+        assert_eq!(lex("All"), vec![Token::All]);
     }
 }

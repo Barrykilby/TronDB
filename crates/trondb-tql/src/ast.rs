@@ -16,6 +16,9 @@ pub enum Statement {
     Promote(PromoteStmt),
     ExplainTiers(ExplainTiersStmt),
     Update(UpdateStmt),
+    Infer(InferStmt),
+    ConfirmEdge(ConfirmEdgeStmt),
+    ExplainHistory(ExplainHistoryStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -177,6 +180,7 @@ pub struct CreateEdgeTypeStmt {
     pub from_collection: String,
     pub to_collection: String,
     pub decay_config: Option<DecayConfigDecl>,
+    pub inference_config: Option<InferenceConfigDecl>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -251,4 +255,35 @@ pub struct UpdateStmt {
     pub entity_id: String,
     pub collection: String,
     pub assignments: Vec<(String, Literal)>,
+}
+
+// --- Inference ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferStmt {
+    pub from_id: String,
+    pub edge_types: Vec<String>,       // empty = all applicable
+    pub limit: Option<usize>,          // None = ALL
+    pub confidence_floor: Option<f32>, // CONFIDENCE > threshold
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmEdgeStmt {
+    pub from_id: String,
+    pub to_id: String,
+    pub edge_type: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainHistoryStmt {
+    pub entity_id: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceConfigDecl {
+    pub auto: bool,
+    pub confidence_floor: Option<f32>,
+    pub limit: Option<usize>,
 }

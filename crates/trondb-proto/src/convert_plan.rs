@@ -636,6 +636,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                 from_collection: ce.from_collection,
                 to_collection: ce.to_collection,
                 decay_config: ce.decay_config.as_ref().map(proto_to_decay_config),
+                inference_config: None, // TODO: proto field added in Task 15
             })),
 
             PP::InsertEdge(ie) => {
@@ -977,6 +978,7 @@ mod tests {
                 promote_threshold: Some(0.9),
                 prune_threshold: Some(0.05),
             }),
+            inference_config: None,
         });
         let restored = round_trip(plan);
         match restored {
