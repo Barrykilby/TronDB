@@ -1845,4 +1845,130 @@ mod tests {
         let result = engine.execute_tql("FETCH * FROM events WHERE id = 'e1';").await.unwrap();
         assert_eq!(result.rows.len(), 1);
     }
+
+    #[tokio::test]
+    async fn insert_composite_vector_multiple_fields() {
+        let (engine, _dir) = test_engine().await;
+
+        // Create collection with a 3-field composite representation AND a 1-field atomic one
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                FIELD description TEXT, \
+                FIELD category TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name, description, category), \
+                REPRESENTATION name_only DIMENSIONS 8 FIELDS (name), \
+            );"
+        ).await.unwrap();
+
+        // Register mock vectorisers for both representations
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock.clone());
+        engine.vectoriser_registry().register("events", "name_only", mock);
+
+        // INSERT without explicit vectors — should auto-vectorise both representations
+        engine.execute_tql(
+            "INSERT INTO events (id, name, description, category) VALUES ('e1', 'Jazz Night', 'Live jazz at the Blue Note', 'music');"
+        ).await.unwrap();
+
+        // Verify entity was stored via FETCH
+        let result = engine.execute_tql("FETCH * FROM events WHERE id = 'e1';").await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Jazz Night".into()))
+        );
+        assert_eq!(
+            result.rows[0].values.get("description"),
+            Some(&Value::String("Live jazz at the Blue Note".into()))
+        );
+        assert_eq!(
+            result.rows[0].values.get("category"),
+            Some(&Value::String("music".into()))
+        );
+
+        // Verify HNSW index was populated by searching the semantic representation
+        let result = engine.execute_tql(
+            "SEARCH events NEAR VECTOR [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8] LIMIT 5;"
+        ).await.unwrap();
+        assert_eq!(result.rows.len(), 1, "SEARCH should find the auto-vectorised entity");
+
+        // Insert a second entity and verify both are findable
+        engine.execute_tql(
+            "INSERT INTO events (id, name, description, category) VALUES ('e2', 'Rock Fest', 'Outdoor rock concert', 'music');"
+        ).await.unwrap();
+
+        let result = engine.execute_tql(
+            "SEARCH events NEAR VECTOR [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8] LIMIT 5;"
+        ).await.unwrap();
+        assert_eq!(result.rows.len(), 2, "SEARCH should find both auto-vectorised entities");
+    }
+
+    #[tokio::test]
+    async fn insert_composite_vector_partial_fields() {
+        // Test that auto-vectorisation works when only some FIELDS are present in the entity
+        let (engine, _dir) = test_engine().await;
+
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                FIELD description TEXT, \
+                FIELD category TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name, description, category), \
+            );"
+        ).await.unwrap();
+
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT with only name and description (no category) — should still auto-vectorise
+        // because at least some fields are present
+        engine.execute_tql(
+            "INSERT INTO events (id, name, description) VALUES ('e1', 'Jazz Night', 'Live jazz');"
+        ).await.unwrap();
+
+        let result = engine.execute_tql("FETCH * FROM events WHERE id = 'e1';").await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        // SEARCH should still find it
+        let result = engine.execute_tql(
+            "SEARCH events NEAR VECTOR [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8] LIMIT 5;"
+        ).await.unwrap();
+        assert_eq!(result.rows.len(), 1, "SEARCH should find entity with partial fields");
+    }
+
+    #[tokio::test]
+    async fn insert_composite_vector_no_matching_fields_skips() {
+        // Test that auto-vectorisation is skipped when none of the FIELDS are in the entity
+        let (engine, _dir) = test_engine().await;
+
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                FIELD description TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name, description), \
+            );"
+        ).await.unwrap();
+
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT with only id — no fields match the representation FIELDS
+        // The entity should still be stored (metadata only) but no vector generated
+        engine.execute_tql(
+            "INSERT INTO events (id) VALUES ('e1');"
+        ).await.unwrap();
+
+        let result = engine.execute_tql("FETCH * FROM events WHERE id = 'e1';").await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        // SEARCH should NOT find it since no vector was generated
+        let result = engine.execute_tql(
+            "SEARCH events NEAR VECTOR [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8] LIMIT 5;"
+        ).await.unwrap();
+        assert_eq!(result.rows.len(), 0, "entity with no matching fields should have no vector");
+    }
 }
