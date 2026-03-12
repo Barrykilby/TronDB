@@ -41,12 +41,13 @@ pub struct EngineConfig {
 }
 
 pub struct Engine {
-    executor: Executor,
+    executor: Arc<Executor>,
     data_dir: PathBuf,
     vectoriser_registry: Arc<VectoriserRegistry>,
     inference_audit: Arc<InferenceAuditBuffer>,
     _snapshot_handle: Option<tokio::task::JoinHandle<()>>,
     _hnsw_snapshot_handle: Option<tokio::task::JoinHandle<()>>,
+    _inference_sweeper_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Engine {
@@ -352,6 +353,23 @@ impl Engine {
             None
         };
 
+        let executor = Arc::new(executor);
+
+        // Spawn background InferenceSweeper task
+        let inference_sweeper_handle = {
+            let executor = Arc::clone(&executor);
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = executor.drain_inference_queue().await {
+                        eprintln!("inference sweeper error: {e}");
+                    }
+                }
+            }))
+        };
+
         Ok((Self {
             executor,
             data_dir: config.data_dir.clone(),
@@ -359,6 +377,7 @@ impl Engine {
             inference_audit,
             _snapshot_handle: snapshot_handle,
             _hnsw_snapshot_handle: hnsw_snapshot_handle,
+            _inference_sweeper_handle: inference_sweeper_handle,
         }, unhandled_records))
     }
 
@@ -610,7 +629,10 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // Abort background snapshot tasks to prevent them running on a dropping engine
+        // Abort background tasks to prevent them running on a dropping engine
+        if let Some(h) = self._inference_sweeper_handle.take() {
+            h.abort();
+        }
         if let Some(h) = self._hnsw_snapshot_handle.take() {
             h.abort();
         }

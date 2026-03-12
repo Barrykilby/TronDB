@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 use crate::edge::{AdjacencyIndex, Edge, EdgeSource, EdgeType};
 use crate::error::EngineError;
@@ -43,6 +43,8 @@ pub struct Executor {
     entity_collections: DashMap<LogicalId, String>,
     /// Ring buffer of inference audit entries for EXPLAIN HISTORY
     inference_audit: Arc<InferenceAuditBuffer>,
+    /// RAM-only work queue of entity IDs pending background inference
+    inference_queue: Arc<DashSet<LogicalId>>,
 }
 
 impl Executor {
@@ -66,6 +68,7 @@ impl Executor {
             vectoriser_registry,
             entity_collections: DashMap::new(),
             inference_audit,
+            inference_queue: Arc::new(DashSet::new()),
         }
     }
 
@@ -566,6 +569,14 @@ impl Executor {
                         if values.len() == entry.field_types().len() {
                             entry.insert(&entity_id, &values)?;
                         }
+                    }
+                }
+
+                // Enqueue for background inference if any edge type has auto inference
+                for et in self.edge_types.iter() {
+                    if et.value().inference_config.auto && et.value().from_collection == p.collection {
+                        self.inference_queue.insert(entity_id.clone());
+                        break;
                     }
                 }
 
@@ -1870,6 +1881,14 @@ impl Executor {
                     }
                 }
 
+                // Enqueue for background inference if any edge type has auto inference
+                for et in self.edge_types.iter() {
+                    if et.value().inference_config.auto && et.value().from_collection == p.collection {
+                        self.inference_queue.insert(entity_id.clone());
+                        break;
+                    }
+                }
+
                 Ok(QueryResult {
                     columns: vec!["result".into()],
                     rows: vec![Row {
@@ -1968,6 +1987,136 @@ impl Executor {
 
     pub fn inference_audit(&self) -> &InferenceAuditBuffer {
         &self.inference_audit
+    }
+
+    pub fn inference_queue(&self) -> &Arc<DashSet<LogicalId>> {
+        &self.inference_queue
+    }
+
+    /// Drain the inference work queue and run background inference for each entity.
+    /// For each queued entity, find edge types with `auto` inference from that entity's
+    /// collection, HNSW search in the target collection, and create inferred edges.
+    pub async fn drain_inference_queue(&self) -> Result<usize, EngineError> {
+        let entity_ids: Vec<LogicalId> = self.inference_queue.iter().map(|r| r.key().clone()).collect();
+        let mut processed = 0;
+
+        for entity_id in &entity_ids {
+            self.inference_queue.remove(entity_id);
+
+            // Find entity's collection
+            let collection = match self.entity_collections.get(entity_id) {
+                Some(c) => c.value().clone(),
+                None => continue,
+            };
+
+            // Find edge types with auto inference for this collection
+            let auto_types: Vec<EdgeType> = self.edge_types.iter()
+                .filter(|et| et.value().from_collection == collection && et.value().inference_config.auto)
+                .map(|et| et.value().clone())
+                .collect();
+
+            for et in &auto_types {
+                // Get source entity vector (same pattern as Plan::Infer)
+                let source_entity = match self.store.get(&collection, entity_id) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let source_vector = match source_entity.representations.iter().find_map(|repr| {
+                    if let VectorData::Dense(ref v) = repr.vector {
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                }) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                // Find HNSW index for target collection
+                let target_collection = &et.to_collection;
+                let prefix = format!("{}:", target_collection);
+                let hnsw_key = match self.indexes.iter()
+                    .find(|e| e.key().starts_with(&prefix))
+                    .map(|e| e.key().clone())
+                {
+                    Some(k) => k,
+                    None => continue,
+                };
+
+                let hnsw = match self.indexes.get(&hnsw_key) {
+                    Some(h) => h,
+                    None => continue,
+                };
+
+                // Search using source entity's vector
+                let search_k = et.inference_config.limit * 4;
+                let raw_results = hnsw.search(&source_vector, search_k);
+
+                // Existing edges for this source + edge type
+                let existing_edges = self.adjacency.get(entity_id, &et.name);
+                let existing_targets: HashSet<LogicalId> = existing_edges
+                    .iter()
+                    .map(|e| e.to_id.clone())
+                    .collect();
+
+                let mut created_count = 0;
+
+                for (target_id, score) in raw_results {
+                    if created_count >= et.inference_config.limit {
+                        break;
+                    }
+                    if score < et.inference_config.confidence_floor {
+                        continue;
+                    }
+                    if target_id == *entity_id {
+                        continue; // skip self
+                    }
+                    if existing_targets.contains(&target_id) {
+                        continue; // skip if edge already exists
+                    }
+
+                    let now_millis = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    let edge = Edge {
+                        from_id: entity_id.clone(),
+                        to_id: target_id.clone(),
+                        edge_type: et.name.clone(),
+                        confidence: score,
+                        metadata: HashMap::new(),
+                        created_at: now_millis,
+                        source: EdgeSource::Inferred,
+                    };
+
+                    // WAL write (EdgeInferred)
+                    let tx_id = self.wal.next_tx_id();
+                    self.wal.append(RecordType::TxBegin, &et.name, tx_id, 1, vec![]);
+                    let payload = rmp_serde::to_vec_named(&edge)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    self.wal.append(RecordType::EdgeInferred, &et.name, tx_id, 1, payload);
+                    self.wal.commit(tx_id).await?;
+
+                    // Fjall write
+                    self.store.insert_edge(&edge)?;
+
+                    // AdjacencyIndex update
+                    self.adjacency.insert(
+                        &edge.from_id,
+                        &et.name,
+                        &edge.to_id,
+                        edge.confidence,
+                        edge.created_at,
+                        EdgeSource::Inferred,
+                    );
+
+                    created_count += 1;
+                }
+            }
+            processed += 1;
+        }
+        Ok(processed)
     }
 
     /// Look up which collection an entity belongs to (via the reverse map).
@@ -5621,5 +5770,207 @@ mod tests {
             limit: None,
         })).await.unwrap();
         assert!(result.rows.is_empty(), "EXPLAIN HISTORY for non-inferred entity should be empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // Background inference queue tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn background_inference_creates_inferred_edges() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create source and target collections
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Create edge type with INFER AUTO enabled
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "performs_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: Some(crate::edge::InferenceConfig {
+                auto: true,
+                confidence_floor: 0.0,
+                limit: 10,
+            }),
+        })).await.unwrap();
+
+        // Insert target venues first (so HNSW has something to search)
+        insert_entity(
+            &exec, "venues", "venue1",
+            vec![("name", Literal::String("Jazz Club".into()))],
+            Some(vec![0.95, 0.1, 0.0]),
+        ).await;
+        insert_entity(
+            &exec, "venues", "venue2",
+            vec![("name", Literal::String("Rock Bar".into()))],
+            Some(vec![0.5, 0.5, 0.0]),
+        ).await;
+
+        // Insert source artist — this should enqueue the entity for background inference
+        insert_entity(
+            &exec, "artists", "artist1",
+            vec![("name", Literal::String("Band A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Verify the entity was enqueued
+        assert!(
+            exec.inference_queue().contains(&LogicalId::from_string("artist1")),
+            "artist1 should be in the inference queue after INSERT"
+        );
+
+        // Directly call drain_inference_queue (don't wait for background timer)
+        let processed = exec.drain_inference_queue().await.unwrap();
+        assert_eq!(processed, 1, "should have processed 1 entity from queue");
+
+        // Queue should be empty after drain
+        assert!(exec.inference_queue().is_empty(), "inference queue should be empty after drain");
+
+        // Verify inferred edges were created
+        let edges = exec.adjacency().get(&LogicalId::from_string("artist1"), "performs_at");
+        assert!(!edges.is_empty(), "inferred edges should have been created");
+
+        // All inferred edges should have EdgeSource::Inferred
+        for edge in &edges {
+            assert_eq!(edge.source, EdgeSource::Inferred, "edges should be Inferred");
+            assert!(edge.confidence > 0.0, "confidence should be > 0");
+        }
+
+        // venue1 should be the closest match (most similar vector)
+        let to_ids: Vec<String> = edges.iter().map(|e| e.to_id.to_string()).collect();
+        assert!(to_ids.contains(&"venue1".to_string()), "venue1 should be in inferred edges");
+    }
+
+    #[tokio::test]
+    async fn inference_queue_populated_on_update() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Create edge type with auto inference
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "performs_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: Some(crate::edge::InferenceConfig {
+                auto: true,
+                confidence_floor: 0.0,
+                limit: 10,
+            }),
+        })).await.unwrap();
+
+        // Insert artist
+        insert_entity(
+            &exec, "artists", "artist1",
+            vec![("name", Literal::String("Band A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Drain queue from the INSERT
+        exec.drain_inference_queue().await.unwrap();
+        assert!(exec.inference_queue().is_empty());
+
+        // Update artist — should re-enqueue
+        exec.execute(&Plan::UpdateEntity(crate::planner::UpdateEntityPlan {
+            collection: "artists".into(),
+            entity_id: "artist1".into(),
+            assignments: vec![
+                ("name".into(), Literal::String("Band B".into())),
+            ],
+        })).await.unwrap();
+
+        assert!(
+            exec.inference_queue().contains(&LogicalId::from_string("artist1")),
+            "artist1 should be re-enqueued after UPDATE"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_queue_not_populated_without_auto() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Create edge type WITHOUT auto inference
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "performs_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: None, // default: auto=false
+        })).await.unwrap();
+
+        // Insert artist
+        insert_entity(
+            &exec, "artists", "artist1",
+            vec![("name", Literal::String("Band A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Queue should be empty since no auto inference edge types
+        assert!(
+            exec.inference_queue().is_empty(),
+            "inference queue should be empty when no auto edge types exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_inference_queue_skips_existing_edges() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Create edge type with auto inference
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "performs_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: Some(crate::edge::InferenceConfig {
+                auto: true,
+                confidence_floor: 0.0,
+                limit: 10,
+            }),
+        })).await.unwrap();
+
+        // Insert venues
+        insert_entity(
+            &exec, "venues", "venue1",
+            vec![("name", Literal::String("Jazz Club".into()))],
+            Some(vec![0.95, 0.1, 0.0]),
+        ).await;
+
+        // Insert artist
+        insert_entity(
+            &exec, "artists", "artist1",
+            vec![("name", Literal::String("Band A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Manually insert an edge from artist1 -> venue1 (structural)
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "performs_at".into(),
+            from_id: "artist1".into(),
+            to_id: "venue1".into(),
+            metadata: vec![],
+        })).await.unwrap();
+
+        // Drain the inference queue
+        exec.drain_inference_queue().await.unwrap();
+
+        // The edges for artist1 -> venue1 should still be just the structural one
+        let edges = exec.adjacency().get(&LogicalId::from_string("artist1"), "performs_at");
+        let venue1_edges: Vec<_> = edges.iter()
+            .filter(|e| e.to_id == LogicalId::from_string("venue1"))
+            .collect();
+        assert_eq!(venue1_edges.len(), 1, "should not create duplicate edge to venue1");
+        assert_eq!(venue1_edges[0].source, EdgeSource::Structural, "original edge should be Structural");
     }
 }
