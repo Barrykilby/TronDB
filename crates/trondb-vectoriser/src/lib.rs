@@ -17,3 +17,6 @@ pub mod recipe;
 // Re-exports for convenience
 pub use passthrough::PassthroughVectoriser;
 pub use mock::MockVectoriser;
+pub use network::NetworkVectoriser;
+#[cfg(feature = "external")]
+pub use external::ExternalVectoriser;
