@@ -1245,19 +1245,59 @@ impl Executor {
                     entity.metadata.insert(field.clone(), value);
                 }
 
-                // Step 4: WAL append (reuse EntityWrite — full entity blob)
+                // Step 4: Dirty detection — which representations are affected by changed fields?
+                let changed_fields: HashSet<&str> = p.assignments.iter()
+                    .map(|(f, _)| f.as_str())
+                    .collect();
+
+                let dirty_repr_indices: Vec<u32> = if let Some(ref s) = schema {
+                    s.representations.iter().enumerate()
+                        .filter(|(_, stored_repr)| {
+                            // passthrough representations (no FIELDS) are never dirty from field changes
+                            !stored_repr.fields.is_empty()
+                                && stored_repr.fields.iter().any(|f| changed_fields.contains(f.as_str()))
+                        })
+                        .map(|(idx, _)| idx as u32)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Step 5: WAL append — EntityWrite + ReprDirty records in same transaction
                 let tx_id = self.wal.next_tx_id();
                 self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
                 let payload = rmp_serde::to_vec_named(&entity)
                     .map_err(|e| EngineError::Storage(e.to_string()))?;
                 self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
+
+                // Append ReprDirty WAL records for affected representations
+                for &repr_idx in &dirty_repr_indices {
+                    let repr_key = ReprKey {
+                        entity_id: entity_id.clone(),
+                        repr_index: repr_idx,
+                    };
+                    let dirty_payload = rmp_serde::to_vec_named(&repr_key)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    self.wal.append(RecordType::ReprDirty, &p.collection, tx_id, 1, dirty_payload);
+                }
+
                 self.wal.commit(tx_id).await?;
 
-                // Step 5: Write to Fjall
+                // Step 6: Write to Fjall
                 self.store.insert(&p.collection, entity.clone())?;
                 self.store.persist()?;
 
-                // Step 6: Update field indexes — remove old, insert new
+                // Step 7: Transition Location Table entries to Dirty
+                for &repr_idx in &dirty_repr_indices {
+                    let loc_key = ReprKey {
+                        entity_id: entity_id.clone(),
+                        repr_index: repr_idx,
+                    };
+                    // Best-effort: location entry may not exist (e.g. entity had no vector)
+                    let _ = self.location.transition(&loc_key, LocState::Dirty);
+                }
+
+                // Step 8: Update field indexes — remove old, insert new
                 if let Some(ref s) = schema {
                     for (idx_def, (fidx_key, old_values)) in s.indexes.iter().zip(old_field_values.iter()) {
                         if let Some(fidx) = self.field_indexes.get(fidx_key) {

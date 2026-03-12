@@ -1971,4 +1971,134 @@ mod tests {
         ).await.unwrap();
         assert_eq!(result.rows.len(), 0, "entity with no matching fields should have no vector");
     }
+
+    #[tokio::test]
+    async fn update_marks_managed_repr_dirty() {
+        let (engine, _dir) = test_engine().await;
+
+        // Create collection with a FIELDS-based representation
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                FIELD description TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name, description), \
+            );"
+        ).await.unwrap();
+
+        // Register mock vectoriser
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT — auto-vectorise creates the entity + location entry (Clean)
+        engine.execute_tql(
+            "INSERT INTO events (id, name, description) VALUES ('e1', 'Jazz Night', 'Live jazz');"
+        ).await.unwrap();
+
+        // Verify location entry is Clean before UPDATE
+        let key = crate::location::ReprKey {
+            entity_id: crate::types::LogicalId::from_string("e1"),
+            repr_index: 0,
+        };
+        let desc = engine.location().get(&key).expect("should have location entry after INSERT");
+        assert_eq!(desc.state, crate::location::LocState::Clean, "should be Clean after INSERT");
+
+        // UPDATE a contributing field
+        engine.execute_tql(
+            "UPDATE 'e1' IN events SET name = 'Blues Night';"
+        ).await.unwrap();
+
+        // The representation should now be Dirty in the Location Table
+        let desc = engine.location().get(&key).expect("should still have location entry after UPDATE");
+        assert_eq!(desc.state, crate::location::LocState::Dirty, "should be Dirty after UPDATE of contributing field");
+    }
+
+    #[tokio::test]
+    async fn update_non_contributing_field_stays_clean() {
+        let (engine, _dir) = test_engine().await;
+
+        // Create collection with a representation that depends only on (name, description)
+        // but also has a 'category' field that is NOT in FIELDS
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                FIELD description TEXT, \
+                FIELD category TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name, description), \
+            );"
+        ).await.unwrap();
+
+        // Register mock vectoriser
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT — auto-vectorise creates entity + location entry (Clean)
+        engine.execute_tql(
+            "INSERT INTO events (id, name, description, category) VALUES ('e1', 'Jazz Night', 'Live jazz', 'music');"
+        ).await.unwrap();
+
+        let key = crate::location::ReprKey {
+            entity_id: crate::types::LogicalId::from_string("e1"),
+            repr_index: 0,
+        };
+        let desc = engine.location().get(&key).expect("should have location entry");
+        assert_eq!(desc.state, crate::location::LocState::Clean);
+
+        // UPDATE a field that is NOT in FIELDS (category)
+        engine.execute_tql(
+            "UPDATE 'e1' IN events SET category = 'jazz';"
+        ).await.unwrap();
+
+        // The representation should still be Clean — category is not a contributing field
+        let desc = engine.location().get(&key).expect("should still have location entry");
+        assert_eq!(desc.state, crate::location::LocState::Clean, "should stay Clean after UPDATE of non-contributing field");
+    }
+
+    #[tokio::test]
+    async fn update_marks_only_affected_repr_dirty() {
+        let (engine, _dir) = test_engine().await;
+
+        // Create collection with TWO representations depending on different fields
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                FIELD description TEXT, \
+                FIELD category TEXT, \
+                REPRESENTATION name_repr DIMENSIONS 8 FIELDS (name), \
+                REPRESENTATION desc_repr DIMENSIONS 8 FIELDS (description, category), \
+            );"
+        ).await.unwrap();
+
+        // Register mock vectorisers for both representations
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "name_repr", mock.clone());
+        engine.vectoriser_registry().register("events", "desc_repr", mock);
+
+        // INSERT creates both representations
+        engine.execute_tql(
+            "INSERT INTO events (id, name, description, category) VALUES ('e1', 'Jazz', 'Live jazz', 'music');"
+        ).await.unwrap();
+
+        let key_name = crate::location::ReprKey {
+            entity_id: crate::types::LogicalId::from_string("e1"),
+            repr_index: 0,
+        };
+        let key_desc = crate::location::ReprKey {
+            entity_id: crate::types::LogicalId::from_string("e1"),
+            repr_index: 1,
+        };
+
+        // UPDATE only 'description' — should dirty desc_repr (index 1) but not name_repr (index 0)
+        engine.execute_tql(
+            "UPDATE 'e1' IN events SET description = 'Updated description';"
+        ).await.unwrap();
+
+        let desc_name = engine.location().get(&key_name).expect("name_repr location");
+        let desc_desc = engine.location().get(&key_desc).expect("desc_repr location");
+
+        assert_eq!(desc_name.state, crate::location::LocState::Clean, "name_repr should stay Clean");
+        assert_eq!(desc_desc.state, crate::location::LocState::Dirty, "desc_repr should be Dirty");
+    }
 }
