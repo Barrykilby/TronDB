@@ -1,0 +1,16 @@
+[package]
+name = "trondb-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+trondb-core = { path = "../trondb-core" }
+trondb-tql = { path = "../trondb-tql" }
+trondb-wal = { path = "../trondb-wal" }
+trondb-routing = { path = "../trondb-routing" }
+
+[build-dependencies]
+tonic-build = { workspace = true }

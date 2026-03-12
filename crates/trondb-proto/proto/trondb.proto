@@ -1,0 +1,6 @@
+syntax = "proto3";
+package trondb;
+
+// Placeholder message so tonic_build generates trondb.rs.
+// This file will be replaced in Task 3.
+message Placeholder {}
