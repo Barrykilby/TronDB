@@ -3,3 +3,6 @@ pub mod pb {
 }
 
 pub mod convert_plan;
+pub mod convert_result;
+pub mod convert_wal;
+pub mod convert_health;
