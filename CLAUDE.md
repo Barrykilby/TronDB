@@ -1,11 +1,12 @@
 # TronDB
 
-Inference-first storage engine. Phase 9: Multi-Node Distribution.
+Inference-first storage engine. Phase 10: Pluggable Vectoriser + Mutation Cascade.
 
 ## Project Structure
 
 - `crates/trondb-wal/` — Write-Ahead Log: record types (MessagePack), segment files, buffer, async writer, crash recovery
-- `crates/trondb-core/` — Engine: types, Fjall-backed store, Location Table (DashMap), HNSW index (hnsw_rs), edges (AdjacencyIndex), planner, async executor. Depends on trondb-wal + trondb-tql.
+- `crates/trondb-core/` — Engine: types, Fjall-backed store, Location Table (DashMap), HNSW index (hnsw_rs), edges (AdjacencyIndex), planner, async executor, Vectoriser trait + VectoriserRegistry. Depends on trondb-wal + trondb-tql.
+- `crates/trondb-vectoriser/` — Pluggable vectoriser implementations: PassthroughVectoriser, MockVectoriser, OnnxDenseVectoriser (feature: onnx), OnnxSparseVectoriser (feature: onnx), NetworkVectoriser, ExternalVectoriser (feature: external). Factory function create_vectoriser_from_config(). Depends on trondb-core.
 - `crates/trondb-tql/` — TQL parser (logos lexer + recursive descent). No engine dependency.
 - `crates/trondb-proto/` — Protobuf + tonic codegen: TronNode gRPC service, Plan/Result/WAL/Health message conversions. Depends on trondb-core + trondb-wal + trondb-routing.
 - `crates/trondb-server/` — gRPC server binary: role-based startup (primary/replica/router), WAL streaming replication, write forwarding, scatter-gather SEARCH, health probes. Depends on all crates.
@@ -108,3 +109,23 @@ Inference-first storage engine. Phase 9: Multi-Node Distribution.
   - Container deployment: single binary Dockerfile, 3-node docker-compose.yml (primary + replica + router)
   - Run server: `cargo run -p trondb-server -- --config cluster.toml`
   - Run server with env: `TRONDB_ROLE=primary TRONDB_BIND_ADDR=0.0.0.0:9400 cargo run -p trondb-server`
+- Pluggable Vectoriser + Mutation Cascade (Phase 10)
+  - Vectoriser trait in trondb-core/src/vectoriser.rs: object-safe, async-trait, encode(FieldSet) → VectorData, encode_query(str) → VectorData
+  - VectoriserRegistry: DashMap mapping "{collection}:{repr_name}" → Arc<dyn Vectoriser>
+  - Dependency inversion: trondb-core defines trait, trondb-vectoriser implements, binaries wire
+  - Three vectoriser tiers: Local ONNX (no auth), Network cluster (no auth), External API (Bearer auth)
+  - Feature flags: `onnx` (OnnxDense + OnnxSparse), `external` (ExternalVectoriser)
+  - FIELDS clause on REPRESENTATION declarations for managed representations
+  - VectoriserConfig on CollectionSchema: model, model_path, device, vectoriser_type, endpoint, auth
+  - Auto-vectorise INSERT: detects managed representations (non-empty fields + registered vectoriser), calls encode()
+  - Recipe hash: SHA-256 of model_id + sorted field names, stored per representation for staleness detection
+  - Mutation cascade: UPDATE → detect changed fields → mark affected representations Dirty (WAL-logged) → background recompute → Clean
+  - SEARCH dirty exclusion: entities with Dirty/Recomputing representation excluded from SEARCH on that representation
+  - Natural language SEARCH: NEAR 'text query' USING repr_name → vectoriser.encode_query() → HNSW search
+  - NaturalLanguage search strategy in planner + proto/gRPC transport
+  - WAL record types: ReprDirty (0x21), ReprWrite (0x20) — both replayed on crash recovery
+  - Location Table state machine extended: Clean → Dirty → Recomputing → Clean
+  - Entity→collection reverse lookup: DashMap in executor for O(1) recompute_dirty lookups
+  - Engine::schemas() public method for iterating stored collection schemas
+  - CLI + server startup: iterate schemas, create_vectoriser_from_config() factory, register managed vectorisers
+  - Backwards compatibility: #[serde(default)] on new fields in StoredRepresentation and CollectionSchema

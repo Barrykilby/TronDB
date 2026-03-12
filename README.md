@@ -240,7 +240,7 @@ The HNSW graph topology is never modified under memory pressure. When a hot-tier
 
 ## Current Status
 
-### What's built (Phases 1-9)
+### What's built (Phases 1-10)
 
 | Phase | Deliverable | Status |
 |-------|------------|--------|
@@ -253,19 +253,7 @@ The HNSW graph topology is never modified under memory pressure. When a hot-tier
 | 7 | Edge decay (exponential/linear/step), routing intelligence (health, co-location, semantic) | Done |
 | 8 | UPDATE mutations, HNSW persistence, WAL replay for all record types | Done |
 | 9 | Multi-node (gRPC, WAL streaming, write forwarding, scatter-gather, Docker) | Done |
-
-### In progress (Phase 10)
-
-| Feature | Status |
-|---------|--------|
-| Pluggable Vectoriser trait + registry | Done |
-| PassthroughVectoriser + MockVectoriser | Done |
-| FIELDS clause + VectoriserConfig in schema | In progress |
-| Auto-vectorise INSERT | Planned |
-| Mutation cascade (dirty detection + background recompute) | Planned |
-| Natural language SEARCH (`NEAR 'text'`) | Planned |
-| ONNX dense/sparse vectorisers | Planned |
-| Network + External vectorisers | Planned |
+| 10 | Pluggable vectoriser (ONNX/Network/External), auto-vectorise INSERT, mutation cascade, natural language SEARCH | Done |
 
 ### Planned (Phases 11-15)
 
