@@ -17,7 +17,7 @@ use crate::replication::ReplicaTracker;
 use crate::stream_health::spawn_health_stream;
 
 pub struct TronNodeService {
-    engine: Arc<Engine>,
+    engine: Option<Arc<Engine>>,
     role: NodeRoleConfig,
     primary_channel: Option<tonic::transport::Channel>,  // for write forwarding
     tracker: Option<Arc<ReplicaTracker>>,
@@ -29,7 +29,7 @@ pub struct TronNodeService {
 impl TronNodeService {
     pub fn new(engine: Arc<Engine>, role: NodeRoleConfig) -> Self {
         Self {
-            engine,
+            engine: Some(engine),
             role,
             primary_channel: None,
             tracker: None,
@@ -45,7 +45,7 @@ impl TronNodeService {
         tracker: Arc<ReplicaTracker>,
     ) -> Self {
         Self {
-            engine,
+            engine: Some(engine),
             role,
             primary_channel: None,
             tracker: Some(tracker),
@@ -62,11 +62,28 @@ impl TronNodeService {
         replication_config: ReplicationConfig,
     ) -> Self {
         Self {
-            engine,
+            engine: Some(engine),
             role,
             primary_channel: None,
             tracker: Some(tracker),
             replication_config,
+            location_broadcast: None,
+            system_metrics: Arc::new(SystemMetrics::new()),
+        }
+    }
+
+    /// Create a router service with no local engine.
+    ///
+    /// The router forwards all Execute calls to the primary and returns
+    /// minimal health information. It does not support WAL streaming or
+    /// location update streaming.
+    pub fn new_router(primary_channel: tonic::transport::Channel) -> Self {
+        Self {
+            engine: None,
+            role: NodeRoleConfig::Router,
+            primary_channel: Some(primary_channel),
+            tracker: None,
+            replication_config: ReplicationConfig::default(),
             location_broadcast: None,
             system_metrics: Arc::new(SystemMetrics::new()),
         }
@@ -93,6 +110,14 @@ impl TronNodeService {
             Plan::AlterEntityDropAffinity(_) | Plan::Demote(_) | Plan::Promote(_)
         )
     }
+
+    /// Get a reference to the engine, or return a gRPC error if this is a
+    /// router node (no engine).
+    fn engine_ref(&self) -> Result<&Arc<Engine>, Status> {
+        self.engine.as_ref().ok_or_else(|| {
+            Status::failed_precondition("no local engine (router node)")
+        })
+    }
 }
 
 #[tonic::async_trait]
@@ -104,6 +129,12 @@ impl TronNode for TronNodeService {
         let proto_plan = request.into_inner();
         let plan = Plan::try_from(proto_plan)
             .map_err(|e| Status::invalid_argument(e))?;
+
+        // Router mode: forward ALL calls to the primary (no local engine)
+        if self.engine.is_none() {
+            return self.forward_to_primary(&plan).await;
+        }
+        let engine = self.engine_ref()?;
 
         // Write forwarding: non-primary nodes forward writes to primary
         if self.role != NodeRoleConfig::Primary && Self::is_write_plan(&plan) {
@@ -123,18 +154,18 @@ impl TronNode for TronNodeService {
                 }
 
                 // Capture LSN before execution
-                let lsn_before = self.engine.wal_head_lsn();
+                let lsn_before = engine.wal_head_lsn();
 
                 // Execute locally
-                let result = self.engine.execute(&plan).await
+                let result = engine.execute(&plan).await
                     .map_err(|e| Status::internal(e.to_string()))?;
 
                 // Get LSN after execution; if unchanged, no WAL was written — skip broadcast
-                let lsn_after = self.engine.wal_head_lsn();
+                let lsn_after = engine.wal_head_lsn();
 
                 if lsn_after > lsn_before && tracker.connected_count() > 0 {
                     // Broadcast new WAL records to all replicas
-                    if let Ok(records) = self.engine.wal_records_since(lsn_before).await {
+                    if let Ok(records) = engine.wal_records_since(lsn_before).await {
                         for record in &records {
                             let proto: pb::WalRecordMessage = record.into();
                             tracker.broadcast(&proto).await;
@@ -172,16 +203,16 @@ impl TronNode for TronNodeService {
         }
 
         // Capture LSN before execution for location broadcast
-        let lsn_before = self.engine.wal_head_lsn();
+        let lsn_before = engine.wal_head_lsn();
 
-        let result = self.engine.execute(&plan).await
+        let result = engine.execute(&plan).await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         // Feed LocationUpdate WAL records into the location broadcast channel
         if let Some(ref loc_tx) = self.location_broadcast {
-            let lsn_after = self.engine.wal_head_lsn();
+            let lsn_after = engine.wal_head_lsn();
             if lsn_after > lsn_before {
-                if let Ok(records) = self.engine.wal_records_since(lsn_before).await {
+                if let Ok(records) = engine.wal_records_since(lsn_before).await {
                     for record in &records {
                         if matches!(record.record_type, trondb_wal::RecordType::LocationUpdate) {
                             let msg = pb::LocationUpdateMessage {
@@ -204,6 +235,12 @@ impl TronNode for TronNodeService {
         &self,
         _request: Request<pb::Empty>,
     ) -> Result<Response<pb::HealthSignalResponse>, Status> {
+        // Router nodes without an engine return a minimal health signal
+        if self.engine.is_none() {
+            let signal = self.compute_router_health();
+            let proto: pb::HealthSignalResponse = (&signal).into();
+            return Ok(Response::new(proto));
+        }
         let signal = self.compute_local_health();
         let proto: pb::HealthSignalResponse = (&signal).into();
         Ok(Response::new(proto))
@@ -218,9 +255,10 @@ impl TronNode for TronNodeService {
         &self,
         _: Request<pb::Empty>,
     ) -> Result<Response<Self::StreamHealthStream>, Status> {
+        let engine = self.engine_ref()?;
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         spawn_health_stream(
-            self.engine.clone(),
+            engine.clone(),
             self.role.clone(),
             tx,
             Duration::from_millis(200),
@@ -275,7 +313,7 @@ impl TronNode for TronNodeService {
         tracker.register(replica_id.clone(), wal_tx);
 
         // Step 3: Catch-up — read WAL records after last_confirmed_lsn
-        let engine = self.engine.clone();
+        let engine = self.engine_ref()?.clone();
         let tx_catchup = tx.clone();
         let catchup_lsn = last_confirmed_lsn;
 
@@ -329,6 +367,7 @@ impl TronNode for TronNodeService {
         &self,
         _: Request<pb::Empty>,
     ) -> Result<Response<Self::StreamLocationUpdatesStream>, Status> {
+        let engine = self.engine_ref()?;
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
         // Subscribe to the broadcast channel (if available) before taking
@@ -336,7 +375,7 @@ impl TronNode for TronNodeService {
         // the snapshot and the first recv.
         let bcast_rx = self.location_broadcast.as_ref().map(|s| s.subscribe());
 
-        spawn_location_stream(self.engine.clone(), bcast_rx, tx);
+        spawn_location_stream(engine.clone(), bcast_rx, tx);
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
@@ -346,7 +385,9 @@ impl TronNodeService {
     /// Compute a HealthSignal from the local engine state, using real
     /// CPU/RAM metrics from `sysinfo`.
     fn compute_local_health(&self) -> HealthSignal {
-        let entity_count = self.engine.entity_count() as u64;
+        let entity_count = self.engine.as_ref()
+            .map(|e| e.entity_count() as u64)
+            .unwrap_or(0);
         let cpu = self.system_metrics.cpu_utilisation();
         let ram = self.system_metrics.ram_pressure();
         HealthSignal {
@@ -365,6 +406,34 @@ impl TronNodeService {
             ram_pressure: ram,
             hot_entity_count: entity_count,
             hot_tier_capacity: 100_000,
+            warm_entity_count: 0,
+            archive_entity_count: 0,
+            queue_depth: 0,
+            queue_capacity: 1000,
+            hnsw_p50_ms: 0.0,
+            hnsw_p99_ms: 0.0,
+            replica_lag_ms: None,
+            load_score: 0.0,
+            status: NodeStatus::Healthy,
+        }
+    }
+
+    /// Compute a minimal HealthSignal for router nodes (no local engine).
+    fn compute_router_health(&self) -> HealthSignal {
+        let cpu = self.system_metrics.cpu_utilisation();
+        let ram = self.system_metrics.ram_pressure();
+        HealthSignal {
+            node_id: NodeId::from_string("local"),
+            node_role: NodeRole::Router,
+            signal_ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+            sequence: 0,
+            cpu_utilisation: cpu,
+            ram_pressure: ram,
+            hot_entity_count: 0,
+            hot_tier_capacity: 0,
             warm_entity_count: 0,
             archive_entity_count: 0,
             queue_depth: 0,

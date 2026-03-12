@@ -182,6 +182,16 @@ impl WalWriter {
         Ok(lsn)
     }
 
+    /// Flush the WAL buffer and fsync the current segment to disk.
+    ///
+    /// Unlike `commit`, this does not append a TxCommit record. It simply
+    /// ensures all buffered data in the current segment is written and fsynced.
+    pub async fn flush(&self) -> Result<(), WalError> {
+        let mut seg = self.segment.lock().await;
+        seg.sync().await?;
+        Ok(())
+    }
+
     /// Get the current head LSN (last assigned).
     pub fn head_lsn(&self) -> u64 {
         self.next_lsn.load(Ordering::SeqCst).saturating_sub(1)

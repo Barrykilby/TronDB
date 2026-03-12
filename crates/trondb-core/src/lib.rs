@@ -521,6 +521,55 @@ impl Engine {
     pub fn scan_edges(&self, edge_type: &str) -> Result<Vec<crate::edge::Edge>, EngineError> {
         self.executor.scan_edges(edge_type)
     }
+
+    /// Returns the last WAL LSN that has been applied.
+    ///
+    /// Since WAL records are applied as they arrive, this is effectively
+    /// the same as `wal_head_lsn()`.
+    pub fn last_applied_lsn(&self) -> u64 {
+        self.wal_head_lsn()
+    }
+
+    /// Apply a single WAL record received from the primary during streaming
+    /// replication. This is the runtime equivalent of the WAL replay logic in
+    /// `Engine::open` / `Executor::replay_wal_records`.
+    ///
+    /// Handles the common record types by delegating to the executor's replay
+    /// logic. Control records (TxBegin, TxCommit, TxAbort, Checkpoint) are
+    /// silently skipped since the replica does not need to manage transactions.
+    pub async fn apply_wal_record(&self, record: &WalRecord) -> Result<(), EngineError> {
+        match record.record_type {
+            // Skip control records — replicas do not manage transactions
+            trondb_wal::RecordType::TxBegin
+            | trondb_wal::RecordType::TxCommit
+            | trondb_wal::RecordType::TxAbort
+            | trondb_wal::RecordType::Checkpoint => Ok(()),
+
+            // Delegate all data records to the executor's replay logic
+            _ => {
+                let (replayed, _unhandled) =
+                    self.executor.replay_wal_records(std::slice::from_ref(record))?;
+                if replayed > 0 {
+                    // Trace-level logging for applied records
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Flush the WAL writer's buffer to disk (fsync).
+    pub async fn flush_wal(&self) -> Result<(), EngineError> {
+        self.executor
+            .wal_writer()
+            .flush()
+            .await
+            .map_err(|e| EngineError::Storage(format!("WAL flush failed: {e}")))
+    }
+
+    /// Returns a reference to the location table. Alias for `location()`.
+    pub fn location_table(&self) -> &location::LocationTable {
+        self.location()
+    }
 }
 
 impl Drop for Engine {
