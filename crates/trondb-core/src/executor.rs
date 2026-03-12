@@ -331,12 +331,26 @@ impl Executor {
                         }
                     };
 
+                    // Look up schema representation to get its declared FIELDS list
+                    let stored_repr = schema.representations.iter()
+                        .find(|r| r.name == *repr_name);
+
+                    let recipe_hash = match stored_repr {
+                        Some(sr) if !sr.fields.is_empty() => {
+                            let model_id = schema.vectoriser_config.as_ref()
+                                .and_then(|vc| vc.model.as_deref())
+                                .unwrap_or("unknown");
+                            crate::vectoriser::compute_recipe_hash(model_id, &sr.fields)
+                        }
+                        _ => [0u8; 32], // passthrough — no staleness tracking
+                    };
+
                     let repr = Representation {
                         name: repr_name.clone(),
                         repr_type: ReprType::Atomic,
                         fields: p.fields.clone(),
                         vector: vector_data,
-                        recipe_hash: [0u8; 32],
+                        recipe_hash,
                         state: ReprState::Clean,
                     };
                     entity.representations.push(repr);
