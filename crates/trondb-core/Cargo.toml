@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 trondb-tql = { path = "../trondb-tql" }
 trondb-wal = { path = "../trondb-wal" }
+async-trait.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 bytes.workspace = true
 serde.workspace = true

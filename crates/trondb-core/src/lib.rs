@@ -12,6 +12,7 @@ pub mod index;
 pub mod location;
 pub mod sparse_index;
 pub mod types;
+pub mod vectoriser;
 
 use std::path::PathBuf;
 use std::sync::Arc;

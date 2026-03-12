@@ -2116,6 +2116,7 @@ name = "trondb-core"
 version = "0.1.0"
 dependencies = [
  "anndists",
+ "async-trait",
  "bincode",
  "bytes",
  "dashmap",
@@ -2128,6 +2129,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "trondb-tql",
  "trondb-wal",
  "uuid",
