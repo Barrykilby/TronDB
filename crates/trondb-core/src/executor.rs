@@ -1366,8 +1366,166 @@ impl Executor {
                     },
                 })
             }
-            // Inference plan types — executor implementations added in later tasks
-            Plan::Infer(_) => Err(EngineError::UnsupportedOperation("INFER executor not yet implemented".into())),
+            // -----------------------------------------------------------------
+            // INFER — read-only HNSW similarity search for edge proposals
+            // -----------------------------------------------------------------
+            Plan::Infer(p) => {
+                let source_id = LogicalId::from_string(&p.from_id);
+
+                // Step 1: Find the source entity's collection
+                let source_collection = self.entity_collections.get(&source_id)
+                    .map(|v| v.clone())
+                    .ok_or_else(|| EngineError::InvalidQuery(
+                        format!("entity '{}' not found in any collection", p.from_id),
+                    ))?;
+
+                // Step 2: Retrieve the source entity to get its vector
+                let source_entity = self.store.get(&source_collection, &source_id)?;
+
+                // Extract the first dense vector from the source entity's representations
+                let source_vector = source_entity.representations.iter()
+                    .find_map(|repr| {
+                        if let VectorData::Dense(ref v) = repr.vector {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| EngineError::InvalidQuery(
+                        format!("entity '{}' has no dense vector representation", p.from_id),
+                    ))?;
+
+                // Step 3: Resolve applicable edge types
+                let applicable_edge_types: Vec<EdgeType> = if p.edge_types.is_empty() {
+                    // Find all edge types where from_collection matches source entity's collection
+                    self.edge_types.iter()
+                        .filter(|et| et.from_collection == source_collection)
+                        .map(|et| et.clone())
+                        .collect()
+                } else {
+                    // Look up specified edge types
+                    let mut types = Vec::new();
+                    for et_name in &p.edge_types {
+                        let et = self.edge_types.get(et_name)
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                format!("edge type '{}' not found", et_name),
+                            ))?;
+                        if et.from_collection != source_collection {
+                            return Err(EngineError::InvalidQuery(
+                                format!(
+                                    "edge type '{}' from_collection '{}' does not match entity collection '{}'",
+                                    et_name, et.from_collection, source_collection,
+                                ),
+                            ));
+                        }
+                        types.push(et.clone());
+                    }
+                    types
+                };
+
+                if applicable_edge_types.is_empty() {
+                    return Ok(QueryResult {
+                        columns: vec![
+                            "from_id".into(), "to_id".into(),
+                            "edge_type".into(), "confidence".into(),
+                        ],
+                        rows: vec![],
+                        stats: QueryStats {
+                            elapsed: start.elapsed(),
+                            entities_scanned: 0,
+                            mode: QueryMode::Probabilistic,
+                            tier: "Ram".into(),
+                        },
+                    });
+                }
+
+                // Step 4: For each edge type, HNSW search in target collection
+                let default_limit = 10usize;
+                let global_limit = p.limit.unwrap_or(default_limit);
+                let default_floor = 0.0f32;
+                let confidence_floor = p.confidence_floor.unwrap_or(default_floor);
+
+                let mut all_candidates: Vec<(String, LogicalId, f32)> = Vec::new(); // (edge_type, to_id, score)
+
+                for et in &applicable_edge_types {
+                    let target_collection = &et.to_collection;
+
+                    // Find an HNSW index for the target collection
+                    let prefix = format!("{}:", target_collection);
+                    let hnsw_key = self.indexes.iter()
+                        .find(|e| e.key().starts_with(&prefix))
+                        .map(|e| e.key().clone());
+
+                    let hnsw_key = match hnsw_key {
+                        Some(k) => k,
+                        None => continue, // No HNSW index for target collection — skip
+                    };
+
+                    let hnsw = match self.indexes.get(&hnsw_key) {
+                        Some(h) => h,
+                        None => continue,
+                    };
+
+                    // Search using source entity's vector — over-fetch to account for filtering
+                    let search_k = global_limit * 4;
+                    let raw_results = hnsw.search(&source_vector, search_k);
+
+                    // Step 5: Filter out entities that already have an edge of this type from the source
+                    let existing_edges = self.adjacency.get(&source_id, &et.name);
+                    let existing_targets: HashSet<LogicalId> = existing_edges
+                        .iter()
+                        .map(|e| e.to_id.clone())
+                        .collect();
+
+                    for (candidate_id, score) in raw_results {
+                        // Skip self-references
+                        if candidate_id == source_id {
+                            continue;
+                        }
+                        // Skip entities that already have this edge type from source
+                        if existing_targets.contains(&candidate_id) {
+                            continue;
+                        }
+                        // Step 6: Apply confidence floor filter
+                        if score < confidence_floor {
+                            continue;
+                        }
+                        all_candidates.push((et.name.clone(), candidate_id, score));
+                    }
+                }
+
+                // Step 7: Sort by score descending and apply limit
+                all_candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                all_candidates.truncate(global_limit);
+
+                // Step 8: Build QueryResult rows
+                let mut rows = Vec::new();
+                for (edge_type_name, to_id, score) in &all_candidates {
+                    let mut values = HashMap::new();
+                    values.insert("from_id".into(), Value::String(p.from_id.clone()));
+                    values.insert("to_id".into(), Value::String(to_id.to_string()));
+                    values.insert("edge_type".into(), Value::String(edge_type_name.clone()));
+                    values.insert("confidence".into(), Value::Float(*score as f64));
+                    rows.push(Row {
+                        values,
+                        score: Some(*score),
+                    });
+                }
+
+                Ok(QueryResult {
+                    columns: vec![
+                        "from_id".into(), "to_id".into(),
+                        "edge_type".into(), "confidence".into(),
+                    ],
+                    rows,
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: all_candidates.len(),
+                        mode: QueryMode::Probabilistic,
+                        tier: "Ram".into(),
+                    },
+                })
+            }
             Plan::ConfirmEdge(_) => Err(EngineError::UnsupportedOperation("CONFIRM EDGE executor not yet implemented".into())),
             Plan::ExplainHistory(_) => Err(EngineError::UnsupportedOperation("EXPLAIN HISTORY executor not yet implemented".into())),
 
@@ -2101,7 +2259,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, FetchPlan, FetchStrategy, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
+    use crate::planner::{CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -4651,5 +4809,316 @@ mod tests {
             fetched.metadata.get("name"),
             Some(&Value::String("Metal".into()))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // INFER executor tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn infer_proposes_edges_sorted_by_similarity() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create two collections: artists (source) and venues (target)
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert source artist with a known vector
+        insert_entity(
+            &exec, "artists", "artist1",
+            vec![("name", Literal::String("Band A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Insert target venues with vectors at various similarities to artist1
+        // venue_close: very similar vector to artist1
+        insert_entity(
+            &exec, "venues", "venue_close",
+            vec![("name", Literal::String("Close Venue".into()))],
+            Some(vec![0.95, 0.1, 0.0]),
+        ).await;
+        // venue_mid: moderately similar
+        insert_entity(
+            &exec, "venues", "venue_mid",
+            vec![("name", Literal::String("Mid Venue".into()))],
+            Some(vec![0.5, 0.5, 0.0]),
+        ).await;
+        // venue_far: dissimilar
+        insert_entity(
+            &exec, "venues", "venue_far",
+            vec![("name", Literal::String("Far Venue".into()))],
+            Some(vec![0.0, 0.0, 1.0]),
+        ).await;
+
+        // Create edge type: performs_at (artists -> venues)
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "performs_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Run INFER
+        let result = exec.execute(&Plan::Infer(InferPlan {
+            from_id: "artist1".into(),
+            edge_types: vec!["performs_at".into()],
+            limit: Some(10),
+            confidence_floor: None,
+        })).await.unwrap();
+
+        // Should have proposals
+        assert!(!result.rows.is_empty(), "INFER should return proposals");
+
+        // Results should be sorted by score descending
+        let scores: Vec<f32> = result.rows.iter()
+            .map(|r| r.score.unwrap())
+            .collect();
+        for w in scores.windows(2) {
+            assert!(w[0] >= w[1], "Results should be sorted by score descending: {} >= {}", w[0], w[1]);
+        }
+
+        // First result should be venue_close (most similar)
+        let first_to_id = result.rows[0].values.get("to_id").unwrap();
+        assert_eq!(*first_to_id, Value::String("venue_close".into()),
+            "First proposal should be the most similar entity");
+
+        // All rows should have correct column values
+        for row in &result.rows {
+            assert_eq!(row.values.get("from_id"), Some(&Value::String("artist1".into())));
+            assert_eq!(row.values.get("edge_type"), Some(&Value::String("performs_at".into())));
+            assert!(row.values.get("to_id").is_some());
+            assert!(row.values.get("confidence").is_some());
+        }
+
+        // Stats should be Probabilistic
+        assert_eq!(result.stats.mode, QueryMode::Probabilistic);
+    }
+
+    #[tokio::test]
+    async fn infer_excludes_existing_edges() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collections
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert entities
+        insert_entity(
+            &exec, "artists", "art1",
+            vec![("name", Literal::String("Artist 1".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+        insert_entity(
+            &exec, "venues", "ven1",
+            vec![("name", Literal::String("Venue 1".into()))],
+            Some(vec![0.95, 0.1, 0.0]),
+        ).await;
+        insert_entity(
+            &exec, "venues", "ven2",
+            vec![("name", Literal::String("Venue 2".into()))],
+            Some(vec![0.9, 0.2, 0.0]),
+        ).await;
+
+        // Create edge type
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "plays_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Insert an edge from art1 -> ven1 (so ven1 should be excluded from INFER results)
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "plays_at".into(),
+            from_id: "art1".into(),
+            to_id: "ven1".into(),
+            metadata: vec![],
+        })).await.unwrap();
+
+        // Run INFER
+        let result = exec.execute(&Plan::Infer(InferPlan {
+            from_id: "art1".into(),
+            edge_types: vec!["plays_at".into()],
+            limit: Some(10),
+            confidence_floor: None,
+        })).await.unwrap();
+
+        // ven1 should NOT appear in results (already has an edge)
+        let to_ids: Vec<String> = result.rows.iter()
+            .map(|r| match r.values.get("to_id").unwrap() {
+                Value::String(s) => s.clone(),
+                _ => panic!("expected string"),
+            })
+            .collect();
+        assert!(!to_ids.contains(&"ven1".to_string()),
+            "Entities with existing edges should be excluded from INFER results");
+        // ven2 SHOULD appear
+        assert!(to_ids.contains(&"ven2".to_string()),
+            "Entities without existing edges should appear in INFER results");
+    }
+
+    #[tokio::test]
+    async fn infer_applies_confidence_floor() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "src", 3).await;
+        create_collection(&exec, "tgt", 3).await;
+
+        insert_entity(
+            &exec, "src", "s1",
+            vec![],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Insert target with a moderately similar vector
+        insert_entity(
+            &exec, "tgt", "t1",
+            vec![],
+            Some(vec![0.5, 0.5, 0.0]),
+        ).await;
+        // Insert target with a very similar vector
+        insert_entity(
+            &exec, "tgt", "t2",
+            vec![],
+            Some(vec![0.99, 0.01, 0.0]),
+        ).await;
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "related".into(),
+            from_collection: "src".into(),
+            to_collection: "tgt".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Run INFER with a high confidence floor — only the very similar entity should pass
+        let result = exec.execute(&Plan::Infer(InferPlan {
+            from_id: "s1".into(),
+            edge_types: vec!["related".into()],
+            limit: Some(10),
+            confidence_floor: Some(0.95),
+        })).await.unwrap();
+
+        // t2 (very similar) should be included, t1 may be filtered out
+        let to_ids: Vec<String> = result.rows.iter()
+            .map(|r| match r.values.get("to_id").unwrap() {
+                Value::String(s) => s.clone(),
+                _ => panic!("expected string"),
+            })
+            .collect();
+        assert!(to_ids.contains(&"t2".to_string()),
+            "Highly similar entity should pass the confidence floor");
+        // With floor 0.95, the moderately similar entity (cosine ~0.707) should be excluded
+        assert!(!to_ids.contains(&"t1".to_string()),
+            "Moderately similar entity should be below the confidence floor");
+    }
+
+    #[tokio::test]
+    async fn infer_applies_limit() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "src", 3).await;
+        create_collection(&exec, "tgt", 3).await;
+
+        insert_entity(
+            &exec, "src", "s1",
+            vec![],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Insert many target entities
+        for i in 0..5 {
+            let frac = 1.0 - (i as f64 * 0.1);
+            insert_entity(
+                &exec, "tgt", &format!("t{}", i),
+                vec![],
+                Some(vec![frac, 1.0 - frac, 0.0]),
+            ).await;
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "linked".into(),
+            from_collection: "src".into(),
+            to_collection: "tgt".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // INFER with limit 2
+        let result = exec.execute(&Plan::Infer(InferPlan {
+            from_id: "s1".into(),
+            edge_types: vec!["linked".into()],
+            limit: Some(2),
+            confidence_floor: None,
+        })).await.unwrap();
+
+        assert!(result.rows.len() <= 2, "INFER should respect the limit: got {} rows", result.rows.len());
+    }
+
+    #[tokio::test]
+    async fn infer_auto_discovers_edge_types() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "people", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        insert_entity(
+            &exec, "people", "p1",
+            vec![],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+        insert_entity(
+            &exec, "venues", "v1",
+            vec![],
+            Some(vec![0.9, 0.1, 0.0]),
+        ).await;
+
+        // Create edge type: visits (people -> venues)
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "visits".into(),
+            from_collection: "people".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Run INFER with empty edge_types — should auto-discover "visits"
+        let result = exec.execute(&Plan::Infer(InferPlan {
+            from_id: "p1".into(),
+            edge_types: vec![],
+            limit: Some(10),
+            confidence_floor: None,
+        })).await.unwrap();
+
+        assert!(!result.rows.is_empty(), "INFER with empty edge_types should auto-discover applicable types");
+        assert_eq!(
+            result.rows[0].values.get("edge_type"),
+            Some(&Value::String("visits".into())),
+        );
+    }
+
+    #[tokio::test]
+    async fn infer_returns_empty_for_no_applicable_types() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "lonely", 3).await;
+
+        insert_entity(
+            &exec, "lonely", "l1",
+            vec![],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // No edge types defined — INFER should return empty
+        let result = exec.execute(&Plan::Infer(InferPlan {
+            from_id: "l1".into(),
+            edge_types: vec![],
+            limit: Some(10),
+            confidence_floor: None,
+        })).await.unwrap();
+
+        assert!(result.rows.is_empty(), "INFER with no applicable edge types should return empty");
     }
 }
