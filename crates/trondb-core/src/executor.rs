@@ -154,6 +154,48 @@ impl Executor {
                     self.store.delete_edge(&payload.edge_type, &payload.from_id, &payload.to_id)?;
                     replayed += 1;
                 }
+                RecordType::ReprDirty => {
+                    // Payload is a serialized ReprKey (entity_id + repr_index)
+                    let repr_key: ReprKey = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    if self.location.get(&repr_key).is_some() {
+                        // Best-effort: transition may fail if already Dirty
+                        let _ = self.location.transition(&repr_key, LocState::Dirty);
+                    }
+                    replayed += 1;
+                }
+                RecordType::ReprWrite => {
+                    // Payload is a full serialized Entity (same format as EntityWrite)
+                    let entity: Entity = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+                    // Track entity → collection mapping (for recompute_dirty)
+                    self.entity_collections.insert(entity.id.clone(), record.collection.clone());
+
+                    // Write entity to Fjall (idempotent: WAL is authoritative)
+                    if self.store.has_collection(&record.collection) {
+                        self.store.insert(&record.collection, entity.clone())?;
+                    }
+
+                    // Transition affected repr location entries to Clean
+                    for (idx, _repr) in entity.representations.iter().enumerate() {
+                        let loc_key = ReprKey {
+                            entity_id: entity.id.clone(),
+                            repr_index: idx as u32,
+                        };
+                        if let Some(loc) = self.location.get(&loc_key) {
+                            if loc.state == LocState::Dirty {
+                                // Dirty → Recomputing → Clean
+                                let _ = self.location.transition(&loc_key, LocState::Recomputing);
+                                let _ = self.location.transition(&loc_key, LocState::Clean);
+                            } else if loc.state == LocState::Recomputing {
+                                // Recomputing → Clean
+                                let _ = self.location.transition(&loc_key, LocState::Clean);
+                            }
+                        }
+                    }
+                    replayed += 1;
+                }
                 _ => {
                     unhandled.push(record.clone());
                 }
@@ -4270,6 +4312,316 @@ mod tests {
         assert_eq!(
             result.rows[0].values.get("id"),
             Some(&Value::String("v1".into()))
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL replay: ReprDirty / ReprWrite
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn wal_replay_repr_dirty_transitions_location_to_dirty() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "events", 4).await;
+
+        // Insert an entity so we have a Fjall record
+        insert_entity(
+            &exec,
+            "events",
+            "e1",
+            vec![("name", Literal::String("Jazz".into()))],
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+        )
+        .await;
+
+        // Register a location entry for the entity's representation (Clean)
+        let repr_key = ReprKey {
+            entity_id: LogicalId::from_string("e1"),
+            repr_index: 0,
+        };
+        exec.location.register(
+            repr_key.clone(),
+            LocationDescriptor {
+                tier: Tier::Fjall,
+                node_address: NodeAddress::localhost(),
+                state: LocState::Clean,
+                version: 1,
+                encoding: Encoding::Float32,
+                last_accessed: 0,
+            },
+        );
+
+        // Build a ReprDirty WAL record
+        let dirty_payload = rmp_serde::to_vec_named(&repr_key).unwrap();
+        let wal_record = WalRecord {
+            lsn: 100,
+            ts: 0,
+            tx_id: 50,
+            record_type: RecordType::ReprDirty,
+            schema_ver: 1,
+            collection: "events".into(),
+            payload: dirty_payload,
+        };
+
+        let (replayed, unhandled) = exec.replay_wal_records(&[wal_record]).unwrap();
+        assert_eq!(replayed, 1);
+        assert!(unhandled.is_empty());
+
+        // Location should now be Dirty
+        let loc = exec.location.get(&repr_key).unwrap();
+        assert_eq!(loc.state, LocState::Dirty);
+    }
+
+    #[tokio::test]
+    async fn wal_replay_repr_dirty_skips_missing_location() {
+        let (exec, _dir) = setup_executor().await;
+
+        // No location entry registered — ReprDirty should still count as replayed
+        let repr_key = ReprKey {
+            entity_id: LogicalId::from_string("ghost"),
+            repr_index: 0,
+        };
+        let dirty_payload = rmp_serde::to_vec_named(&repr_key).unwrap();
+        let wal_record = WalRecord {
+            lsn: 101,
+            ts: 0,
+            tx_id: 51,
+            record_type: RecordType::ReprDirty,
+            schema_ver: 1,
+            collection: "events".into(),
+            payload: dirty_payload,
+        };
+
+        let (replayed, unhandled) = exec.replay_wal_records(&[wal_record]).unwrap();
+        assert_eq!(replayed, 1);
+        assert!(unhandled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wal_replay_repr_write_stores_entity_and_cleans_location() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "events", 4).await;
+
+        // Build an entity with one representation
+        let entity = Entity {
+            id: LogicalId::from_string("e1"),
+            raw_data: bytes::Bytes::new(),
+            metadata: {
+                let mut m = HashMap::new();
+                m.insert("name".into(), Value::String("Blues".into()));
+                m
+            },
+            representations: vec![Representation {
+                name: "default".into(),
+                repr_type: ReprType::Atomic,
+                fields: vec!["name".into()],
+                vector: VectorData::Dense(vec![0.5, 0.5, 0.0, 0.0]),
+                recipe_hash: [0u8; 32],
+                state: ReprState::Clean,
+            }],
+            schema_version: 1,
+        };
+
+        // Register the location entry in Dirty state (simulates crash after UPDATE)
+        let repr_key = ReprKey {
+            entity_id: LogicalId::from_string("e1"),
+            repr_index: 0,
+        };
+        exec.location.register(
+            repr_key.clone(),
+            LocationDescriptor {
+                tier: Tier::Fjall,
+                node_address: NodeAddress::localhost(),
+                state: LocState::Clean,
+                version: 1,
+                encoding: Encoding::Float32,
+                last_accessed: 0,
+            },
+        );
+        // Transition to Dirty to simulate the state after UPDATE
+        exec.location.transition(&repr_key, LocState::Dirty).unwrap();
+        assert_eq!(exec.location.get(&repr_key).unwrap().state, LocState::Dirty);
+
+        // Build a ReprWrite WAL record (payload is the full entity)
+        let payload = rmp_serde::to_vec_named(&entity).unwrap();
+        let wal_record = WalRecord {
+            lsn: 200,
+            ts: 0,
+            tx_id: 60,
+            record_type: RecordType::ReprWrite,
+            schema_ver: 1,
+            collection: "events".into(),
+            payload,
+        };
+
+        let (replayed, unhandled) = exec.replay_wal_records(&[wal_record]).unwrap();
+        assert_eq!(replayed, 1);
+        assert!(unhandled.is_empty());
+
+        // Location should now be Clean (Dirty → Recomputing → Clean)
+        let loc = exec.location.get(&repr_key).unwrap();
+        assert_eq!(loc.state, LocState::Clean);
+
+        // Entity should be in Fjall
+        let fetched_entity = exec.store.get("events", &LogicalId::from_string("e1")).unwrap();
+        assert_eq!(
+            fetched_entity.metadata.get("name"),
+            Some(&Value::String("Blues".into()))
+        );
+
+        // entity_collections mapping should be set
+        assert_eq!(
+            exec.entity_collections.get(&LogicalId::from_string("e1")).map(|r| r.clone()),
+            Some("events".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn wal_replay_repr_write_cleans_recomputing_location() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "events", 4).await;
+
+        let entity = Entity {
+            id: LogicalId::from_string("e2"),
+            raw_data: bytes::Bytes::new(),
+            metadata: HashMap::new(),
+            representations: vec![Representation {
+                name: "default".into(),
+                repr_type: ReprType::Atomic,
+                fields: vec![],
+                vector: VectorData::Dense(vec![1.0, 0.0, 0.0, 0.0]),
+                recipe_hash: [0u8; 32],
+                state: ReprState::Clean,
+            }],
+            schema_version: 1,
+        };
+
+        // Register location entry and transition to Recomputing
+        let repr_key = ReprKey {
+            entity_id: LogicalId::from_string("e2"),
+            repr_index: 0,
+        };
+        exec.location.register(
+            repr_key.clone(),
+            LocationDescriptor {
+                tier: Tier::Fjall,
+                node_address: NodeAddress::localhost(),
+                state: LocState::Clean,
+                version: 1,
+                encoding: Encoding::Float32,
+                last_accessed: 0,
+            },
+        );
+        exec.location.transition(&repr_key, LocState::Dirty).unwrap();
+        exec.location.transition(&repr_key, LocState::Recomputing).unwrap();
+        assert_eq!(exec.location.get(&repr_key).unwrap().state, LocState::Recomputing);
+
+        let payload = rmp_serde::to_vec_named(&entity).unwrap();
+        let wal_record = WalRecord {
+            lsn: 300,
+            ts: 0,
+            tx_id: 70,
+            record_type: RecordType::ReprWrite,
+            schema_ver: 1,
+            collection: "events".into(),
+            payload,
+        };
+
+        let (replayed, _) = exec.replay_wal_records(&[wal_record]).unwrap();
+        assert_eq!(replayed, 1);
+
+        // Should be Clean (Recomputing → Clean)
+        let loc = exec.location.get(&repr_key).unwrap();
+        assert_eq!(loc.state, LocState::Clean);
+    }
+
+    #[tokio::test]
+    async fn wal_replay_repr_dirty_then_repr_write_full_cycle() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "events", 4).await;
+
+        // Insert entity via normal path
+        insert_entity(
+            &exec,
+            "events",
+            "e3",
+            vec![("name", Literal::String("Rock".into()))],
+            Some(vec![0.0, 1.0, 0.0, 0.0]),
+        )
+        .await;
+
+        // Register location for repr 0
+        let repr_key = ReprKey {
+            entity_id: LogicalId::from_string("e3"),
+            repr_index: 0,
+        };
+        exec.location.register(
+            repr_key.clone(),
+            LocationDescriptor {
+                tier: Tier::Fjall,
+                node_address: NodeAddress::localhost(),
+                state: LocState::Clean,
+                version: 1,
+                encoding: Encoding::Float32,
+                last_accessed: 0,
+            },
+        );
+
+        // Simulate replay: first ReprDirty, then ReprWrite
+        let dirty_payload = rmp_serde::to_vec_named(&repr_key).unwrap();
+        let dirty_record = WalRecord {
+            lsn: 400,
+            ts: 0,
+            tx_id: 80,
+            record_type: RecordType::ReprDirty,
+            schema_ver: 1,
+            collection: "events".into(),
+            payload: dirty_payload,
+        };
+
+        let updated_entity = Entity {
+            id: LogicalId::from_string("e3"),
+            raw_data: bytes::Bytes::new(),
+            metadata: {
+                let mut m = HashMap::new();
+                m.insert("name".into(), Value::String("Metal".into()));
+                m
+            },
+            representations: vec![Representation {
+                name: "default".into(),
+                repr_type: ReprType::Atomic,
+                fields: vec!["name".into()],
+                vector: VectorData::Dense(vec![0.0, 0.0, 1.0, 0.0]),
+                recipe_hash: [0u8; 32],
+                state: ReprState::Clean,
+            }],
+            schema_version: 1,
+        };
+        let write_payload = rmp_serde::to_vec_named(&updated_entity).unwrap();
+        let write_record = WalRecord {
+            lsn: 401,
+            ts: 0,
+            tx_id: 81,
+            record_type: RecordType::ReprWrite,
+            schema_ver: 1,
+            collection: "events".into(),
+            payload: write_payload,
+        };
+
+        // Replay both in order
+        let (replayed, unhandled) = exec.replay_wal_records(&[dirty_record, write_record]).unwrap();
+        assert_eq!(replayed, 2);
+        assert!(unhandled.is_empty());
+
+        // Final state should be Clean
+        let loc = exec.location.get(&repr_key).unwrap();
+        assert_eq!(loc.state, LocState::Clean);
+
+        // Entity should have the updated data
+        let fetched = exec.store.get("events", &LogicalId::from_string("e3")).unwrap();
+        assert_eq!(
+            fetched.metadata.get("name"),
+            Some(&Value::String("Metal".into()))
         );
     }
 }
