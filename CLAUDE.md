@@ -1,16 +1,18 @@
 # TronDB
 
-Inference-first storage engine. Phase 8: UPDATE, WAL Replay, HNSW Persistence.
+Inference-first storage engine. Phase 9: Multi-Node Distribution.
 
 ## Project Structure
 
 - `crates/trondb-wal/` — Write-Ahead Log: record types (MessagePack), segment files, buffer, async writer, crash recovery
 - `crates/trondb-core/` — Engine: types, Fjall-backed store, Location Table (DashMap), HNSW index (hnsw_rs), edges (AdjacencyIndex), planner, async executor. Depends on trondb-wal + trondb-tql.
 - `crates/trondb-tql/` — TQL parser (logos lexer + recursive descent). No engine dependency.
+- `crates/trondb-proto/` — Protobuf + tonic codegen: TronNode gRPC service, Plan/Result/WAL/Health message conversions. Depends on trondb-core + trondb-wal + trondb-routing.
+- `crates/trondb-server/` — gRPC server binary: role-based startup (primary/replica/router), WAL streaming replication, write forwarding, scatter-gather SEARCH, health probes. Depends on all crates.
 - `crates/trondb-cli/` — Interactive REPL binary (Tokio + rustyline). Depends on all crates.
 - Routing Intelligence: SemanticRouter with health signals, co-location, semantic routing
   - `crates/trondb-routing/` — Routing layer: health signals, co-location, semantic router. Depends on trondb-core + trondb-wal + trondb-tql.
-  - NodeHandle trait: LocalNode (in-process), SimulatedNode (tests), RemoteNode (Phase 6b)
+  - NodeHandle trait: LocalNode (in-process), SimulatedNode (tests), RemoteNode (gRPC)
   - HealthSignal + HealthCache: load score computation (RAM 0.35, queue 0.30, CPU 0.20, HNSW 0.10, lag 0.05)
   - AffinityIndex: explicit groups (WAL-logged, Fjall-persisted) + implicit co-occurrence (RAM-only)
   - Candidate scoring: health (40%) + verb fit (30%) + entity affinity (30%)
@@ -89,3 +91,20 @@ Inference-first storage engine. Phase 8: UPDATE, WAL Replay, HNSW Persistence.
 - CREATE COLLECTION: block syntax with REPRESENTATION, FIELD, INDEX declarations
 - INSERT: named representation vectors (REPRESENTATION name VECTOR/SPARSE)
 - EXPLAIN: shows strategy, index names, pre-filter details
+- Multi-Node Distribution (Phase 9)
+  - gRPC transport via tonic: TronNode service with Execute, HealthSnapshot, StreamHealth, StreamWal, StreamLocationUpdates RPCs
+  - Protobuf serialisation: all 16 Plan variants + nested TQL types, bidirectional conversions
+  - Server roles: Primary (write authority), Replica (WAL-streaming read replica), Router (stateless query router)
+  - WAL streaming replication: bidirectional gRPC stream, ReplicaTracker, semi-synchronous writes (min_ack_replicas, ack_timeout_ms)
+  - Write forwarding: replica/router nodes proxy write plans to primary via Execute RPC
+  - Location Table streaming: primary broadcasts snapshot + deltas to router nodes
+  - Scatter-gather SEARCH: fan-out to multiple nodes, merge results (score sort for dense, RRF for hybrid)
+  - RemoteNode: NodeHandle implementation over gRPC (execute + health_snapshot)
+  - Real metrics: SystemMetrics (sysinfo CPU/RAM), RollingPercentile (HNSW latency), QueryCounter (RAII guard)
+  - Startup wiring: process_pending_wal_records replays AffinityGroup + TierMigration records on restart
+  - Graceful shutdown: SIGTERM handler, WAL flush, HNSW snapshot save, background task abort
+  - tonic-health integration: gRPC health probes for readiness/liveness checks
+  - Cluster config: TOML file + environment variable overrides for container deployment
+  - Container deployment: single binary Dockerfile, 3-node docker-compose.yml (primary + replica + router)
+  - Run server: `cargo run -p trondb-server -- --config cluster.toml`
+  - Run server with env: `TRONDB_ROLE=primary TRONDB_BIND_ADDR=0.0.0.0:9400 cargo run -p trondb-server`

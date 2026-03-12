@@ -5,7 +5,6 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 use trondb_core::Engine;
 use trondb_core::planner::Plan;
-use trondb_core::result::QueryResult;
 use trondb_proto::pb;
 use trondb_proto::pb::tron_node_server::TronNode;
 use trondb_routing::health::{HealthSignal, NodeStatus};
@@ -113,6 +112,7 @@ impl TronNodeService {
 
     /// Get a reference to the engine, or return a gRPC error if this is a
     /// router node (no engine).
+    #[allow(clippy::result_large_err)]
     fn engine_ref(&self) -> Result<&Arc<Engine>, Status> {
         self.engine.as_ref().ok_or_else(|| {
             Status::failed_precondition("no local engine (router node)")
@@ -128,7 +128,7 @@ impl TronNode for TronNodeService {
     ) -> Result<Response<pb::QueryResponse>, Status> {
         let proto_plan = request.into_inner();
         let plan = Plan::try_from(proto_plan)
-            .map_err(|e| Status::invalid_argument(e))?;
+            .map_err(Status::invalid_argument)?;
 
         // Router mode: forward ALL calls to the primary (no local engine)
         if self.engine.is_none() {
@@ -259,7 +259,7 @@ impl TronNode for TronNodeService {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         spawn_health_stream(
             engine.clone(),
-            self.role.clone(),
+            self.role,
             tx,
             Duration::from_millis(200),
         );
@@ -475,6 +475,7 @@ fn uuid_v4_simple() -> String {
 mod tests {
     use super::*;
     use trondb_core::planner::*;
+    use trondb_core::result::QueryResult;
 
     /// Create a temporary EngineConfig for testing.
     fn test_config() -> trondb_core::EngineConfig {

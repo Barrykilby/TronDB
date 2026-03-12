@@ -23,6 +23,7 @@ impl std::error::Error for ReplicationError {}
 
 struct ReplicaState {
     confirmed_lsn: u64,
+    #[allow(dead_code)]
     connected_at: std::time::Instant,
     sender: mpsc::Sender<pb::WalRecordMessage>,
 }

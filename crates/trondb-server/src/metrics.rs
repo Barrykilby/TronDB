@@ -15,6 +15,12 @@ pub struct SystemMetrics {
     system: Mutex<System>,
 }
 
+impl Default for SystemMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SystemMetrics {
     /// Create a new `SystemMetrics` instance. An initial CPU refresh is
     /// performed so that the first call to [`cpu_utilisation`] returns a
@@ -110,6 +116,12 @@ impl RollingPercentile {
 /// when the returned [`QueryCounterGuard`] is dropped.
 pub struct QueryCounter {
     count: AtomicU32,
+}
+
+impl Default for QueryCounter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QueryCounter {

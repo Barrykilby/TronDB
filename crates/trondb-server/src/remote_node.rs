@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use tonic::transport::Channel;
 use trondb_core::error::EngineError;
@@ -56,7 +54,7 @@ impl NodeHandle for RemoteNode {
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         QueryResult::try_from(response.into_inner())
-            .map_err(|e| EngineError::Internal(e))
+            .map_err(EngineError::Internal)
     }
 
     async fn health_snapshot(&self) -> HealthSignal {
@@ -79,6 +77,7 @@ impl NodeHandle for RemoteNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
     use trondb_core::planner::{CreateCollectionPlan, Plan};
     use trondb_core::Engine;
