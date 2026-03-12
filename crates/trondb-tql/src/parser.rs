@@ -751,9 +751,10 @@ impl Parser {
             None
         };
 
-        // Parse NEAR VECTOR and/or NEAR SPARSE
+        // Parse NEAR VECTOR, NEAR SPARSE, and/or NEAR 'text query'
         let mut dense_vector = None;
         let mut sparse_vector = None;
+        let mut query_text = None;
 
         while self.peek() == Some(&Token::Near) {
             self.advance(); // NEAR
@@ -766,22 +767,35 @@ impl Parser {
                     self.advance(); // SPARSE
                     sparse_vector = Some(self.parse_sparse_vector_list()?);
                 }
+                Some(Token::StringLit(_)) => {
+                    if let Some((Token::StringLit(s), _)) = self.advance() {
+                        query_text = Some(s);
+                    }
+                }
                 Some(tok) => {
                     let tok_str = format!("{tok:?}");
                     let pos = self.tokens[self.pos].1.start;
                     return Err(ParseError::UnexpectedToken {
                         pos,
-                        expected: "VECTOR or SPARSE".into(),
+                        expected: "VECTOR, SPARSE, or string literal".into(),
                         got: tok_str,
                     });
                 }
-                None => return Err(ParseError::UnexpectedEof("expected VECTOR or SPARSE".into())),
+                None => return Err(ParseError::UnexpectedEof("expected VECTOR, SPARSE, or string literal".into())),
             }
         }
 
-        if dense_vector.is_none() && sparse_vector.is_none() {
+        // Parse optional USING repr_name
+        let using_repr = if self.peek() == Some(&Token::Using) {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+
+        if dense_vector.is_none() && sparse_vector.is_none() && query_text.is_none() {
             return Err(ParseError::InvalidSyntax(
-                "SEARCH requires at least one NEAR VECTOR or NEAR SPARSE clause".into(),
+                "SEARCH requires at least one NEAR VECTOR, NEAR SPARSE, or NEAR 'text query' clause".into(),
             ));
         }
 
@@ -809,8 +823,8 @@ impl Parser {
             filter,
             confidence,
             limit,
-            query_text: None,
-            using_repr: None,
+            query_text,
+            using_repr,
         }))
     }
 
@@ -1133,6 +1147,44 @@ mod tests {
     fn parse_search_no_near_fails() {
         let result = parse("SEARCH venues LIMIT 10;");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_search_near_text() {
+        let stmt = parse("SEARCH venues NEAR 'live jazz in Bristol' LIMIT 10;").unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert_eq!(s.query_text.unwrap(), "live jazz in Bristol");
+                assert!(s.dense_vector.is_none());
+                assert!(s.sparse_vector.is_none());
+                assert!(s.using_repr.is_none());
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_near_text_with_using() {
+        let stmt = parse("SEARCH events NEAR 'jazz music' USING semantic LIMIT 5;").unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert_eq!(s.query_text.unwrap(), "jazz music");
+                assert_eq!(s.using_repr.unwrap(), "semantic");
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_near_text_with_where() {
+        let stmt = parse("SEARCH venues WHERE city = 'Bristol' NEAR 'live jazz' LIMIT 10;").unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert!(s.filter.is_some());
+                assert_eq!(s.query_text.unwrap(), "live jazz");
+            }
+            _ => panic!("expected Search"),
+        }
     }
 
     #[test]
