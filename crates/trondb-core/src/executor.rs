@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
-use crate::edge::{AdjacencyIndex, Edge, EdgeSource, EdgeType};
+use crate::edge::{AdjacencyIndex, Edge, EdgeSource, EdgeType, InferenceConfig};
 use crate::error::EngineError;
 use crate::field_index::FieldIndex;
 use crate::index::HnswIndex;
@@ -966,6 +966,7 @@ impl Executor {
                     from_collection: p.from_collection.clone(),
                     to_collection: p.to_collection.clone(),
                     decay_config,
+                    inference_config: InferenceConfig::default(),
                 };
 
                 // WAL: TxBegin -> SchemaCreateEdgeType -> commit

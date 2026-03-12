@@ -52,6 +52,8 @@ pub struct EdgeType {
     pub from_collection: String,
     pub to_collection: String,
     pub decay_config: DecayConfig,
+    #[serde(default)]
+    pub inference_config: InferenceConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -68,6 +70,27 @@ pub enum DecayFn {
     Exponential,
     Linear,
     Step,
+}
+
+// ---------------------------------------------------------------------------
+// InferenceConfig — controls background inference for an edge type
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceConfig {
+    pub auto: bool,
+    pub confidence_floor: f32,
+    pub limit: usize,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            auto: false,
+            confidence_floor: 0.5,
+            limit: 10,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -487,5 +510,26 @@ mod tests {
         };
         let json = serde_json::to_string(&edge).unwrap();
         assert!(json.contains("Inferred"));
+    }
+
+    // -----------------------------------------------------------------------
+    // InferenceConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn edge_type_deserializes_without_inference_config() {
+        let json = r#"{"name":"test","from_collection":"a","to_collection":"b","decay_config":{"decay_fn":null,"decay_rate":null,"floor":null,"promote_threshold":null,"prune_threshold":null}}"#;
+        let et: EdgeType = serde_json::from_str(json).unwrap();
+        assert!(!et.inference_config.auto);
+        assert_eq!(et.inference_config.confidence_floor, 0.5);
+        assert_eq!(et.inference_config.limit, 10);
+    }
+
+    #[test]
+    fn inference_config_defaults_sensible() {
+        let config = InferenceConfig::default();
+        assert!(!config.auto);
+        assert_eq!(config.confidence_floor, 0.5);
+        assert_eq!(config.limit, 10);
     }
 }
