@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 use trondb_core::Engine;
@@ -10,6 +11,7 @@ use trondb_proto::pb::tron_node_server::TronNode;
 use trondb_routing::health::{HealthSignal, NodeStatus};
 use trondb_routing::node::{NodeId, NodeRole};
 use crate::config::{NodeRoleConfig, ReplicationConfig};
+use crate::location_stream::spawn_location_stream;
 use crate::replication::ReplicaTracker;
 use crate::stream_health::spawn_health_stream;
 
@@ -19,6 +21,7 @@ pub struct TronNodeService {
     primary_channel: Option<tonic::transport::Channel>,  // for write forwarding
     tracker: Option<Arc<ReplicaTracker>>,
     replication_config: ReplicationConfig,
+    location_broadcast: Option<broadcast::Sender<pb::LocationUpdateMessage>>,
 }
 
 impl TronNodeService {
@@ -29,6 +32,7 @@ impl TronNodeService {
             primary_channel: None,
             tracker: None,
             replication_config: ReplicationConfig::default(),
+            location_broadcast: None,
         }
     }
 
@@ -43,6 +47,7 @@ impl TronNodeService {
             primary_channel: None,
             tracker: Some(tracker),
             replication_config: ReplicationConfig::default(),
+            location_broadcast: None,
         }
     }
 
@@ -58,11 +63,20 @@ impl TronNodeService {
             primary_channel: None,
             tracker: Some(tracker),
             replication_config,
+            location_broadcast: None,
         }
     }
 
     pub fn with_primary(mut self, channel: tonic::transport::Channel) -> Self {
         self.primary_channel = Some(channel);
+        self
+    }
+
+    pub fn with_location_broadcast(
+        mut self,
+        sender: broadcast::Sender<pb::LocationUpdateMessage>,
+    ) -> Self {
+        self.location_broadcast = Some(sender);
         self
     }
 
@@ -120,6 +134,20 @@ impl TronNode for TronNodeService {
                             let proto: pb::WalRecordMessage = record.into();
                             tracker.broadcast(&proto).await;
                         }
+
+                        // Feed LocationUpdate records into the location broadcast channel
+                        if let Some(ref loc_tx) = self.location_broadcast {
+                            for record in &records {
+                                if matches!(record.record_type, trondb_wal::RecordType::LocationUpdate) {
+                                    let msg = pb::LocationUpdateMessage {
+                                        is_snapshot: false,
+                                        payload: record.payload.clone(),
+                                        lsn: record.lsn,
+                                    };
+                                    let _ = loc_tx.send(msg);
+                                }
+                            }
+                        }
                     }
 
                     // Wait for ack (semi-sync: timeout is non-fatal)
@@ -138,8 +166,31 @@ impl TronNode for TronNodeService {
             }
         }
 
+        // Capture LSN before execution for location broadcast
+        let lsn_before = self.engine.wal_head_lsn();
+
         let result = self.engine.execute(&plan).await
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Feed LocationUpdate WAL records into the location broadcast channel
+        if let Some(ref loc_tx) = self.location_broadcast {
+            let lsn_after = self.engine.wal_head_lsn();
+            if lsn_after > lsn_before {
+                if let Ok(records) = self.engine.wal_records_since(lsn_before).await {
+                    for record in &records {
+                        if matches!(record.record_type, trondb_wal::RecordType::LocationUpdate) {
+                            let msg = pb::LocationUpdateMessage {
+                                is_snapshot: false,
+                                payload: record.payload.clone(),
+                                lsn: record.lsn,
+                            };
+                            let _ = loc_tx.send(msg);
+                        }
+                    }
+                }
+            }
+        }
+
         let proto_result: pb::QueryResponse = (&result).into();
         Ok(Response::new(proto_result))
     }
@@ -153,8 +204,7 @@ impl TronNode for TronNodeService {
         Ok(Response::new(proto))
     }
 
-    // StreamHealth — real implementation (Task 8)
-    // StreamWal, StreamLocationUpdates — stub implementations (Tasks 12, 15)
+    // StreamHealth (Task 8), StreamWal (Task 12), StreamLocationUpdates (Task 15)
 
     type StreamHealthStream =
         tokio_stream::wrappers::ReceiverStream<Result<pb::HealthSignalResponse, Status>>;
@@ -274,7 +324,16 @@ impl TronNode for TronNodeService {
         &self,
         _: Request<pb::Empty>,
     ) -> Result<Response<Self::StreamLocationUpdatesStream>, Status> {
-        Err(Status::unimplemented("implemented in Task 14"))
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        // Subscribe to the broadcast channel (if available) before taking
+        // the snapshot so that we don't miss any deltas written between
+        // the snapshot and the first recv.
+        let bcast_rx = self.location_broadcast.as_ref().map(|s| s.subscribe());
+
+        spawn_location_stream(self.engine.clone(), bcast_rx, tx);
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 }
 

@@ -10,6 +10,7 @@ pub mod remote_node;
 pub mod replication;
 pub mod service;
 pub mod stream_health;
+pub mod write_forward;
 
 #[derive(Parser)]
 #[command(name = "trondb-server", about = "TronDB distributed node")]
