@@ -34,7 +34,7 @@ prost = "0.13"
 prost-types = "0.13"
 tonic-build = "0.13"
 tonic-health = "0.13"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 sysinfo = "0.34"

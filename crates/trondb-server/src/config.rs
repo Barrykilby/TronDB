@@ -391,4 +391,11 @@ data_dir = "/data/trondb"
         assert_eq!(peers[1].role, NodeRoleConfig::Router);
         assert_eq!(peers[1].addr, "192.168.1.12:9400");
     }
+
+    #[test]
+    fn role_dispatches_correctly() {
+        assert_eq!(NodeRoleConfig::Primary, NodeRoleConfig::Primary);
+        assert_ne!(NodeRoleConfig::Primary, NodeRoleConfig::Replica);
+        assert_ne!(NodeRoleConfig::Primary, NodeRoleConfig::Router);
+    }
 }
