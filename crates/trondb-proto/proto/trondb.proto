@@ -46,6 +46,9 @@ message PlanRequest {
         PromotePlan promote = 14;
         ExplainTiersPlan explain_tiers = 15;
         UpdateEntityPlan update_entity = 16;
+        InferPlanProto infer = 17;
+        ConfirmEdgePlanProto confirm_edge = 18;
+        ExplainHistoryPlanProto explain_history = 19;
     }
 }
 
@@ -153,6 +156,25 @@ message UpdateEntityPlan {
     string entity_id = 1;
     string collection = 2;
     repeated FieldAssignment assignments = 3;
+}
+
+message InferPlanProto {
+    string from_id = 1;
+    repeated string edge_types = 2;
+    optional uint64 limit = 3;
+    optional float confidence_floor = 4;
+}
+
+message ConfirmEdgePlanProto {
+    string from_id = 1;
+    string to_id = 2;
+    string edge_type = 3;
+    float confidence = 4;
+}
+
+message ExplainHistoryPlanProto {
+    string entity_id = 1;
+    optional uint64 limit = 2;
 }
 
 // ---------------------------------------------------------------------------

@@ -522,12 +522,24 @@ impl From<&Plan> for pb::PlanRequest {
                         .collect(),
                 }),
 
-                // Inference plan types — proto fields added in Task 15
-                Plan::Infer(_) | Plan::ConfirmEdge(_) | Plan::ExplainHistory(_) => {
-                    // Placeholder: these plan types don't have proto representations yet.
-                    // Task 15 will add the proto messages and conversions.
-                    PP::Explain(Box::new(pb::ExplainPlan { inner: None }))
-                }
+                Plan::Infer(p) => PP::Infer(pb::InferPlanProto {
+                    from_id: p.from_id.clone(),
+                    edge_types: p.edge_types.clone(),
+                    limit: p.limit.map(|l| l as u64),
+                    confidence_floor: p.confidence_floor,
+                }),
+
+                Plan::ConfirmEdge(p) => PP::ConfirmEdge(pb::ConfirmEdgePlanProto {
+                    from_id: p.from_id.clone(),
+                    to_id: p.to_id.clone(),
+                    edge_type: p.edge_type.clone(),
+                    confidence: p.confidence,
+                }),
+
+                Plan::ExplainHistory(p) => PP::ExplainHistory(pb::ExplainHistoryPlanProto {
+                    entity_id: p.entity_id.clone(),
+                    limit: p.limit.map(|l| l as u64),
+                })
             }),
         }
     }
@@ -725,6 +737,25 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     assignments,
                 }))
             }
+
+            PP::Infer(p) => Ok(Plan::Infer(InferPlan {
+                from_id: p.from_id,
+                edge_types: p.edge_types,
+                limit: p.limit.map(|l| l as usize),
+                confidence_floor: p.confidence_floor,
+            })),
+
+            PP::ConfirmEdge(p) => Ok(Plan::ConfirmEdge(ConfirmEdgePlan {
+                from_id: p.from_id,
+                to_id: p.to_id,
+                edge_type: p.edge_type,
+                confidence: p.confidence,
+            })),
+
+            PP::ExplainHistory(p) => Ok(Plan::ExplainHistory(ExplainHistoryPlan {
+                entity_id: p.entity_id,
+                limit: p.limit.map(|l| l as usize),
+            })),
         }
     }
 }
@@ -1196,6 +1227,97 @@ mod tests {
                 assert_eq!(dp.target_tier, TierTarget::Archive);
             }
             _ => panic!("expected Demote"),
+        }
+    }
+
+    #[test]
+    fn round_trip_infer() {
+        let plan = Plan::Infer(InferPlan {
+            from_id: "u1".into(),
+            edge_types: vec!["likes".into(), "follows".into()],
+            limit: Some(20),
+            confidence_floor: Some(0.5),
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Infer(p) => {
+                assert_eq!(p.from_id, "u1");
+                assert_eq!(p.edge_types, vec!["likes", "follows"]);
+                assert_eq!(p.limit, Some(20));
+                assert_eq!(p.confidence_floor, Some(0.5));
+            }
+            _ => panic!("expected Infer"),
+        }
+    }
+
+    #[test]
+    fn round_trip_infer_no_optionals() {
+        let plan = Plan::Infer(InferPlan {
+            from_id: "u1".into(),
+            edge_types: vec!["likes".into()],
+            limit: None,
+            confidence_floor: None,
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Infer(p) => {
+                assert_eq!(p.from_id, "u1");
+                assert!(p.limit.is_none());
+                assert!(p.confidence_floor.is_none());
+            }
+            _ => panic!("expected Infer"),
+        }
+    }
+
+    #[test]
+    fn round_trip_confirm_edge() {
+        let plan = Plan::ConfirmEdge(ConfirmEdgePlan {
+            from_id: "u1".into(),
+            to_id: "v1".into(),
+            edge_type: "likes".into(),
+            confidence: 0.95,
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::ConfirmEdge(p) => {
+                assert_eq!(p.from_id, "u1");
+                assert_eq!(p.to_id, "v1");
+                assert_eq!(p.edge_type, "likes");
+                assert!((p.confidence - 0.95).abs() < 1e-6);
+            }
+            _ => panic!("expected ConfirmEdge"),
+        }
+    }
+
+    #[test]
+    fn round_trip_explain_history() {
+        let plan = Plan::ExplainHistory(ExplainHistoryPlan {
+            entity_id: "v1".into(),
+            limit: Some(10),
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::ExplainHistory(p) => {
+                assert_eq!(p.entity_id, "v1");
+                assert_eq!(p.limit, Some(10));
+            }
+            _ => panic!("expected ExplainHistory"),
+        }
+    }
+
+    #[test]
+    fn round_trip_explain_history_no_limit() {
+        let plan = Plan::ExplainHistory(ExplainHistoryPlan {
+            entity_id: "v1".into(),
+            limit: None,
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::ExplainHistory(p) => {
+                assert_eq!(p.entity_id, "v1");
+                assert!(p.limit.is_none());
+            }
+            _ => panic!("expected ExplainHistory"),
         }
     }
 }
