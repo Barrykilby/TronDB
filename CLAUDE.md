@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 10: Pluggable Vectoriser + Mutation Cascade.
+Inference-first storage engine. Phase 11: Inference Pipeline.
 
 ## Project Structure
 
@@ -129,3 +129,24 @@ Inference-first storage engine. Phase 10: Pluggable Vectoriser + Mutation Cascad
   - Engine::schemas() public method for iterating stored collection schemas
   - CLI + server startup: iterate schemas, create_vectoriser_from_config() factory, register managed vectorisers
   - Backwards compatibility: #[serde(default)] on new fields in StoredRepresentation and CollectionSchema
+- Inference Pipeline (Phase 11)
+  - EdgeSource classification: Structural (app-asserted, confidence 1.0, permanent), Inferred (engine-proposed, decays, prunable), Confirmed (promoted from Inferred, excluded from auto-prune)
+  - Edge struct: `source: EdgeSource` field with `#[serde(default)]` for backward compatibility
+  - INFER verb: read-only query proposing edges from HNSW vector similarity
+    - Syntax: INFER EDGES FROM 'id' [VIA type1, type2] RETURNING (TOP n | ALL) [CONFIDENCE > threshold];
+    - Pipeline: fetch source vector → HNSW search target collections → filter existing edges → score + rank → return proposals
+  - CONFIRM verb: creates or promotes edges to Confirmed status
+    - Syntax: CONFIRM EDGE FROM 'id' TO 'id' TYPE name CONFIDENCE value;
+    - Behavior: None→create Confirmed, Inferred→promote to Confirmed, Confirmed→update confidence, Structural→error
+  - InferenceSweeper: background task (30s interval), drains DashSet work queue populated by INSERT/UPDATE
+    - Only for edge types with INFER AUTO enabled
+    - Creates Inferred edges via WAL (EdgeInferred 0x31) + Fjall + AdjacencyIndex
+  - DecaySweeper: background task (60s interval), prunes Inferred edges below prune_threshold
+    - Uses effective_confidence() with decay function, only affects Inferred source edges
+  - InferenceAuditBuffer: Mutex<VecDeque> ring buffer (capacity 1000), records every INFER execution
+  - EXPLAIN HISTORY: queries audit buffer for inference history per entity
+    - Syntax: EXPLAIN HISTORY 'id' [LIMIT n];
+  - CREATE EDGE TYPE extended: INFER AUTO CONFIDENCE > threshold LIMIT n
+  - InferenceConfig on EdgeType: auto, confidence_floor, limit with #[serde(default)]
+  - WAL record types: EdgeInferred (0x31), EdgeConfidenceUpdate (0x32), EdgeConfirm (0x33), EdgeDelete (0x34)
+  - Proto/gRPC: InferPlanProto, ConfirmEdgePlanProto, ExplainHistoryPlanProto messages

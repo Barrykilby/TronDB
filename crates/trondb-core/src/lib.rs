@@ -2392,6 +2392,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn end_to_end_inference_lifecycle() {
+        // Full E2E test: collections → edge type with INFER AUTO → insert entities →
+        // INFER → CONFIRM → TRAVERSE → EXPLAIN HISTORY → re-INFER excludes confirmed
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("data"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
+        };
+        let (engine, _) = Engine::open(config).await.unwrap();
+
+        // 1. Create two collections with 3D vector representations
+        create_simple_collection(&engine, "acts", 3).await;
+        create_simple_collection(&engine, "venues", 3).await;
+
+        // 2. Create edge type with INFER AUTO
+        engine
+            .execute_tql(
+                "CREATE EDGE performs_at FROM acts TO venues INFER AUTO CONFIDENCE > 0.5 LIMIT 5;",
+            )
+            .await
+            .unwrap();
+
+        // 3. Insert entities with known vectors
+        // act1: Jazz Band — vector similar to v1
+        engine
+            .execute_tql(
+                "INSERT INTO acts (id, name) VALUES ('act1', 'Jazz Band') \
+                 REPRESENTATION default VECTOR [0.9, 0.1, 0.0];",
+            )
+            .await
+            .unwrap();
+        // v1: Jazz Club — vector similar to act1
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v1', 'Jazz Club') \
+                 REPRESENTATION default VECTOR [0.85, 0.15, 0.0];",
+            )
+            .await
+            .unwrap();
+        // v2: Metal Pit — vector dissimilar to act1
+        engine
+            .execute_tql(
+                "INSERT INTO venues (id, name) VALUES ('v2', 'Metal Pit') \
+                 REPRESENTATION default VECTOR [0.0, 0.1, 0.9];",
+            )
+            .await
+            .unwrap();
+
+        // 4. Explicit INFER — should propose edges sorted by similarity
+        let proposals = engine
+            .execute_tql("INFER EDGES FROM 'act1' VIA performs_at RETURNING TOP 5;")
+            .await
+            .unwrap();
+        assert!(
+            !proposals.rows.is_empty(),
+            "INFER should return at least one proposal"
+        );
+        // First result should be v1 (more similar to act1 than v2)
+        assert_eq!(
+            proposals.rows[0].values.get("to_id"),
+            Some(&Value::String("v1".into())),
+            "First proposal should be the most similar entity (v1)"
+        );
+
+        // 5. CONFIRM the top proposal
+        engine
+            .execute_tql(
+                "CONFIRM EDGE FROM 'act1' TO 'v1' TYPE performs_at CONFIDENCE 0.90;",
+            )
+            .await
+            .unwrap();
+
+        // 6. Confirmed edge should be traversable
+        let traversal = engine
+            .execute_tql("TRAVERSE performs_at FROM 'act1';")
+            .await
+            .unwrap();
+        assert_eq!(
+            traversal.rows.len(),
+            1,
+            "TRAVERSE should find exactly 1 confirmed edge"
+        );
+
+        // 7. EXPLAIN HISTORY should have audit entries (from the INFER above)
+        let history = engine
+            .execute_tql("EXPLAIN HISTORY 'act1';")
+            .await
+            .unwrap();
+        assert!(
+            !history.rows.is_empty(),
+            "EXPLAIN HISTORY should return at least one audit entry"
+        );
+
+        // 8. INFER again — should now exclude the confirmed edge (act1 → v1)
+        let proposals2 = engine
+            .execute_tql("INFER EDGES FROM 'act1' VIA performs_at RETURNING TOP 5;")
+            .await
+            .unwrap();
+        for row in &proposals2.rows {
+            if let Some(to_id) = row.values.get("to_id") {
+                assert_ne!(
+                    to_id,
+                    &Value::String("v1".into()),
+                    "v1 should not appear in proposals after confirmation"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn schemas_returns_all_collections() {
         let (engine, _dir) = test_engine().await;
 
