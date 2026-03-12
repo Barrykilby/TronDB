@@ -9,6 +9,7 @@ trondb-tql = { path = "../trondb-tql" }
 trondb-wal = { path = "../trondb-wal" }
 trondb-routing = { path = "../trondb-routing" }
 trondb-proto = { path = "../trondb-proto" }
+async-trait = { workspace = true }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
 prost = { workspace = true }
@@ -19,7 +20,7 @@ tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

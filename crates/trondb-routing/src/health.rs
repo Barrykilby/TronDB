@@ -40,6 +40,35 @@ pub struct HealthSignal {
     pub archive_entity_count: u64,
 }
 
+impl HealthSignal {
+    /// Construct a sentinel signal indicating the node is faulted.
+    /// Used as a fallback when a remote node cannot be reached.
+    pub fn faulted(node_id: NodeId) -> Self {
+        HealthSignal {
+            node_id,
+            node_role: NodeRole::HotNode,
+            signal_ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+            sequence: 0,
+            cpu_utilisation: 1.0,
+            ram_pressure: 1.0,
+            hot_entity_count: 0,
+            hot_tier_capacity: 0,
+            queue_depth: 0,
+            queue_capacity: 0,
+            hnsw_p99_ms: 0.0,
+            hnsw_p50_ms: 0.0,
+            replica_lag_ms: None,
+            load_score: 1.0,
+            status: NodeStatus::Faulted,
+            warm_entity_count: 0,
+            archive_entity_count: 0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Load score computation
 // ---------------------------------------------------------------------------
