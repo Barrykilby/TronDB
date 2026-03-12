@@ -755,6 +755,47 @@ impl Executor {
                     }
                 };
 
+                // Step 3b: Exclude dirty/recomputing representations from results
+                let searched_repr_idx: Option<u32> = self.schemas.get(&p.collection)
+                    .and_then(|schema| {
+                        // Determine which repr_name was searched based on the strategy
+                        let prefix = format!("{}:", p.collection);
+                        let repr_name = match &p.strategy {
+                            SearchStrategy::Hnsw | SearchStrategy::Hybrid => {
+                                self.indexes.iter()
+                                    .find(|e| e.key().starts_with(&prefix))
+                                    .map(|e| e.key().strip_prefix(&prefix).unwrap_or("").to_string())
+                            }
+                            SearchStrategy::Sparse => {
+                                self.sparse_indexes.iter()
+                                    .find(|e| e.key().starts_with(&prefix))
+                                    .map(|e| e.key().strip_prefix(&prefix).unwrap_or("").to_string())
+                            }
+                        };
+                        repr_name.and_then(|name| {
+                            schema.representations.iter()
+                                .position(|r| r.name == name)
+                                .map(|idx| idx as u32)
+                        })
+                    });
+
+                let results: Vec<(LogicalId, f32)> = if let Some(repr_idx) = searched_repr_idx {
+                    results.into_iter().filter(|(entity_id, _score)| {
+                        let repr_key = ReprKey {
+                            entity_id: entity_id.clone(),
+                            repr_index: repr_idx,
+                        };
+                        if let Some(loc) = self.location.get(&repr_key) {
+                            if loc.state == LocState::Dirty || loc.state == LocState::Recomputing {
+                                return false;
+                            }
+                        }
+                        true
+                    }).collect()
+                } else {
+                    results
+                };
+
                 // Step 4: Post-filter on pre-filter candidates
                 let filtered = if let Some(ref allowed) = pre_filter_ids {
                     results.into_iter().filter(|(id, _)| allowed.contains(id)).collect::<Vec<_>>()
@@ -3798,5 +3839,139 @@ mod tests {
             result.rows[0].values.get("id"),
             Some(&Value::String("v2".into()))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 9 (Phase 10): SEARCH dirty exclusion
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn search_excludes_dirty_entities() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FjallStore::open(&dir.path().join("store")).unwrap();
+        let wal_config = WalConfig {
+            wal_dir: dir.path().join("wal"),
+            ..Default::default()
+        };
+        let wal = WalWriter::open(wal_config).await.unwrap();
+        let location = Arc::new(LocationTable::new());
+        let exec = Executor::new(store, wal, location.clone(), Arc::new(VectoriserRegistry::new()));
+
+        // Create collection with a representation that has FIELDS
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "venues".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "semantic".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec!["name".into()],
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+            vectoriser_config: None,
+        }))
+        .await
+        .unwrap();
+
+        // Insert two entities with explicit vectors
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("Jazz Club".into())],
+            vectors: vec![("semantic".to_string(), VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v2".into()), Literal::String("Rock Bar".into())],
+            vectors: vec![("semantic".to_string(), VectorLiteral::Dense(vec![0.9, 0.1, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+
+        // Both should appear in a SEARCH before marking dirty
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: Some(vec![1.0, 0.0, 0.0]),
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::Hnsw,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 2, "both entities should appear before dirty");
+
+        // Mark v1's representation as Dirty in the Location Table
+        // repr_index 0 = "semantic" (first representation in schema)
+        let repr_key = ReprKey {
+            entity_id: LogicalId::from_string("v1"),
+            repr_index: 0,
+        };
+        location.transition(&repr_key, LocState::Dirty).unwrap();
+
+        // SEARCH should now exclude v1 (dirty), returning only v2
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: Some(vec![1.0, 0.0, 0.0]),
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::Hnsw,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1, "dirty entity should be excluded");
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v2".into()))
+        );
+
+        // Also test Recomputing state exclusion
+        let repr_key_v2 = ReprKey {
+            entity_id: LogicalId::from_string("v2"),
+            repr_index: 0,
+        };
+        // v1: Dirty -> Recomputing
+        location.transition(&repr_key, LocState::Recomputing).unwrap();
+        // v2: Clean -> Dirty -> Recomputing
+        location.transition(&repr_key_v2, LocState::Dirty).unwrap();
+        location.transition(&repr_key_v2, LocState::Recomputing).unwrap();
+
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: Some(vec![1.0, 0.0, 0.0]),
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::Hnsw,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 0, "both recomputing entities should be excluded");
     }
 }
