@@ -135,6 +135,7 @@ impl Parser {
             Some(Token::Update) => self.parse_update(),
             Some(Token::Delete) => self.parse_delete(),
             Some(Token::Traverse) => self.parse_traverse(),
+            Some(Token::Confirm) => self.parse_confirm_edge(),
             Some(tok) => {
                 let tok_str = format!("{tok:?}");
                 let pos = self.tokens[self.pos].1.start;
@@ -450,13 +451,42 @@ impl Parser {
             None
         };
 
+        // Optional INFER AUTO clause
+        let inference_config = if self.peek() == Some(&Token::Infer) {
+            self.advance(); // INFER
+            self.expect(&Token::Auto)?;
+            let mut confidence_floor = None;
+            let mut limit = None;
+            loop {
+                match self.peek() {
+                    Some(Token::Confidence) => {
+                        self.advance(); // CONFIDENCE
+                        self.expect(&Token::Gt)?;
+                        confidence_floor = Some(self.expect_float_or_int()? as f32);
+                    }
+                    Some(Token::Limit) => {
+                        self.advance(); // LIMIT
+                        limit = Some(self.expect_int()? as usize);
+                    }
+                    _ => break,
+                }
+            }
+            Some(InferenceConfigDecl {
+                auto: true,
+                confidence_floor,
+                limit,
+            })
+        } else {
+            None
+        };
+
         self.expect(&Token::Semicolon)?;
         Ok(Statement::CreateEdgeType(CreateEdgeTypeStmt {
             name,
             from_collection,
             to_collection,
             decay_config,
-            inference_config: None,
+            inference_config,
         }))
     }
 
@@ -860,6 +890,20 @@ impl Parser {
             let collection = self.expect_ident()?;
             self.expect(&Token::Semicolon)?;
             Ok(Statement::ExplainTiers(ExplainTiersStmt { collection }))
+        } else if self.peek() == Some(&Token::History) {
+            self.advance(); // HISTORY
+            let entity_id = self.expect_string_lit()?;
+            let limit = if self.peek() == Some(&Token::Limit) {
+                self.advance(); // LIMIT
+                Some(self.expect_int()? as usize)
+            } else {
+                None
+            };
+            self.expect(&Token::Semicolon)?;
+            Ok(Statement::ExplainHistory(ExplainHistoryStmt {
+                entity_id,
+                limit,
+            }))
         } else {
             let inner = self.parse_statement()?;
             Ok(Statement::Explain(Box::new(inner)))
@@ -902,6 +946,26 @@ impl Parser {
         Ok(Statement::Promote(PromoteStmt {
             entity_id,
             collection,
+        }))
+    }
+
+    fn parse_confirm_edge(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // CONFIRM
+        self.expect(&Token::Edge)?;
+        self.expect(&Token::From)?;
+        let from_id = self.expect_string_lit()?;
+        self.expect(&Token::To)?;
+        let to_id = self.expect_string_lit()?;
+        self.expect(&Token::Type)?;
+        let edge_type = self.expect_ident()?;
+        self.expect(&Token::Confidence)?;
+        let confidence = self.expect_float_or_int()? as f32;
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::ConfirmEdge(ConfirmEdgeStmt {
+            from_id,
+            to_id,
+            edge_type,
+            confidence,
         }))
     }
 
@@ -1699,6 +1763,58 @@ mod tests {
                 assert_eq!(c.indexes.len(), 1);
             }
             _ => panic!("expected CreateCollection"),
+        }
+    }
+
+    #[test]
+    fn parse_confirm_edge() {
+        let stmt = parse("CONFIRM EDGE FROM 'e1' TO 'e2' TYPE performs_at CONFIDENCE 0.95;").unwrap();
+        match stmt {
+            Statement::ConfirmEdge(s) => {
+                assert_eq!(s.from_id, "e1");
+                assert_eq!(s.to_id, "e2");
+                assert_eq!(s.edge_type, "performs_at");
+                assert_eq!(s.confidence, 0.95);
+            }
+            _ => panic!("expected ConfirmEdge"),
+        }
+    }
+
+    #[test]
+    fn parse_confirm_edge_integer_confidence() {
+        let stmt = parse("CONFIRM EDGE FROM 'a' TO 'b' TYPE likes CONFIDENCE 1;").unwrap();
+        match stmt {
+            Statement::ConfirmEdge(s) => {
+                assert_eq!(s.from_id, "a");
+                assert_eq!(s.to_id, "b");
+                assert_eq!(s.edge_type, "likes");
+                assert_eq!(s.confidence, 1.0);
+            }
+            _ => panic!("expected ConfirmEdge"),
+        }
+    }
+
+    #[test]
+    fn parse_explain_history() {
+        let stmt = parse("EXPLAIN HISTORY 'ent1' LIMIT 50;").unwrap();
+        match stmt {
+            Statement::ExplainHistory(s) => {
+                assert_eq!(s.entity_id, "ent1");
+                assert_eq!(s.limit, Some(50));
+            }
+            _ => panic!("expected ExplainHistory"),
+        }
+    }
+
+    #[test]
+    fn parse_explain_history_no_limit() {
+        let stmt = parse("EXPLAIN HISTORY 'ent1';").unwrap();
+        match stmt {
+            Statement::ExplainHistory(s) => {
+                assert_eq!(s.entity_id, "ent1");
+                assert!(s.limit.is_none());
+            }
+            _ => panic!("expected ExplainHistory"),
         }
     }
 }
