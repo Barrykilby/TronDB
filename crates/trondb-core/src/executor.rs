@@ -19,6 +19,7 @@ use crate::types::{
     CollectionSchema, Entity, FieldType, LogicalId, Metric, ReprState, ReprType, Representation,
     StoredField, StoredIndex, StoredRepresentation, Value, VectorData,
 };
+use crate::vectoriser::{FieldSet, VectoriserRegistry};
 use trondb_tql::{FieldList, Literal, VectorLiteral, WhereClause};
 use trondb_wal::{RecordType, WalRecord, WalWriter};
 
@@ -36,10 +37,16 @@ pub struct Executor {
     schemas: DashMap<String, CollectionSchema>,
     adjacency: AdjacencyIndex,
     edge_types: DashMap<String, EdgeType>,
+    vectoriser_registry: Arc<VectoriserRegistry>,
 }
 
 impl Executor {
-    pub fn new(store: FjallStore, wal: WalWriter, location: Arc<LocationTable>) -> Self {
+    pub fn new(
+        store: FjallStore,
+        wal: WalWriter,
+        location: Arc<LocationTable>,
+        vectoriser_registry: Arc<VectoriserRegistry>,
+    ) -> Self {
         Self {
             store,
             wal: Arc::new(wal),
@@ -50,6 +57,7 @@ impl Executor {
             schemas: DashMap::new(),
             adjacency: AdjacencyIndex::new(),
             edge_types: DashMap::new(),
+            vectoriser_registry,
         }
     }
 
@@ -349,6 +357,55 @@ impl Executor {
                         name: repr_name.clone(),
                         repr_type: ReprType::Atomic,
                         fields: p.fields.clone(),
+                        vector: vector_data,
+                        recipe_hash,
+                        state: ReprState::Clean,
+                    };
+                    entity.representations.push(repr);
+                }
+
+                // Auto-vectorise managed representations that weren't explicitly provided
+                let explicit_repr_names: HashSet<&str> = p.vectors.iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+
+                for stored_repr in &schema.representations {
+                    if stored_repr.fields.is_empty() {
+                        continue; // passthrough — no auto-vectorisation
+                    }
+                    if explicit_repr_names.contains(stored_repr.name.as_str()) {
+                        continue; // explicit vector was provided
+                    }
+
+                    // Build FieldSet from entity metadata
+                    let field_set: FieldSet = stored_repr.fields.iter()
+                        .filter_map(|f| {
+                            entity.metadata.get(f).map(|v| (f.clone(), v.to_string()))
+                        })
+                        .collect();
+
+                    if field_set.is_empty() {
+                        continue; // no matching fields in entity
+                    }
+
+                    // Look up vectoriser
+                    let vectoriser = self.vectoriser_registry
+                        .get(&p.collection, &stored_repr.name)
+                        .ok_or_else(|| EngineError::InvalidQuery(format!(
+                            "representation '{}' has FIELDS but no vectoriser registered for collection '{}'",
+                            stored_repr.name, p.collection
+                        )))?;
+
+                    let vector_data = vectoriser.encode(&field_set).await
+                        .map_err(|e| EngineError::Storage(format!("vectoriser encode failed: {e}")))?;
+
+                    let model_id = vectoriser.model_id();
+                    let recipe_hash = crate::vectoriser::compute_recipe_hash(model_id, &stored_repr.fields);
+
+                    let repr = Representation {
+                        name: stored_repr.name.clone(),
+                        repr_type: if stored_repr.fields.len() > 1 { ReprType::Composite } else { ReprType::Atomic },
+                        fields: stored_repr.fields.clone(),
                         vector: vector_data,
                         recipe_hash,
                         state: ReprState::Clean,
@@ -1297,6 +1354,10 @@ impl Executor {
         &self.edge_types
     }
 
+    pub fn vectoriser_registry(&self) -> &Arc<VectoriserRegistry> {
+        &self.vectoriser_registry
+    }
+
     pub fn list_edge_types(&self) -> Vec<EdgeType> {
         self.store.list_edge_types()
     }
@@ -1735,7 +1796,7 @@ mod tests {
             ..Default::default()
         };
         let wal = WalWriter::open(wal_config).await.unwrap();
-        (Executor::new(store, wal, Arc::new(LocationTable::new())), dir)
+        (Executor::new(store, wal, Arc::new(LocationTable::new()), Arc::new(VectoriserRegistry::new())), dir)
     }
 
     async fn create_collection(exec: &Executor, name: &str, dims: usize) {

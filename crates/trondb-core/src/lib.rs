@@ -24,6 +24,7 @@ use result::QueryResult;
 use store::FjallStore;
 use trondb_wal::{WalConfig, WalRecord, WalRecovery, WalWriter};
 use types::LogicalId;
+use vectoriser::VectoriserRegistry;
 
 // ---------------------------------------------------------------------------
 // Engine — public API
@@ -40,6 +41,7 @@ pub struct EngineConfig {
 pub struct Engine {
     executor: Executor,
     data_dir: PathBuf,
+    vectoriser_registry: Arc<VectoriserRegistry>,
     _snapshot_handle: Option<tokio::task::JoinHandle<()>>,
     _hnsw_snapshot_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -64,7 +66,8 @@ impl Engine {
         let recovery = WalRecovery::recover(&config.wal.wal_dir).await?;
         let wal = WalWriter::open(config.wal).await?;
         let location = Arc::new(location);
-        let executor = Executor::new(store, wal, Arc::clone(&location));
+        let vectoriser_registry = Arc::new(VectoriserRegistry::new());
+        let executor = Executor::new(store, wal, Arc::clone(&location), Arc::clone(&vectoriser_registry));
 
         // Filter records to only replay those after snapshot LSN
         let records_to_replay: Vec<_> = recovery
@@ -345,6 +348,7 @@ impl Engine {
         Ok((Self {
             executor,
             data_dir: config.data_dir.clone(),
+            vectoriser_registry,
             _snapshot_handle: snapshot_handle,
             _hnsw_snapshot_handle: hnsw_snapshot_handle,
         }, unhandled_records))
@@ -387,6 +391,10 @@ impl Engine {
 
     pub fn wal_head_lsn(&self) -> u64 {
         self.executor.wal_head_lsn()
+    }
+
+    pub fn vectoriser_registry(&self) -> &Arc<VectoriserRegistry> {
+        &self.vectoriser_registry
     }
 
     /// Save all HNSW index snapshots to disk.
@@ -1728,5 +1736,113 @@ mod tests {
             snap_dir.join("venues_default.hnsw.meta").exists(),
             "snapshot meta should exist after drop"
         );
+    }
+
+    // Inline mock vectoriser for tests (avoids circular dependency with trondb-vectoriser)
+    mod test_vectoriser {
+        use async_trait::async_trait;
+        use crate::types::VectorData;
+        use crate::vectoriser::{FieldSet, VectorKind, Vectoriser, VectoriserError};
+
+        pub struct TestMockVectoriser {
+            dimensions: usize,
+        }
+
+        impl TestMockVectoriser {
+            pub fn new(dimensions: usize) -> Self {
+                Self { dimensions }
+            }
+        }
+
+        #[async_trait]
+        impl Vectoriser for TestMockVectoriser {
+            fn id(&self) -> &str { "test-mock" }
+            fn model_id(&self) -> &str { "mock-model" }
+            fn output_size(&self) -> usize { self.dimensions }
+            fn output_kind(&self) -> VectorKind { VectorKind::Dense }
+
+            async fn encode(&self, fields: &FieldSet) -> Result<VectorData, VectoriserError> {
+                // Deterministic: produce a vector of 0.5s with length = dimensions
+                // Slightly vary based on input so we can distinguish different inputs
+                let mut pairs: Vec<_> = fields.iter().collect();
+                pairs.sort_by_key(|(k, _)| (*k).clone());
+                let seed: f32 = pairs.iter()
+                    .flat_map(|(_, v)| v.bytes())
+                    .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as f32 / 1000.0;
+                let vec = (0..self.dimensions)
+                    .map(|i| (seed + i as f32 * 0.1).sin())
+                    .collect();
+                Ok(VectorData::Dense(vec))
+            }
+
+            async fn encode_query(&self, query: &str) -> Result<VectorData, VectoriserError> {
+                let seed: f32 = query.bytes()
+                    .fold(0u32, |acc, b| acc.wrapping_add(b as u32)) as f32 / 1000.0;
+                let vec = (0..self.dimensions)
+                    .map(|i| (seed + i as f32 * 0.1).sin())
+                    .collect();
+                Ok(VectorData::Dense(vec))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_auto_vectorise_from_fields() {
+        let (engine, _dir) = test_engine().await;
+
+        // Create collection with FIELDS-based representation
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                FIELD description TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name, description), \
+            );"
+        ).await.unwrap();
+
+        // Register mock vectoriser for the representation
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT without explicit vector — should auto-vectorise
+        engine.execute_tql(
+            "INSERT INTO events (id, name, description) VALUES ('e1', 'Jazz Night', 'Live jazz at the Blue Note');"
+        ).await.unwrap();
+
+        // Verify entity was stored via FETCH
+        let result = engine.execute_tql("FETCH * FROM events WHERE id = 'e1';").await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Jazz Night".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_auto_vectorise_skips_explicit_vector() {
+        let (engine, _dir) = test_engine().await;
+
+        // Create collection with FIELDS-based representation
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                REPRESENTATION semantic DIMENSIONS 3 FIELDS (name), \
+            );"
+        ).await.unwrap();
+
+        // Register mock vectoriser
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(3));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT with explicit vector — should use the explicit one, not auto-vectorise
+        engine.execute_tql(
+            "INSERT INTO events (id, name) VALUES ('e1', 'Jazz Night') \
+             REPRESENTATION semantic VECTOR [0.1, 0.2, 0.3];"
+        ).await.unwrap();
+
+        // Verify entity was stored
+        let result = engine.execute_tql("FETCH * FROM events WHERE id = 'e1';").await.unwrap();
+        assert_eq!(result.rows.len(), 1);
     }
 }
