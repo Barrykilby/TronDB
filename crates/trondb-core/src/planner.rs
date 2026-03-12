@@ -13,6 +13,7 @@ pub enum SearchStrategy {
     Hnsw,
     Sparse,
     Hybrid,
+    NaturalLanguage,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +92,8 @@ pub struct SearchPlan {
     pub k: usize,
     pub confidence_threshold: f64,
     pub strategy: SearchStrategy,
+    pub query_text: Option<String>,
+    pub using_repr: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,12 +176,16 @@ pub struct UpdateEntityPlan {
 fn select_search_strategy(
     has_dense: bool,
     has_sparse: bool,
+    has_query_text: bool,
 ) -> SearchStrategy {
+    if has_query_text {
+        return SearchStrategy::NaturalLanguage;
+    }
     match (has_dense, has_sparse) {
         (true, false) => SearchStrategy::Hnsw,
         (false, true) => SearchStrategy::Sparse,
         (true, true) => SearchStrategy::Hybrid,
-        (false, false) => unreachable!("parser guarantees at least one vector"),
+        (false, false) => unreachable!("parser guarantees at least one vector or query_text"),
     }
 }
 
@@ -294,7 +301,8 @@ pub fn plan(
         Statement::Search(s) => {
             let has_dense = s.dense_vector.is_some();
             let has_sparse = s.sparse_vector.is_some();
-            let strategy = select_search_strategy(has_dense, has_sparse);
+            let has_query_text = s.query_text.is_some();
+            let strategy = select_search_strategy(has_dense, has_sparse, has_query_text);
 
             // Validate sparse representation exists when Sparse/Hybrid selected
             if matches!(strategy, SearchStrategy::Sparse | SearchStrategy::Hybrid) {
@@ -319,6 +327,8 @@ pub fn plan(
                 k: s.limit.unwrap_or(10),
                 confidence_threshold: s.confidence.unwrap_or(0.0),
                 strategy,
+                query_text: s.query_text.clone(),
+                using_repr: s.using_repr.clone(),
             }))
         }
 
@@ -701,6 +711,31 @@ mod tests {
                 assert_eq!(up.assignments.len(), 1);
             }
             _ => panic!("expected UpdateEntityPlan"),
+        }
+    }
+
+    #[test]
+    fn plan_search_natural_language_strategy() {
+        let stmt = Statement::Search(SearchStmt {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: None,
+            sparse_vector: None,
+            filter: None,
+            confidence: None,
+            limit: Some(5),
+            query_text: Some("live jazz in Bristol".into()),
+            using_repr: Some("semantic".into()),
+        });
+        let p = plan(&stmt, &empty_schemas()).unwrap();
+        match p {
+            Plan::Search(sp) => {
+                assert_eq!(sp.strategy, SearchStrategy::NaturalLanguage);
+                assert_eq!(sp.query_text, Some("live jazz in Bristol".into()));
+                assert_eq!(sp.using_repr, Some("semantic".into()));
+                assert_eq!(sp.k, 5);
+            }
+            _ => panic!("expected SearchPlan"),
         }
     }
 

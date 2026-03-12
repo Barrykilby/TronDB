@@ -753,6 +753,59 @@ impl Executor {
                         // RRF merge — no confidence threshold (RRF scores are relative ranking)
                         crate::hybrid::merge_rrf(&dense_results, &sparse_results, crate::hybrid::default_rrf_k())
                     }
+                    SearchStrategy::NaturalLanguage => {
+                        let query_text = p.query_text.as_ref()
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "NaturalLanguage strategy requires query_text".into(),
+                            ))?;
+
+                        // Determine which representation to use
+                        let schema = self.schemas.get(&p.collection)
+                            .ok_or_else(|| EngineError::CollectionNotFound(p.collection.clone()))?;
+
+                        let repr_name = p.using_repr.as_deref()
+                            .or_else(|| {
+                                schema.representations.iter()
+                                    .find(|r| !r.fields.is_empty() && !r.sparse)
+                                    .map(|r| r.name.as_str())
+                            })
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                "no managed dense representation found for natural language SEARCH".into(),
+                            ))?
+                            .to_string();
+
+                        drop(schema); // release DashMap ref before async call
+
+                        // Look up vectoriser
+                        let vectoriser = self.vectoriser_registry
+                            .get(&p.collection, &repr_name)
+                            .ok_or_else(|| EngineError::InvalidQuery(format!(
+                                "no vectoriser registered for {}:{}", p.collection, repr_name
+                            )))?;
+
+                        // Encode query text
+                        let query_vector = vectoriser.encode_query(query_text).await
+                            .map_err(|e| EngineError::Storage(format!("encode_query failed: {e}")))?;
+
+                        let query_f32 = match query_vector {
+                            VectorData::Dense(v) => v,
+                            _ => return Err(EngineError::InvalidQuery(
+                                "natural language SEARCH requires a dense vectoriser".into(),
+                            )),
+                        };
+
+                        let hnsw_key = format!("{}:{}", p.collection, repr_name);
+                        let hnsw = self.indexes.get(&hnsw_key)
+                            .ok_or_else(|| EngineError::InvalidQuery(format!(
+                                "no HNSW index for {}", hnsw_key
+                            )))?;
+
+                        let mut raw = hnsw.search(&query_f32, fetch_k);
+                        if p.confidence_threshold > 0.0 {
+                            raw.retain(|(_, score)| (*score as f64) >= p.confidence_threshold);
+                        }
+                        raw
+                    }
                 };
 
                 // Step 3b: Exclude dirty/recomputing representations from results
@@ -761,7 +814,7 @@ impl Executor {
                         // Determine which repr_name was searched based on the strategy
                         let prefix = format!("{}:", p.collection);
                         let repr_name = match &p.strategy {
-                            SearchStrategy::Hnsw | SearchStrategy::Hybrid => {
+                            SearchStrategy::Hnsw | SearchStrategy::Hybrid | SearchStrategy::NaturalLanguage => {
                                 self.indexes.iter()
                                     .find(|e| e.key().starts_with(&prefix))
                                     .map(|e| e.key().strip_prefix(&prefix).unwrap_or("").to_string())
@@ -1872,6 +1925,7 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
                 SearchStrategy::Hnsw => "HnswSearch",
                 SearchStrategy::Sparse => "SparseSearch",
                 SearchStrategy::Hybrid => "HybridSearch",
+                SearchStrategy::NaturalLanguage => "NaturalLanguageSearch",
             };
             props.push(("strategy", strategy_str.into()));
             props.push(("k", p.k.to_string()));
@@ -2927,6 +2981,8 @@ mod tests {
             k: 10,
             confidence_threshold: 0.0,
             strategy: SearchStrategy::Sparse,
+            query_text: None,
+            using_repr: None,
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 2);
@@ -3002,6 +3058,8 @@ mod tests {
             k: 10,
             confidence_threshold: 0.0,
             strategy: SearchStrategy::Hybrid,
+            query_text: None,
+            using_repr: None,
         })).await.unwrap();
 
         // Both entities should appear, d1 should rank higher (matches both dense and sparse)
@@ -3079,6 +3137,8 @@ mod tests {
             k: 10,
             confidence_threshold: 0.0,
             strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
         })).await.unwrap();
 
         // Only London entities should be returned
@@ -3102,6 +3162,8 @@ mod tests {
             k: 5,
             confidence_threshold: 0.8,
             strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
         });
 
         let result = exec
@@ -3176,6 +3238,8 @@ mod tests {
             k: 5,
             confidence_threshold: 0.0,
             strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
         });
 
         let result = exec
@@ -3721,6 +3785,8 @@ mod tests {
                 k: 10,
                 confidence_threshold: 0.0,
                 strategy: SearchStrategy::Hnsw,
+                query_text: None,
+                using_repr: None,
             }))
             .await
             .unwrap();
@@ -3746,6 +3812,8 @@ mod tests {
                 k: 10,
                 confidence_threshold: 0.0,
                 strategy: SearchStrategy::Hnsw,
+                query_text: None,
+                using_repr: None,
             }))
             .await
             .unwrap();
@@ -3913,6 +3981,8 @@ mod tests {
                 k: 10,
                 confidence_threshold: 0.0,
                 strategy: SearchStrategy::Hnsw,
+                query_text: None,
+                using_repr: None,
             }))
             .await
             .unwrap();
@@ -3938,6 +4008,8 @@ mod tests {
                 k: 10,
                 confidence_threshold: 0.0,
                 strategy: SearchStrategy::Hnsw,
+                query_text: None,
+                using_repr: None,
             }))
             .await
             .unwrap();
@@ -3969,9 +4041,235 @@ mod tests {
                 k: 10,
                 confidence_threshold: 0.0,
                 strategy: SearchStrategy::Hnsw,
+                query_text: None,
+                using_repr: None,
             }))
             .await
             .unwrap();
         assert_eq!(result.rows.len(), 0, "both recomputing entities should be excluded");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 11 (Phase 10): Natural Language SEARCH via vectoriser encode_query
+    // -----------------------------------------------------------------------
+
+    /// A test vectoriser that produces deterministic dense vectors from field values and query text.
+    struct TestDenseVectoriser;
+
+    #[async_trait::async_trait]
+    impl crate::vectoriser::Vectoriser for TestDenseVectoriser {
+        fn id(&self) -> &str { "test-dense" }
+        fn model_id(&self) -> &str { "test-dense-model" }
+        fn output_size(&self) -> usize { 3 }
+        fn output_kind(&self) -> crate::vectoriser::VectorKind { crate::vectoriser::VectorKind::Dense }
+
+        async fn encode(&self, fields: &crate::vectoriser::FieldSet) -> Result<VectorData, crate::vectoriser::VectoriserError> {
+            // Produce a vector based on field content
+            let combined: String = fields.values().cloned().collect();
+            let v = if combined.contains("jazz") || combined.contains("Jazz") {
+                vec![1.0_f32, 0.0, 0.0]
+            } else if combined.contains("rock") || combined.contains("Rock") {
+                vec![0.0_f32, 1.0, 0.0]
+            } else {
+                vec![0.0_f32, 0.0, 1.0]
+            };
+            Ok(VectorData::Dense(v))
+        }
+
+        async fn encode_query(&self, query: &str) -> Result<VectorData, crate::vectoriser::VectoriserError> {
+            // Query about jazz → vector near [1,0,0]
+            let v = if query.contains("jazz") || query.contains("Jazz") {
+                vec![1.0_f32, 0.0, 0.0]
+            } else if query.contains("rock") || query.contains("Rock") {
+                vec![0.0_f32, 1.0, 0.0]
+            } else {
+                vec![0.5_f32, 0.5, 0.0]
+            };
+            Ok(VectorData::Dense(v))
+        }
+    }
+
+    #[tokio::test]
+    async fn search_natural_language() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FjallStore::open(&dir.path().join("store")).unwrap();
+        let wal_config = WalConfig {
+            wal_dir: dir.path().join("wal"),
+            ..Default::default()
+        };
+        let wal = WalWriter::open(wal_config).await.unwrap();
+        let location = Arc::new(LocationTable::new());
+        let registry = Arc::new(VectoriserRegistry::new());
+
+        // Register the test vectoriser for venues:semantic
+        registry.register("venues", "semantic", Arc::new(TestDenseVectoriser));
+
+        let exec = Executor::new(store, wal, location, registry);
+
+        // Create collection with a managed representation
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "venues".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "semantic".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec!["name".into()],
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+            vectoriser_config: None,
+        }))
+        .await
+        .unwrap();
+
+        // Insert entities — auto-vectorisation will call encode() via the registered vectoriser
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("jazz club".into())],
+            vectors: vec![],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v2".into()), Literal::String("rock bar".into())],
+            vectors: vec![],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+
+        // Natural language SEARCH: "jazz" should find v1 first
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: None,
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::NaturalLanguage,
+                query_text: Some("jazz".into()),
+                using_repr: Some("semantic".into()),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.rows.is_empty(), "should find at least one entity");
+        // v1 (jazz) should be the top result since query vector [1,0,0] is closest to v1's [1,0,0]
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v1".into())),
+            "jazz query should find v1 first"
+        );
+
+        // Natural language SEARCH: "rock" should find v2 first
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: None,
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::NaturalLanguage,
+                query_text: Some("rock".into()),
+                using_repr: Some("semantic".into()),
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.rows.is_empty(), "should find at least one entity");
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v2".into())),
+            "rock query should find v2 first"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_natural_language_auto_selects_repr() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FjallStore::open(&dir.path().join("store")).unwrap();
+        let wal_config = WalConfig {
+            wal_dir: dir.path().join("wal"),
+            ..Default::default()
+        };
+        let wal = WalWriter::open(wal_config).await.unwrap();
+        let location = Arc::new(LocationTable::new());
+        let registry = Arc::new(VectoriserRegistry::new());
+        registry.register("venues", "semantic", Arc::new(TestDenseVectoriser));
+
+        let exec = Executor::new(store, wal, location, registry);
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "venues".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "semantic".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec!["name".into()],
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+            vectoriser_config: None,
+        }))
+        .await
+        .unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("jazz club".into())],
+            vectors: vec![],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+
+        // SEARCH without USING — should auto-select "semantic" (first non-sparse repr with FIELDS)
+        let result = exec
+            .execute(&Plan::Search(SearchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                dense_vector: None,
+                sparse_vector: None,
+                filter: None,
+                pre_filter: None,
+                k: 10,
+                confidence_threshold: 0.0,
+                strategy: SearchStrategy::NaturalLanguage,
+                query_text: Some("jazz".into()),
+                using_repr: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1, "should find the inserted entity");
+        assert_eq!(
+            result.rows[0].values.get("id"),
+            Some(&Value::String("v1".into()))
+        );
     }
 }

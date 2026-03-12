@@ -200,6 +200,8 @@ fn search_strategy_to_proto(ss: &SearchStrategy) -> i32 {
         SearchStrategy::Hnsw => pb::SearchStrategyProto::SearchStrategyHnsw as i32,
         SearchStrategy::Sparse => pb::SearchStrategyProto::SearchStrategySparse as i32,
         SearchStrategy::Hybrid => pb::SearchStrategyProto::SearchStrategyHybrid as i32,
+        // NaturalLanguage resolves to HNSW after encode_query — serialise as Hnsw for now
+        SearchStrategy::NaturalLanguage => pb::SearchStrategyProto::SearchStrategyHnsw as i32,
     }
 }
 
@@ -613,6 +615,8 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     k: sp.k as usize,
                     confidence_threshold: sp.confidence_threshold,
                     strategy: proto_to_search_strategy(sp.strategy),
+                    query_text: None,
+                    using_repr: None,
                 }))
             }
 
@@ -763,6 +767,8 @@ mod tests {
             k: 5,
             confidence_threshold: 0.8,
             strategy: SearchStrategy::Hybrid,
+            query_text: None,
+            using_repr: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1061,6 +1067,8 @@ mod tests {
             k: 10,
             confidence_threshold: 0.0,
             strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
         });
         let restored = round_trip(plan);
         match restored {
