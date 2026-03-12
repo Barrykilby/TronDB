@@ -9,6 +9,7 @@ trondb-tql = { path = "../trondb-tql" }
 trondb-wal = { path = "../trondb-wal" }
 trondb-routing = { path = "../trondb-routing" }
 trondb-proto = { path = "../trondb-proto" }
+trondb-vectoriser = { path = "../trondb-vectoriser" }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
 tonic = { workspace = true }

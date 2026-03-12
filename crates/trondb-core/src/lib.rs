@@ -399,6 +399,15 @@ impl Engine {
         &self.vectoriser_registry
     }
 
+    /// Returns all stored collection schemas (snapshot of in-memory DashMap).
+    pub fn schemas(&self) -> Vec<types::CollectionSchema> {
+        self.executor
+            .schemas()
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
     /// Save all HNSW index snapshots to disk.
     pub fn save_hnsw_snapshots(&self) -> Result<(), EngineError> {
         let snap_dir = self.data_dir.join("hnsw_snapshots");
@@ -2272,5 +2281,80 @@ mod tests {
         };
         assert_eq!(engine.location().get(&key1).unwrap().state, crate::location::LocState::Clean);
         assert_eq!(engine.location().get(&key2).unwrap().state, crate::location::LocState::Clean);
+    }
+
+    #[tokio::test]
+    async fn end_to_end_auto_vectorise_and_nl_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().join("store"),
+            wal: trondb_wal::WalConfig {
+                wal_dir: dir.path().join("wal"),
+                ..Default::default()
+            },
+            snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
+        };
+        let (engine, _) = Engine::open(config).await.unwrap();
+
+        engine.execute_tql("CREATE COLLECTION venues (
+            MODEL 'mock-model'
+            FIELD name TEXT,
+            FIELD description TEXT,
+            REPRESENTATION semantic DIMENSIONS 8 FIELDS (name, description),
+            REPRESENTATION identity DIMENSIONS 8,
+        );").await.unwrap();
+
+        // Register mock vectoriser for the FIELDS-based representation
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("venues", "semantic", mock);
+
+        // INSERT with auto-vectorise (no explicit vector for 'semantic') + explicit for 'identity'
+        engine.execute_tql(
+            "INSERT INTO venues (id, name, description) VALUES ('v1', 'Blue Note', 'Famous jazz club') \
+             REPRESENTATION identity VECTOR [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];"
+        ).await.unwrap();
+
+        engine.execute_tql(
+            "INSERT INTO venues (id, name, description) VALUES ('v2', 'Rock Arena', 'Heavy metal venue') \
+             REPRESENTATION identity VECTOR [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2];"
+        ).await.unwrap();
+
+        // Natural language SEARCH via the 'semantic' representation
+        let result = engine.execute_tql(
+            "SEARCH venues NEAR 'jazz music' USING semantic LIMIT 10;"
+        ).await.unwrap();
+        assert!(!result.rows.is_empty(), "NL search should return results");
+
+        // UPDATE triggers dirty
+        engine.execute_tql("UPDATE 'v1' IN venues SET name = 'Blue Note Jazz Club';").await.unwrap();
+
+        // Recompute dirty representations
+        engine.trigger_cascade_recompute().await.unwrap();
+
+        // Search again after recompute
+        let result2 = engine.execute_tql(
+            "SEARCH venues NEAR 'jazz club' USING semantic LIMIT 10;"
+        ).await.unwrap();
+        assert!(!result2.rows.is_empty(), "NL search should return results after recompute");
+    }
+
+    #[tokio::test]
+    async fn schemas_returns_all_collections() {
+        let (engine, _dir) = test_engine().await;
+
+        engine.execute_tql("CREATE COLLECTION alpha (
+            REPRESENTATION r DIMENSIONS 3 METRIC COSINE
+        );").await.unwrap();
+        engine.execute_tql("CREATE COLLECTION beta (
+            REPRESENTATION r DIMENSIONS 3 METRIC COSINE
+        );").await.unwrap();
+
+        let schemas = engine.schemas();
+        assert_eq!(schemas.len(), 2);
+
+        let names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"beta".to_string()));
     }
 }

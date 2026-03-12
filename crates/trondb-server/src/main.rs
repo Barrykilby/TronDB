@@ -59,6 +59,10 @@ async fn shutdown_signal() {
 async fn start_primary(config: config::ClusterConfig) -> Result<(), Box<dyn std::error::Error>> {
     let engine_config = config.to_engine_config();
     let (engine, pending_records) = trondb_core::Engine::open(engine_config).await?;
+
+    // Register vectorisers for existing collections that have a VectoriserConfig
+    register_vectorisers(&engine);
+
     let engine = Arc::new(engine);
 
     // Process pending WAL records (TierMigration + AffinityGroup)
@@ -111,6 +115,10 @@ async fn start_primary(config: config::ClusterConfig) -> Result<(), Box<dyn std:
 async fn start_replica(config: config::ClusterConfig) -> Result<(), Box<dyn std::error::Error>> {
     let engine_config = config.to_engine_config();
     let (engine, _pending_records) = trondb_core::Engine::open(engine_config).await?;
+
+    // Register vectorisers for existing collections that have a VectoriserConfig
+    register_vectorisers(&engine);
+
     let engine = Arc::new(engine);
 
     // Find the primary peer in the cluster configuration
@@ -257,4 +265,27 @@ async fn start_router(config: config::ClusterConfig) -> Result<(), Box<dyn std::
         .await?;
 
     Ok(())
+}
+
+/// Register vectorisers for all existing collections that have a `VectoriserConfig`.
+///
+/// Called during startup (before `Arc::new(engine)`) so that the engine can
+/// auto-vectorise inserts and handle SEARCH NEAR 'text' queries immediately.
+fn register_vectorisers(engine: &trondb_core::Engine) {
+    for schema in engine.schemas() {
+        if let Some(ref vc) = schema.vectoriser_config {
+            for repr in &schema.representations {
+                if !repr.fields.is_empty() {
+                    match trondb_vectoriser::create_vectoriser_from_config(vc, repr) {
+                        Ok(v) => engine.vectoriser_registry().register(&schema.name, &repr.name, v),
+                        Err(e) => tracing::warn!(
+                            collection = %schema.name,
+                            repr = %repr.name,
+                            "could not create vectoriser: {e}",
+                        ),
+                    }
+                }
+            }
+        }
+    }
 }

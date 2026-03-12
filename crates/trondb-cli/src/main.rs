@@ -43,6 +43,23 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Register vectorisers for existing collections that have a VectoriserConfig
+    for schema in engine.schemas() {
+        if let Some(ref vc) = schema.vectoriser_config {
+            for repr in &schema.representations {
+                if !repr.fields.is_empty() {
+                    match trondb_vectoriser::create_vectoriser_from_config(vc, repr) {
+                        Ok(v) => engine.vectoriser_registry().register(&schema.name, &repr.name, v),
+                        Err(e) => eprintln!(
+                            "warning: could not create vectoriser for {}.{}: {e}",
+                            schema.name, repr.name
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     let engine = Arc::new(engine);
 
     let wal = engine.wal_writer();
