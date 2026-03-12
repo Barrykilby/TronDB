@@ -147,8 +147,8 @@ impl Executor {
                         replayed += 1;
                     }
                 }
-                RecordType::EdgeConfirm | RecordType::EdgeConfidenceUpdate => {
-                    // Both EdgeConfirm and EdgeConfidenceUpdate store a full Edge payload
+                RecordType::EdgeConfirm | RecordType::EdgeConfidenceUpdate | RecordType::EdgeInferred => {
+                    // EdgeConfirm, EdgeConfidenceUpdate, and EdgeInferred all store a full Edge payload
                     let edge: crate::edge::Edge = rmp_serde::from_slice(&record.payload)
                         .map_err(|e| EngineError::Storage(e.to_string()))?;
                     if self.store.has_edge_type(&edge.edge_type) {
