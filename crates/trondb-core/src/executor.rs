@@ -142,6 +142,15 @@ impl Executor {
                         replayed += 1;
                     }
                 }
+                RecordType::EdgeConfirm | RecordType::EdgeConfidenceUpdate => {
+                    // Both EdgeConfirm and EdgeConfidenceUpdate store a full Edge payload
+                    let edge: crate::edge::Edge = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    if self.store.has_edge_type(&edge.edge_type) {
+                        self.store.insert_edge(&edge)?;
+                        replayed += 1;
+                    }
+                }
                 RecordType::EdgeDelete => {
                     #[derive(serde::Deserialize)]
                     struct EdgeDeletePayload {
@@ -1526,7 +1535,186 @@ impl Executor {
                     },
                 })
             }
-            Plan::ConfirmEdge(_) => Err(EngineError::UnsupportedOperation("CONFIRM EDGE executor not yet implemented".into())),
+            Plan::ConfirmEdge(p) => {
+                // Step 1: Validate edge type exists
+                let _edge_type = self.store.get_edge_type(&p.edge_type)?;
+
+                let from_id = LogicalId::from_string(&p.from_id);
+                let to_id = LogicalId::from_string(&p.to_id);
+
+                // Step 2: Look up existing edge in Fjall
+                let existing = self.store.get_edge(&p.edge_type, &p.from_id, &p.to_id)?;
+
+                let now_millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+
+                match existing {
+                    // Structural edges cannot be confirmed — they are already permanent at 1.0
+                    Some(ref edge) if edge.source == EdgeSource::Structural => {
+                        return Err(EngineError::InvalidQuery(
+                            format!(
+                                "cannot CONFIRM structural edge '{}' {} -> {} (already permanent at confidence 1.0)",
+                                p.edge_type, p.from_id, p.to_id,
+                            ),
+                        ));
+                    }
+
+                    // Inferred → Confirmed: delete old, create new with Confirmed source
+                    Some(ref _edge) if _edge.source == EdgeSource::Inferred => {
+                        let new_edge = Edge {
+                            from_id: from_id.clone(),
+                            to_id: to_id.clone(),
+                            edge_type: p.edge_type.clone(),
+                            confidence: p.confidence,
+                            metadata: _edge.metadata.clone(),
+                            created_at: now_millis,
+                            source: EdgeSource::Confirmed,
+                        };
+
+                        // WAL: TxBegin -> EdgeConfirm -> commit
+                        let tx_id = self.wal.next_tx_id();
+                        self.wal.append(RecordType::TxBegin, &p.edge_type, tx_id, 1, vec![]);
+                        let payload = rmp_serde::to_vec_named(&new_edge)
+                            .map_err(|e| EngineError::Storage(e.to_string()))?;
+                        self.wal.append(RecordType::EdgeConfirm, &p.edge_type, tx_id, 1, payload);
+                        self.wal.commit(tx_id).await?;
+
+                        // Apply to Fjall (insert_edge overwrites the same key)
+                        self.store.insert_edge(&new_edge)?;
+                        self.store.persist()?;
+
+                        // Update AdjacencyIndex: remove old entry, insert new
+                        self.adjacency.remove(&from_id, &p.edge_type, &to_id);
+                        self.adjacency.insert(&from_id, &p.edge_type, &to_id, p.confidence, now_millis, EdgeSource::Confirmed);
+
+                        Ok(QueryResult {
+                            columns: vec!["result".into()],
+                            rows: vec![Row {
+                                values: HashMap::from([(
+                                    "result".into(),
+                                    Value::String(format!(
+                                        "Edge '{}' confirmed: {} -> {} (was Inferred, now Confirmed at {:.2})",
+                                        p.edge_type, p.from_id, p.to_id, p.confidence,
+                                    )),
+                                )]),
+                                score: None,
+                            }],
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: 0,
+                                mode: QueryMode::Deterministic,
+                                tier: "Fjall".into(),
+                            },
+                        })
+                    }
+
+                    // Confirmed → re-confirm: update confidence (idempotent)
+                    Some(ref _edge) if _edge.source == EdgeSource::Confirmed => {
+                        let updated_edge = Edge {
+                            from_id: from_id.clone(),
+                            to_id: to_id.clone(),
+                            edge_type: p.edge_type.clone(),
+                            confidence: p.confidence,
+                            metadata: _edge.metadata.clone(),
+                            created_at: _edge.created_at,
+                            source: EdgeSource::Confirmed,
+                        };
+
+                        // WAL: TxBegin -> EdgeConfidenceUpdate -> commit
+                        let tx_id = self.wal.next_tx_id();
+                        self.wal.append(RecordType::TxBegin, &p.edge_type, tx_id, 1, vec![]);
+                        let payload = rmp_serde::to_vec_named(&updated_edge)
+                            .map_err(|e| EngineError::Storage(e.to_string()))?;
+                        self.wal.append(RecordType::EdgeConfidenceUpdate, &p.edge_type, tx_id, 1, payload);
+                        self.wal.commit(tx_id).await?;
+
+                        // Apply to Fjall
+                        self.store.insert_edge(&updated_edge)?;
+                        self.store.persist()?;
+
+                        // Update AdjacencyIndex
+                        self.adjacency.remove(&from_id, &p.edge_type, &to_id);
+                        self.adjacency.insert(&from_id, &p.edge_type, &to_id, p.confidence, _edge.created_at, EdgeSource::Confirmed);
+
+                        Ok(QueryResult {
+                            columns: vec!["result".into()],
+                            rows: vec![Row {
+                                values: HashMap::from([(
+                                    "result".into(),
+                                    Value::String(format!(
+                                        "Edge '{}' re-confirmed: {} -> {} (confidence updated to {:.2})",
+                                        p.edge_type, p.from_id, p.to_id, p.confidence,
+                                    )),
+                                )]),
+                                score: None,
+                            }],
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: 0,
+                                mode: QueryMode::Deterministic,
+                                tier: "Fjall".into(),
+                            },
+                        })
+                    }
+
+                    // Some edge with unknown source — treat as error (shouldn't happen)
+                    Some(_) => {
+                        return Err(EngineError::InvalidQuery(
+                            format!("edge '{}' {} -> {} has unexpected source", p.edge_type, p.from_id, p.to_id),
+                        ));
+                    }
+
+                    // No existing edge → create new Confirmed edge
+                    None => {
+                        let new_edge = Edge {
+                            from_id: from_id.clone(),
+                            to_id: to_id.clone(),
+                            edge_type: p.edge_type.clone(),
+                            confidence: p.confidence,
+                            metadata: HashMap::new(),
+                            created_at: now_millis,
+                            source: EdgeSource::Confirmed,
+                        };
+
+                        // WAL: TxBegin -> EdgeConfirm -> commit
+                        let tx_id = self.wal.next_tx_id();
+                        self.wal.append(RecordType::TxBegin, &p.edge_type, tx_id, 1, vec![]);
+                        let payload = rmp_serde::to_vec_named(&new_edge)
+                            .map_err(|e| EngineError::Storage(e.to_string()))?;
+                        self.wal.append(RecordType::EdgeConfirm, &p.edge_type, tx_id, 1, payload);
+                        self.wal.commit(tx_id).await?;
+
+                        // Apply to Fjall
+                        self.store.insert_edge(&new_edge)?;
+                        self.store.persist()?;
+
+                        // Update AdjacencyIndex
+                        self.adjacency.insert(&from_id, &p.edge_type, &to_id, p.confidence, now_millis, EdgeSource::Confirmed);
+
+                        Ok(QueryResult {
+                            columns: vec!["result".into()],
+                            rows: vec![Row {
+                                values: HashMap::from([(
+                                    "result".into(),
+                                    Value::String(format!(
+                                        "Edge '{}' confirmed: {} -> {} (new Confirmed edge at {:.2})",
+                                        p.edge_type, p.from_id, p.to_id, p.confidence,
+                                    )),
+                                )]),
+                                score: None,
+                            }],
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: 0,
+                                mode: QueryMode::Deterministic,
+                                tier: "Fjall".into(),
+                            },
+                        })
+                    }
+                }
+            }
             Plan::ExplainHistory(_) => Err(EngineError::UnsupportedOperation("EXPLAIN HISTORY executor not yet implemented".into())),
 
             Plan::UpdateEntity(p) => {
@@ -2259,7 +2447,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
+    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -5120,5 +5308,154 @@ mod tests {
         })).await.unwrap();
 
         assert!(result.rows.is_empty(), "INFER with no applicable edge types should return empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // CONFIRM EDGE executor tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn confirm_creates_new_confirmed_edge() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collections and edge type
+        create_collection(&exec, "people", 3).await;
+        create_collection(&exec, "places", 3).await;
+
+        insert_entity(&exec, "people", "p1", vec![], None).await;
+        insert_entity(&exec, "places", "pl1", vec![], None).await;
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "visits".into(),
+            from_collection: "people".into(),
+            to_collection: "places".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // CONFIRM EDGE when no edge exists — should create new Confirmed edge
+        let result = exec.execute(&Plan::ConfirmEdge(ConfirmEdgePlan {
+            from_id: "p1".into(),
+            to_id: "pl1".into(),
+            edge_type: "visits".into(),
+            confidence: 0.9,
+        })).await.unwrap();
+
+        let msg = match result.rows[0].values.get("result").unwrap() {
+            Value::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert!(msg.contains("confirmed"), "Result message should mention confirmed: {}", msg);
+
+        // Verify edge was persisted in Fjall with Confirmed source
+        let stored = exec.store.get_edge("visits", "p1", "pl1").unwrap();
+        assert!(stored.is_some(), "Edge should exist in Fjall after CONFIRM");
+        let edge = stored.unwrap();
+        assert_eq!(edge.source, EdgeSource::Confirmed);
+        assert!((edge.confidence - 0.9).abs() < 0.001);
+
+        // Verify AdjacencyIndex was updated
+        let adj_entries = exec.adjacency.get(&LogicalId::from_string("p1"), "visits");
+        assert_eq!(adj_entries.len(), 1);
+        assert_eq!(adj_entries[0].to_id, LogicalId::from_string("pl1"));
+        assert_eq!(adj_entries[0].source, EdgeSource::Confirmed);
+        assert!((adj_entries[0].confidence - 0.9).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn confirm_rejects_structural_edge() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        insert_entity(&exec, "artists", "a1", vec![], None).await;
+        insert_entity(&exec, "venues", "v1", vec![], None).await;
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "plays_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Insert a structural edge (normal INSERT EDGE creates structural edges)
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "plays_at".into(),
+            from_id: "a1".into(),
+            to_id: "v1".into(),
+            metadata: vec![],
+        })).await.unwrap();
+
+        // CONFIRM should fail on structural edge
+        let result = exec.execute(&Plan::ConfirmEdge(ConfirmEdgePlan {
+            from_id: "a1".into(),
+            to_id: "v1".into(),
+            edge_type: "plays_at".into(),
+            confidence: 0.95,
+        })).await;
+
+        assert!(result.is_err(), "CONFIRM should reject structural edges");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("structural"), "Error should mention structural: {}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn confirm_updates_existing_confirmed_edge_confidence() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection(&exec, "people", 3).await;
+        create_collection(&exec, "places", 3).await;
+
+        insert_entity(&exec, "people", "p1", vec![], None).await;
+        insert_entity(&exec, "places", "pl1", vec![], None).await;
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "visits".into(),
+            from_collection: "people".into(),
+            to_collection: "places".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // First CONFIRM — creates new Confirmed edge at 0.8
+        exec.execute(&Plan::ConfirmEdge(ConfirmEdgePlan {
+            from_id: "p1".into(),
+            to_id: "pl1".into(),
+            edge_type: "visits".into(),
+            confidence: 0.8,
+        })).await.unwrap();
+
+        // Verify initial state
+        let edge = exec.store.get_edge("visits", "p1", "pl1").unwrap().unwrap();
+        assert_eq!(edge.source, EdgeSource::Confirmed);
+        assert!((edge.confidence - 0.8).abs() < 0.001);
+        let original_created_at = edge.created_at;
+
+        // Re-CONFIRM with different confidence — should update confidence, preserve created_at
+        let result = exec.execute(&Plan::ConfirmEdge(ConfirmEdgePlan {
+            from_id: "p1".into(),
+            to_id: "pl1".into(),
+            edge_type: "visits".into(),
+            confidence: 0.95,
+        })).await.unwrap();
+
+        let msg = match result.rows[0].values.get("result").unwrap() {
+            Value::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert!(msg.contains("re-confirmed"), "Result message should mention re-confirmed: {}", msg);
+
+        // Verify updated state in Fjall
+        let updated = exec.store.get_edge("visits", "p1", "pl1").unwrap().unwrap();
+        assert_eq!(updated.source, EdgeSource::Confirmed);
+        assert!((updated.confidence - 0.95).abs() < 0.001);
+        assert_eq!(updated.created_at, original_created_at, "created_at should be preserved on re-confirmation");
+
+        // Verify AdjacencyIndex reflects updated confidence
+        let adj_entries = exec.adjacency.get(&LogicalId::from_string("p1"), "visits");
+        assert_eq!(adj_entries.len(), 1);
+        assert!((adj_entries[0].confidence - 0.95).abs() < 0.001);
     }
 }

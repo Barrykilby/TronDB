@@ -246,6 +246,23 @@ impl FjallStore {
         Ok(())
     }
 
+    pub fn get_edge(&self, edge_type: &str, from_id: &str, to_id: &str) -> Result<Option<crate::edge::Edge>, EngineError> {
+        let partition_name = format!("edges.{edge_type}");
+        let partition = self.keyspace
+            .open_partition(&partition_name, PartitionCreateOptions::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let key = format!("{EDGE_PREFIX}{from_id}:{to_id}");
+        match partition.get(&key).map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))? {
+            Some(bytes) => {
+                let edge: crate::edge::Edge = rmp_serde::from_slice(&bytes)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                Ok(Some(edge))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn delete_edge(&self, edge_type: &str, from_id: &str, to_id: &str) -> Result<(), EngineError> {
         let partition_name = format!("edges.{edge_type}");
         let partition = self.keyspace
