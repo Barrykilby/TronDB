@@ -8,6 +8,7 @@ members = [
     "crates/trondb-routing",
     "crates/trondb-proto",
     "crates/trondb-server",
+    "crates/trondb-vectoriser",
 ]
 
 [workspace.dependencies]

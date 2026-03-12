@@ -1,0 +1,36 @@
+[package]
+name = "trondb-vectoriser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+trondb-core = { path = "../trondb-core" }
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = []
+onnx = ["dep:ort", "dep:tokenizers"]
+external = ["dep:reqwest"]
+
+[dependencies.ort]
+version = "2.0.0-rc.12"
+optional = true
+
+[dependencies.tokenizers]
+version = "0.21"
+optional = true
+default-features = false
+features = ["onig"]
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["json"]
+optional = true
