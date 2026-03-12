@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use error::EngineError;
 use executor::Executor;
+use inference::InferenceAuditBuffer;
 use location::Tier;
 use result::QueryResult;
 use store::FjallStore;
@@ -43,6 +44,7 @@ pub struct Engine {
     executor: Executor,
     data_dir: PathBuf,
     vectoriser_registry: Arc<VectoriserRegistry>,
+    inference_audit: Arc<InferenceAuditBuffer>,
     _snapshot_handle: Option<tokio::task::JoinHandle<()>>,
     _hnsw_snapshot_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -68,7 +70,8 @@ impl Engine {
         let wal = WalWriter::open(config.wal).await?;
         let location = Arc::new(location);
         let vectoriser_registry = Arc::new(VectoriserRegistry::new());
-        let executor = Executor::new(store, wal, Arc::clone(&location), Arc::clone(&vectoriser_registry));
+        let inference_audit = Arc::new(InferenceAuditBuffer::new(1000));
+        let executor = Executor::new(store, wal, Arc::clone(&location), Arc::clone(&vectoriser_registry), Arc::clone(&inference_audit));
 
         // Filter records to only replay those after snapshot LSN
         let records_to_replay: Vec<_> = recovery
@@ -353,6 +356,7 @@ impl Engine {
             executor,
             data_dir: config.data_dir.clone(),
             vectoriser_registry,
+            inference_audit,
             _snapshot_handle: snapshot_handle,
             _hnsw_snapshot_handle: hnsw_snapshot_handle,
         }, unhandled_records))
@@ -399,6 +403,10 @@ impl Engine {
 
     pub fn vectoriser_registry(&self) -> &Arc<VectoriserRegistry> {
         &self.vectoriser_registry
+    }
+
+    pub fn inference_audit(&self) -> &InferenceAuditBuffer {
+        &self.inference_audit
     }
 
     /// Returns all stored collection schemas (snapshot of in-memory DashMap).

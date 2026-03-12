@@ -8,6 +8,7 @@ use crate::edge::{AdjacencyIndex, Edge, EdgeSource, EdgeType};
 use crate::error::EngineError;
 use crate::field_index::FieldIndex;
 use crate::index::HnswIndex;
+use crate::inference::{InferenceAuditBuffer, InferenceAuditEntry, InferenceCandidate, InferenceTrigger};
 use crate::location::{
     Encoding, LocState, LocationDescriptor, LocationTable, NodeAddress, ReprKey, Tier,
 };
@@ -40,6 +41,8 @@ pub struct Executor {
     vectoriser_registry: Arc<VectoriserRegistry>,
     /// Reverse map: entity_id → collection name (for recompute_dirty)
     entity_collections: DashMap<LogicalId, String>,
+    /// Ring buffer of inference audit entries for EXPLAIN HISTORY
+    inference_audit: Arc<InferenceAuditBuffer>,
 }
 
 impl Executor {
@@ -48,6 +51,7 @@ impl Executor {
         wal: WalWriter,
         location: Arc<LocationTable>,
         vectoriser_registry: Arc<VectoriserRegistry>,
+        inference_audit: Arc<InferenceAuditBuffer>,
     ) -> Self {
         Self {
             store,
@@ -61,6 +65,7 @@ impl Executor {
             edge_types: DashMap::new(),
             vectoriser_registry,
             entity_collections: DashMap::new(),
+            inference_audit,
         }
     }
 
@@ -1455,6 +1460,8 @@ impl Executor {
                 let confidence_floor = p.confidence_floor.unwrap_or(default_floor);
 
                 let mut all_candidates: Vec<(String, LogicalId, f32)> = Vec::new(); // (edge_type, to_id, score)
+                let mut total_candidates_evaluated: usize = 0;
+                let mut total_candidates_above_threshold: usize = 0;
 
                 for et in &applicable_edge_types {
                     let target_collection = &et.to_collection;
@@ -1495,10 +1502,12 @@ impl Executor {
                         if existing_targets.contains(&candidate_id) {
                             continue;
                         }
+                        total_candidates_evaluated += 1;
                         // Step 6: Apply confidence floor filter
                         if score < confidence_floor {
                             continue;
                         }
+                        total_candidates_above_threshold += 1;
                         all_candidates.push((et.name.clone(), candidate_id, score));
                     }
                 }
@@ -1506,6 +1515,26 @@ impl Executor {
                 // Step 7: Sort by score descending and apply limit
                 all_candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
                 all_candidates.truncate(global_limit);
+
+                // Record inference audit entry
+                self.inference_audit.record(InferenceAuditEntry {
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    source_entity: source_id.clone(),
+                    edge_type: "all".to_string(),
+                    candidates_evaluated: total_candidates_evaluated,
+                    candidates_above_threshold: total_candidates_above_threshold,
+                    top_candidates: all_candidates.iter().map(|(_edge_type, to_id, score)| {
+                        InferenceCandidate {
+                            entity_id: to_id.clone(),
+                            similarity_score: *score,
+                            accepted: true,
+                        }
+                    }).collect(),
+                    trigger: InferenceTrigger::Explicit,
+                });
 
                 // Step 8: Build QueryResult rows
                 let mut rows = Vec::new();
@@ -1715,7 +1744,36 @@ impl Executor {
                     }
                 }
             }
-            Plan::ExplainHistory(_) => Err(EngineError::UnsupportedOperation("EXPLAIN HISTORY executor not yet implemented".into())),
+            Plan::ExplainHistory(p) => {
+                let entity_id = LogicalId::from_string(&p.entity_id);
+                let entries = self.inference_audit.query(&entity_id, p.limit);
+
+                let rows: Vec<Row> = entries.iter().map(|e| {
+                    let mut values = HashMap::new();
+                    values.insert("timestamp".to_string(), Value::Int(e.timestamp as i64));
+                    values.insert("entity_id".to_string(), Value::String(e.source_entity.to_string()));
+                    values.insert("edge_type".to_string(), Value::String(e.edge_type.clone()));
+                    values.insert("candidates_evaluated".to_string(), Value::Int(e.candidates_evaluated as i64));
+                    values.insert("candidates_above_threshold".to_string(), Value::Int(e.candidates_above_threshold as i64));
+                    values.insert("trigger".to_string(), Value::String(format!("{:?}", e.trigger)));
+                    Row { values, score: None }
+                }).collect();
+
+                Ok(QueryResult {
+                    columns: vec![
+                        "timestamp".into(), "entity_id".into(), "edge_type".into(),
+                        "candidates_evaluated".into(), "candidates_above_threshold".into(),
+                        "trigger".into(),
+                    ],
+                    rows,
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Ram".into(),
+                    },
+                })
+            }
 
             Plan::UpdateEntity(p) => {
                 let entity_id = LogicalId::from_string(&p.entity_id);
@@ -1906,6 +1964,10 @@ impl Executor {
 
     pub fn entity_collections(&self) -> &DashMap<LogicalId, String> {
         &self.entity_collections
+    }
+
+    pub fn inference_audit(&self) -> &InferenceAuditBuffer {
+        &self.inference_audit
     }
 
     /// Look up which collection an entity belongs to (via the reverse map).
@@ -2447,7 +2509,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
+    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -2459,7 +2521,7 @@ mod tests {
             ..Default::default()
         };
         let wal = WalWriter::open(wal_config).await.unwrap();
-        (Executor::new(store, wal, Arc::new(LocationTable::new()), Arc::new(VectoriserRegistry::new())), dir)
+        (Executor::new(store, wal, Arc::new(LocationTable::new()), Arc::new(VectoriserRegistry::new()), Arc::new(InferenceAuditBuffer::new(1000))), dir)
     }
 
     async fn create_collection(exec: &Executor, name: &str, dims: usize) {
@@ -4339,7 +4401,7 @@ mod tests {
         };
         let wal = WalWriter::open(wal_config).await.unwrap();
         let location = Arc::new(LocationTable::new());
-        let exec = Executor::new(store, wal, location.clone(), Arc::new(VectoriserRegistry::new()));
+        let exec = Executor::new(store, wal, location.clone(), Arc::new(VectoriserRegistry::new()), Arc::new(InferenceAuditBuffer::new(1000)));
 
         // Create collection with a representation that has FIELDS
         exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
@@ -4520,7 +4582,7 @@ mod tests {
         // Register the test vectoriser for venues:semantic
         registry.register("venues", "semantic", Arc::new(TestDenseVectoriser));
 
-        let exec = Executor::new(store, wal, location, registry);
+        let exec = Executor::new(store, wal, location, registry, Arc::new(InferenceAuditBuffer::new(1000)));
 
         // Create collection with a managed representation
         exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
@@ -4631,7 +4693,7 @@ mod tests {
         let registry = Arc::new(VectoriserRegistry::new());
         registry.register("venues", "semantic", Arc::new(TestDenseVectoriser));
 
-        let exec = Executor::new(store, wal, location, registry);
+        let exec = Executor::new(store, wal, location, registry, Arc::new(InferenceAuditBuffer::new(1000)));
 
         exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
             name: "venues".into(),
@@ -5457,5 +5519,107 @@ mod tests {
         let adj_entries = exec.adjacency.get(&LogicalId::from_string("p1"), "visits");
         assert_eq!(adj_entries.len(), 1);
         assert!((adj_entries[0].confidence - 0.95).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn explain_history_returns_audit_entries() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collections
+        create_collection(&exec, "artists", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert source entity
+        insert_entity(
+            &exec, "artists", "artist1",
+            vec![("name", Literal::String("Rock Artist".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        ).await;
+
+        // Insert target entities
+        insert_entity(
+            &exec, "venues", "venue1",
+            vec![("name", Literal::String("Close Venue".into()))],
+            Some(vec![0.95, 0.1, 0.0]),
+        ).await;
+        insert_entity(
+            &exec, "venues", "venue2",
+            vec![("name", Literal::String("Mid Venue".into()))],
+            Some(vec![0.5, 0.5, 0.0]),
+        ).await;
+
+        // Create edge type
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "performs_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // EXPLAIN HISTORY before any INFER — should be empty
+        let result = exec.execute(&Plan::ExplainHistory(ExplainHistoryPlan {
+            entity_id: "artist1".into(),
+            limit: None,
+        })).await.unwrap();
+        assert!(result.rows.is_empty(), "EXPLAIN HISTORY should return no entries before INFER");
+
+        // Run INFER to generate audit entries
+        let infer_result = exec.execute(&Plan::Infer(InferPlan {
+            from_id: "artist1".into(),
+            edge_types: vec!["performs_at".into()],
+            limit: Some(10),
+            confidence_floor: None,
+        })).await.unwrap();
+        assert!(!infer_result.rows.is_empty(), "INFER should return proposals");
+
+        // Now EXPLAIN HISTORY should return entries
+        let result = exec.execute(&Plan::ExplainHistory(ExplainHistoryPlan {
+            entity_id: "artist1".into(),
+            limit: None,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1, "EXPLAIN HISTORY should return 1 audit entry after 1 INFER");
+
+        let row = &result.rows[0];
+        assert_eq!(row.values.get("entity_id"), Some(&Value::String("artist1".into())));
+        assert_eq!(row.values.get("edge_type"), Some(&Value::String("all".into())));
+        assert_eq!(row.values.get("trigger"), Some(&Value::String("Explicit".into())));
+
+        // candidates_evaluated should be > 0
+        if let Some(Value::Int(n)) = row.values.get("candidates_evaluated") {
+            assert!(*n > 0, "candidates_evaluated should be > 0, got {}", n);
+        } else {
+            panic!("candidates_evaluated should be an Int");
+        }
+
+        // Run INFER again
+        exec.execute(&Plan::Infer(InferPlan {
+            from_id: "artist1".into(),
+            edge_types: vec!["performs_at".into()],
+            limit: Some(10),
+            confidence_floor: None,
+        })).await.unwrap();
+
+        // EXPLAIN HISTORY should now return 2 entries
+        let result = exec.execute(&Plan::ExplainHistory(ExplainHistoryPlan {
+            entity_id: "artist1".into(),
+            limit: None,
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 2, "EXPLAIN HISTORY should return 2 audit entries after 2 INFERs");
+
+        // Test limit parameter
+        let result = exec.execute(&Plan::ExplainHistory(ExplainHistoryPlan {
+            entity_id: "artist1".into(),
+            limit: Some(1),
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 1, "EXPLAIN HISTORY with limit 1 should return 1 entry");
+
+        // EXPLAIN HISTORY for a different entity should return empty
+        let result = exec.execute(&Plan::ExplainHistory(ExplainHistoryPlan {
+            entity_id: "venue1".into(),
+            limit: None,
+        })).await.unwrap();
+        assert!(result.rows.is_empty(), "EXPLAIN HISTORY for non-inferred entity should be empty");
     }
 }
