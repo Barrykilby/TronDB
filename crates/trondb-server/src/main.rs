@@ -53,11 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn start_primary(config: config::ClusterConfig) -> Result<(), Box<dyn std::error::Error>> {
     let engine_config = config.to_engine_config();
-    let (engine, _pending_records) = trondb_core::Engine::open(engine_config).await?;
+    let (engine, pending_records) = trondb_core::Engine::open(engine_config).await?;
     let engine = Arc::new(engine);
 
     // Process pending WAL records (TierMigration + AffinityGroup)
-    // (wired in Task 18)
+    let affinity = trondb_routing::AffinityIndex::new();
+    trondb_routing::startup::process_pending_wal_records(&engine, &pending_records, &affinity).await?;
 
     let service = service::TronNodeService::new(engine.clone(), config.role);
     let addr = config.bind_addr.parse()?;
