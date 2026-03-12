@@ -63,6 +63,9 @@ pub enum EngineError {
         expected: String,
         got: String,
     },
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 #[cfg(test)]
