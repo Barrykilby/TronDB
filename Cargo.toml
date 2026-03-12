@@ -25,7 +25,7 @@ rustyline = "15"
 fjall = "2"
 rmp-serde = "1"
 crc32fast = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "time", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "time", "io-util", "macros", "signal"] }
 hnsw_rs = "0.3.4"
 anndists = "0.1.4"
 bincode = "1"
