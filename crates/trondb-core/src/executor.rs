@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
-use crate::edge::{AdjacencyIndex, Edge, EdgeType};
+use crate::edge::{AdjacencyIndex, Edge, EdgeSource, EdgeType};
 use crate::error::EngineError;
 use crate::field_index::FieldIndex;
 use crate::index::HnswIndex;
@@ -1031,6 +1031,7 @@ impl Executor {
                     confidence: 1.0,
                     metadata,
                     created_at: now_millis,
+                    source: EdgeSource::Structural,
                 };
 
                 // WAL: TxBegin -> EdgeWrite -> commit
@@ -1046,7 +1047,7 @@ impl Executor {
                 self.store.persist()?;
 
                 // Apply to AdjacencyIndex
-                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0, now_millis);
+                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0, now_millis, EdgeSource::Structural);
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],

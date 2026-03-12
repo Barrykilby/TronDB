@@ -9,6 +9,23 @@ use crate::types::{LogicalId, Value};
 pub type EdgeList = Vec<(String, LogicalId)>;
 
 // ---------------------------------------------------------------------------
+// EdgeSource — provenance of an edge
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EdgeSource {
+    Structural,
+    Inferred,
+    Confirmed,
+}
+
+impl Default for EdgeSource {
+    fn default() -> Self {
+        EdgeSource::Structural
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Edge — a directional relationship between two entities
 // ---------------------------------------------------------------------------
 
@@ -21,6 +38,8 @@ pub struct Edge {
     pub metadata: HashMap<String, Value>,
     #[serde(default)]
     pub created_at: u64,
+    #[serde(default)]
+    pub source: EdgeSource,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +111,7 @@ pub struct AdjEntry {
     pub to_id: LogicalId,
     pub confidence: f32,
     pub created_at: u64,
+    pub source: EdgeSource,
 }
 
 pub struct AdjacencyIndex {
@@ -107,12 +127,13 @@ impl AdjacencyIndex {
         }
     }
 
-    pub fn insert(&self, from_id: &LogicalId, edge_type: &str, to_id: &LogicalId, confidence: f32, created_at: u64) {
+    pub fn insert(&self, from_id: &LogicalId, edge_type: &str, to_id: &LogicalId, confidence: f32, created_at: u64, source: EdgeSource) {
         let key = (from_id.clone(), edge_type.to_string());
         let entry = AdjEntry {
             to_id: to_id.clone(),
             confidence,
             created_at,
+            source,
         };
         self.forward
             .entry(key)
@@ -226,8 +247,8 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
-        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0, EdgeSource::Structural);
 
         let results = idx.get(&make_id("v1"), "knows");
         assert_eq!(results.len(), 2);
@@ -243,8 +264,8 @@ mod tests {
     #[test]
     fn remove_edge() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
-        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0, EdgeSource::Structural);
 
         idx.remove(&make_id("v1"), "knows", &make_id("v2"));
         let results = idx.get(&make_id("v1"), "knows");
@@ -255,7 +276,7 @@ mod tests {
     #[test]
     fn remove_last_edge_cleans_key() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
         idx.remove(&make_id("v1"), "knows", &make_id("v2"));
         assert!(idx.is_empty());
     }
@@ -263,8 +284,8 @@ mod tests {
     #[test]
     fn different_edge_types_separate() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
-        idx.insert(&make_id("v1"), "likes", &make_id("v3"), 0.8, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "likes", &make_id("v3"), 0.8, 0, EdgeSource::Structural);
 
         assert_eq!(idx.get(&make_id("v1"), "knows").len(), 1);
         assert_eq!(idx.get(&make_id("v1"), "likes").len(), 1);
@@ -273,16 +294,16 @@ mod tests {
     #[test]
     fn len_counts_all_edges() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
-        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0);
-        idx.insert(&make_id("v2"), "likes", &make_id("v1"), 0.5, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v2"), "likes", &make_id("v1"), 0.5, 0, EdgeSource::Structural);
         assert_eq!(idx.len(), 3);
     }
 
     #[test]
     fn backward_index_populated_on_insert() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
         let backwards = idx.get_backward(&make_id("v2"), "knows");
         assert_eq!(backwards.len(), 1);
         assert_eq!(backwards[0], make_id("v1"));
@@ -291,7 +312,7 @@ mod tests {
     #[test]
     fn backward_index_remove() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
         idx.remove(&make_id("v1"), "knows", &make_id("v2"));
         let backwards = idx.get_backward(&make_id("v2"), "knows");
         assert!(backwards.is_empty());
@@ -300,9 +321,9 @@ mod tests {
     #[test]
     fn edges_involving_entity() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0);
-        idx.insert(&make_id("v3"), "knows", &make_id("v1"), 1.0, 0);
-        idx.insert(&make_id("v1"), "likes", &make_id("v4"), 1.0, 0);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v3"), "knows", &make_id("v1"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "likes", &make_id("v4"), 1.0, 0, EdgeSource::Structural);
 
         let (forward, backward) = idx.edges_involving(&make_id("v1"));
         assert_eq!(forward.len(), 2); // knows->v2, likes->v4
@@ -318,6 +339,7 @@ mod tests {
             confidence: 1.0,
             metadata: HashMap::new(),
             created_at: 0,
+            source: EdgeSource::Structural,
         };
         let bytes = rmp_serde::to_vec_named(&edge).unwrap();
         let restored: Edge = rmp_serde::from_slice(&bytes).unwrap();
@@ -351,7 +373,7 @@ mod tests {
     #[test]
     fn adj_entry_stores_created_at() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 42);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 42, EdgeSource::Structural);
         let results = idx.get(&make_id("v1"), "knows");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].created_at, 42);
@@ -433,5 +455,37 @@ mod tests {
         };
         let result = effective_confidence(1.0, 0, &config);
         assert!((result - 1.0).abs() < 0.001);
+    }
+
+    // -----------------------------------------------------------------------
+    // EdgeSource tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn edge_source_defaults_to_structural() {
+        let source = EdgeSource::default();
+        assert_eq!(source, EdgeSource::Structural);
+    }
+
+    #[test]
+    fn edge_deserializes_without_source_field() {
+        let json = r#"{"from_id":"a","to_id":"b","edge_type":"test","confidence":1.0,"metadata":{},"created_at":0}"#;
+        let edge: Edge = serde_json::from_str(json).unwrap();
+        assert_eq!(edge.source, EdgeSource::Structural);
+    }
+
+    #[test]
+    fn edge_serializes_with_source_field() {
+        let edge = Edge {
+            from_id: make_id("a"),
+            to_id: make_id("b"),
+            edge_type: "test".into(),
+            confidence: 0.8,
+            metadata: HashMap::new(),
+            created_at: 0,
+            source: EdgeSource::Inferred,
+        };
+        let json = serde_json::to_string(&edge).unwrap();
+        assert!(json.contains("Inferred"));
     }
 }
