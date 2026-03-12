@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 
+use crate::edge::InferenceConfig;
 use crate::error::EngineError;
 use crate::types::CollectionSchema;
 use trondb_tql::{FieldList, Literal, Statement, VectorLiteral, WhereClause};
@@ -51,6 +52,9 @@ pub enum Plan {
     Promote(PromotePlan),
     ExplainTiers(ExplainTiersPlan),
     UpdateEntity(UpdateEntityPlan),
+    Infer(InferPlan),
+    ConfirmEdge(ConfirmEdgePlan),
+    ExplainHistory(ExplainHistoryPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +106,7 @@ pub struct CreateEdgeTypePlan {
     pub from_collection: String,
     pub to_collection: String,
     pub decay_config: Option<trondb_tql::DecayConfigDecl>,
-    pub inference_config: Option<trondb_tql::InferenceConfigDecl>,
+    pub inference_config: Option<InferenceConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +171,28 @@ pub struct UpdateEntityPlan {
     pub entity_id: String,
     pub collection: String,
     pub assignments: Vec<(String, trondb_tql::Literal)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InferPlan {
+    pub from_id: String,
+    pub edge_types: Vec<String>,
+    pub limit: Option<usize>,
+    pub confidence_floor: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfirmEdgePlan {
+    pub from_id: String,
+    pub to_id: String,
+    pub edge_type: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplainHistoryPlan {
+    pub entity_id: String,
+    pub limit: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -333,13 +359,22 @@ pub fn plan(
             }))
         }
 
-        Statement::CreateEdgeType(s) => Ok(Plan::CreateEdgeType(CreateEdgeTypePlan {
-            name: s.name.clone(),
-            from_collection: s.from_collection.clone(),
-            to_collection: s.to_collection.clone(),
-            decay_config: s.decay_config.clone(),
-            inference_config: s.inference_config.clone(),
-        })),
+        Statement::CreateEdgeType(s) => {
+            let inference_config = s.inference_config.as_ref().map(|ic| {
+                InferenceConfig {
+                    auto: ic.auto,
+                    confidence_floor: ic.confidence_floor.unwrap_or(0.5),
+                    limit: ic.limit.unwrap_or(10),
+                }
+            });
+            Ok(Plan::CreateEdgeType(CreateEdgeTypePlan {
+                name: s.name.clone(),
+                from_collection: s.from_collection.clone(),
+                to_collection: s.to_collection.clone(),
+                decay_config: s.decay_config.clone(),
+                inference_config,
+            }))
+        }
 
         Statement::InsertEdge(s) => Ok(Plan::InsertEdge(InsertEdgePlan {
             edge_type: s.edge_type.clone(),
@@ -397,10 +432,24 @@ pub fn plan(
             assignments: s.assignments.clone(),
         })),
 
-        // Inference statements — plan types added in a later task
-        Statement::Infer(_) => Err(EngineError::UnsupportedOperation("INFER plan not yet implemented".into())),
-        Statement::ConfirmEdge(_) => Err(EngineError::UnsupportedOperation("CONFIRM EDGE plan not yet implemented".into())),
-        Statement::ExplainHistory(_) => Err(EngineError::UnsupportedOperation("EXPLAIN HISTORY plan not yet implemented".into())),
+        Statement::Infer(s) => Ok(Plan::Infer(InferPlan {
+            from_id: s.from_id.clone(),
+            edge_types: s.edge_types.clone(),
+            limit: s.limit,
+            confidence_floor: s.confidence_floor,
+        })),
+
+        Statement::ConfirmEdge(s) => Ok(Plan::ConfirmEdge(ConfirmEdgePlan {
+            from_id: s.from_id.clone(),
+            to_id: s.to_id.clone(),
+            edge_type: s.edge_type.clone(),
+            confidence: s.confidence,
+        })),
+
+        Statement::ExplainHistory(s) => Ok(Plan::ExplainHistory(ExplainHistoryPlan {
+            entity_id: s.entity_id.clone(),
+            limit: s.limit,
+        })),
     }
 }
 

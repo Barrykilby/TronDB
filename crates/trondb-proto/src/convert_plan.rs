@@ -521,6 +521,13 @@ impl From<&Plan> for pb::PlanRequest {
                         })
                         .collect(),
                 }),
+
+                // Inference plan types — proto fields added in Task 15
+                Plan::Infer(_) | Plan::ConfirmEdge(_) | Plan::ExplainHistory(_) => {
+                    // Placeholder: these plan types don't have proto representations yet.
+                    // Task 15 will add the proto messages and conversions.
+                    PP::Explain(Box::new(pb::ExplainPlan { inner: None }))
+                }
             }),
         }
     }

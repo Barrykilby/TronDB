@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
-use crate::edge::{AdjacencyIndex, Edge, EdgeSource, EdgeType, InferenceConfig};
+use crate::edge::{AdjacencyIndex, Edge, EdgeSource, EdgeType};
 use crate::error::EngineError;
 use crate::field_index::FieldIndex;
 use crate::index::HnswIndex;
@@ -966,7 +966,7 @@ impl Executor {
                     from_collection: p.from_collection.clone(),
                     to_collection: p.to_collection.clone(),
                     decay_config,
-                    inference_config: InferenceConfig::default(),
+                    inference_config: p.inference_config.clone().unwrap_or_default(),
                 };
 
                 // WAL: TxBegin -> SchemaCreateEdgeType -> commit
@@ -1366,6 +1366,11 @@ impl Executor {
                     },
                 })
             }
+            // Inference plan types — executor implementations added in later tasks
+            Plan::Infer(_) => Err(EngineError::UnsupportedOperation("INFER executor not yet implemented".into())),
+            Plan::ConfirmEdge(_) => Err(EngineError::UnsupportedOperation("CONFIRM EDGE executor not yet implemented".into())),
+            Plan::ExplainHistory(_) => Err(EngineError::UnsupportedOperation("EXPLAIN HISTORY executor not yet implemented".into())),
+
             Plan::UpdateEntity(p) => {
                 let entity_id = LogicalId::from_string(&p.entity_id);
 
@@ -2057,6 +2062,21 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("verb", "UPDATE".into()));
             props.push(("collection", p.collection.clone()));
             props.push(("tier", "Fjall".into()));
+        }
+        Plan::Infer(p) => {
+            props.push(("mode", "Probabilistic".into()));
+            props.push(("verb", "INFER".into()));
+            props.push(("from_id", p.from_id.clone()));
+        }
+        Plan::ConfirmEdge(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "CONFIRM EDGE".into()));
+            props.push(("edge_type", p.edge_type.clone()));
+        }
+        Plan::ExplainHistory(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "EXPLAIN HISTORY".into()));
+            props.push(("entity_id", p.entity_id.clone()));
         }
     }
 
