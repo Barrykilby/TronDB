@@ -235,6 +235,7 @@ fn proto_to_repr_decl(proto: &pb::RepresentationDecl) -> RepresentationDecl {
             Metric::Cosine
         },
         sparse: proto.sparse,
+        fields: vec![], // proto does not carry fields yet (Task 17)
     }
 }
 
@@ -540,6 +541,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     .iter()
                     .map(proto_to_index_decl)
                     .collect::<Result<Vec<_>, _>>()?,
+                vectoriser_config: None, // proto does not carry vectoriser config yet (Task 17)
             })),
 
             PP::Insert(ip) => {
@@ -909,6 +911,7 @@ mod tests {
                 dimensions: Some(384),
                 metric: Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![
                 FieldDecl {
@@ -932,6 +935,7 @@ mod tests {
                     Literal::Bool(true),
                 )),
             }],
+            vectoriser_config: None,
         });
         let restored = round_trip(plan);
         match restored {

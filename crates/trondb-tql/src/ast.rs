@@ -26,6 +26,18 @@ pub struct CreateCollectionStmt {
     pub representations: Vec<RepresentationDecl>,
     pub fields: Vec<FieldDecl>,
     pub indexes: Vec<IndexDecl>,
+    pub vectoriser_config: Option<VectoriserConfigDecl>,
+}
+
+/// Collection-level vectoriser configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectoriserConfigDecl {
+    pub model: Option<String>,
+    pub model_path: Option<String>,
+    pub device: Option<String>,
+    pub vectoriser_type: Option<String>,
+    pub endpoint: Option<String>,
+    pub auth: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +47,7 @@ pub struct RepresentationDecl {
     pub dimensions: Option<usize>,
     pub metric: Metric,
     pub sparse: bool,
+    pub fields: Vec<String>,  // empty means passthrough
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -106,6 +119,8 @@ pub struct SearchStmt {
     pub filter: Option<WhereClause>,
     pub confidence: Option<f64>,
     pub limit: Option<usize>,
+    pub query_text: Option<String>,
+    pub using_repr: Option<String>,
 }
 
 // --- Common types ---

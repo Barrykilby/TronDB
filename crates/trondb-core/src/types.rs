@@ -182,12 +182,25 @@ pub enum FieldType {
     EntityRef(String),
 }
 
+/// Collection-level vectoriser configuration (persisted).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectoriserConfig {
+    pub model: Option<String>,
+    pub model_path: Option<String>,
+    pub device: Option<String>,
+    pub vectoriser_type: Option<String>,
+    pub endpoint: Option<String>,
+    pub auth: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectionSchema {
     pub name: String,
     pub representations: Vec<StoredRepresentation>,
     pub fields: Vec<StoredField>,
     pub indexes: Vec<StoredIndex>,
+    #[serde(default)]
+    pub vectoriser_config: Option<VectoriserConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,6 +210,8 @@ pub struct StoredRepresentation {
     pub dimensions: Option<usize>,
     pub metric: Metric,
     pub sparse: bool,
+    #[serde(default)]
+    pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -294,6 +309,7 @@ mod tests {
                 dimensions: Some(1024),
                 metric: Metric::Cosine,
                 sparse: false,
+            fields: vec![],
             }],
             fields: vec![StoredField {
                 name: "status".into(),
@@ -304,6 +320,7 @@ mod tests {
                 fields: vec!["status".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         };
         let bytes = rmp_serde::to_vec_named(&schema).unwrap();
         let restored: CollectionSchema = rmp_serde::from_slice(&bytes).unwrap();

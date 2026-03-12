@@ -196,6 +196,27 @@ pub enum Token {
     #[token("IN", priority = 10, ignore(ascii_case))]
     In,
 
+    #[token("FIELDS", priority = 10, ignore(ascii_case))]
+    Fields,
+
+    #[token("USING", priority = 10, ignore(ascii_case))]
+    Using,
+
+    #[token("MODEL_PATH", priority = 10, ignore(ascii_case))]
+    ModelPath,
+
+    #[token("DEVICE", priority = 10, ignore(ascii_case))]
+    TokenDevice,
+
+    #[token("VECTORISER", priority = 10, ignore(ascii_case))]
+    TokenVectoriser,
+
+    #[token("ENDPOINT", priority = 10, ignore(ascii_case))]
+    TokenEndpoint,
+
+    #[token("AUTH", priority = 10, ignore(ascii_case))]
+    TokenAuth,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
@@ -402,5 +423,31 @@ mod tests {
         assert_eq!(tokens[4], Token::TokenInt);
         assert_eq!(tokens[5], Token::TokenFloat);
         assert_eq!(tokens[6], Token::DateTime);
+    }
+
+    #[test]
+    fn lex_fields_keyword() {
+        let tokens = lex("FIELDS (name, description)");
+        assert_eq!(tokens[0], Token::Fields);
+        assert_eq!(tokens[1], Token::LParen);
+        assert_eq!(tokens[2], Token::Ident("name".to_string()));
+        assert_eq!(tokens[3], Token::Comma);
+        assert_eq!(tokens[4], Token::Ident("description".to_string()));
+        assert_eq!(tokens[5], Token::RParen);
+    }
+
+    #[test]
+    fn lex_using_keyword() {
+        assert_eq!(lex("USING"), vec![Token::Using]);
+        assert_eq!(lex("using"), vec![Token::Using]);
+    }
+
+    #[test]
+    fn lex_vectoriser_config_tokens() {
+        let tokens = lex("MODEL_PATH '/models/bge.onnx' DEVICE 'cpu'");
+        assert_eq!(tokens[0], Token::ModelPath);
+        assert_eq!(tokens[1], Token::StringLit("/models/bge.onnx".to_string()));
+        assert_eq!(tokens[2], Token::TokenDevice);
+        assert_eq!(tokens[3], Token::StringLit("cpu".to_string()));
     }
 }

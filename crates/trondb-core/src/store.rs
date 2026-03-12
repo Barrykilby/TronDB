@@ -431,9 +431,11 @@ mod tests {
                 dimensions: Some(dims),
                 metric: Metric::Cosine,
                 sparse: false,
+            fields: vec![],
             }],
             fields: vec![],
             indexes: vec![],
+            vectoriser_config: None,
         }
     }
 

@@ -1304,6 +1304,7 @@ fn build_collection_schema(p: &crate::planner::CreateCollectionPlan) -> Collecti
             dimensions: r.dimensions,
             metric: convert_metric(&r.metric),
             sparse: r.sparse,
+            fields: r.fields.clone(),
         }
     }).collect();
 
@@ -1322,11 +1323,23 @@ fn build_collection_schema(p: &crate::planner::CreateCollectionPlan) -> Collecti
         }
     }).collect();
 
+    let vectoriser_config = p.vectoriser_config.as_ref().map(|vc| {
+        crate::types::VectoriserConfig {
+            model: vc.model.clone(),
+            model_path: vc.model_path.clone(),
+            device: vc.device.clone(),
+            vectoriser_type: vc.vectoriser_type.clone(),
+            endpoint: vc.endpoint.clone(),
+            auth: vc.auth.clone(),
+        }
+    });
+
     CollectionSchema {
         name: p.name.clone(),
         representations,
         fields,
         indexes,
+        vectoriser_config,
     }
 }
 
@@ -1720,9 +1733,11 @@ mod tests {
                 dimensions: Some(dims),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![],
             indexes: vec![],
+            vectoriser_config: None,
         }))
         .await
         .unwrap();
@@ -1892,6 +1907,7 @@ mod tests {
                     dimensions: Some(3),
                     metric: trondb_tql::Metric::Cosine,
                     sparse: false,
+                fields: vec![],
                 },
                 trondb_tql::RepresentationDecl {
                     name: "identity".into(),
@@ -1899,10 +1915,12 @@ mod tests {
                     dimensions: Some(3),
                     metric: trondb_tql::Metric::Cosine,
                     sparse: false,
+                fields: vec![],
                 },
             ],
             fields: vec![],
             indexes: vec![],
+            vectoriser_config: None,
         })).await;
 
         assert!(result.is_err());
@@ -1924,6 +1942,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![
                 trondb_tql::FieldDecl {
@@ -1936,6 +1955,7 @@ mod tests {
                 },
             ],
             indexes: vec![],
+            vectoriser_config: None,
         })).await;
 
         assert!(result.is_err());
@@ -1957,6 +1977,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "status".into(),
@@ -1974,6 +1995,7 @@ mod tests {
                     partial_condition: None,
                 },
             ],
+            vectoriser_config: None,
         })).await;
 
         assert!(result.is_err());
@@ -1996,6 +2018,7 @@ mod tests {
                     dimensions: Some(4),
                     metric: trondb_tql::Metric::Cosine,
                     sparse: false,
+                fields: vec![],
                 },
                 trondb_tql::RepresentationDecl {
                     name: "sparse_repr".into(),
@@ -2003,6 +2026,7 @@ mod tests {
                     dimensions: None,
                     metric: trondb_tql::Metric::Cosine,
                     sparse: true,
+                fields: vec![],
                 },
             ],
             fields: vec![trondb_tql::FieldDecl {
@@ -2014,6 +2038,7 @@ mod tests {
                 fields: vec!["status".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Verify HNSW index registered with repr-scoped key
@@ -2065,9 +2090,11 @@ mod tests {
                 dimensions: None,
                 metric: trondb_tql::Metric::Cosine,
                 sparse: true,
+                fields: vec![],
             }],
             fields: vec![],
             indexes: vec![],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert with sparse vector
@@ -2100,6 +2127,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "city".into(),
@@ -2110,6 +2138,7 @@ mod tests {
                 fields: vec!["city".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert with field values
@@ -2143,6 +2172,7 @@ mod tests {
                 dimensions: Some(dims),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "city".into(),
@@ -2153,6 +2183,7 @@ mod tests {
                 fields: vec!["city".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         })).await.unwrap();
     }
 
@@ -2208,6 +2239,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "score".into(),
@@ -2218,6 +2250,7 @@ mod tests {
                 fields: vec!["score".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert entities with scores 10, 20, 30, 40, 50
@@ -2272,6 +2305,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "score".into(),
@@ -2282,6 +2316,7 @@ mod tests {
                 fields: vec!["score".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert entities with scores 10, 20, 30, 40, 50
@@ -2332,6 +2367,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "score".into(),
@@ -2342,6 +2378,7 @@ mod tests {
                 fields: vec!["score".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert entities with scores 10, 20, 30, 40, 50
@@ -2396,6 +2433,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "score".into(),
@@ -2406,6 +2444,7 @@ mod tests {
                 fields: vec!["score".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert entities with scores 10, 20, 30, 40, 50
@@ -2456,6 +2495,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "score".into(),
@@ -2466,6 +2506,7 @@ mod tests {
                 fields: vec!["score".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert entities with scores 10, 20, 30, 40, 50
@@ -2516,12 +2557,14 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "score".into(),
                 field_type: trondb_tql::FieldType::Int,
             }],
             indexes: vec![],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert entities with scores 10, 20, 30, 40, 50
@@ -2573,9 +2616,11 @@ mod tests {
                 dimensions: None,
                 metric: trondb_tql::Metric::Cosine,
                 sparse: true,
+                fields: vec![],
             }],
             fields: vec![],
             indexes: vec![],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert entities with sparse vectors
@@ -2631,6 +2676,7 @@ mod tests {
                     dimensions: Some(3),
                     metric: trondb_tql::Metric::Cosine,
                     sparse: false,
+                fields: vec![],
                 },
                 trondb_tql::RepresentationDecl {
                     name: "keywords".into(),
@@ -2638,10 +2684,12 @@ mod tests {
                     dimensions: None,
                     metric: trondb_tql::Metric::Cosine,
                     sparse: true,
+                fields: vec![],
                 },
             ],
             fields: vec![],
             indexes: vec![],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert entities with both dense and sparse vectors
@@ -2701,6 +2749,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "city".into(),
@@ -2711,6 +2760,7 @@ mod tests {
                 fields: vec!["city".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         })).await.unwrap();
 
         // Insert entities in different cities
@@ -2881,12 +2931,14 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "name".into(),
                 field_type: trondb_tql::FieldType::Text,
             }],
             indexes: vec![],
+            vectoriser_config: None,
         }))
         .await
         .unwrap();
@@ -2952,12 +3004,14 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "name".into(),
                 field_type: trondb_tql::FieldType::Text,
             }],
             indexes: vec![],
+            vectoriser_config: None,
         }))
         .await
         .unwrap();
@@ -3022,12 +3076,14 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "name".into(),
                 field_type: trondb_tql::FieldType::Text,
             }],
             indexes: vec![],
+            vectoriser_config: None,
         }))
         .await
         .unwrap();
@@ -3090,12 +3146,14 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "name".into(),
                 field_type: trondb_tql::FieldType::Text,
             }],
             indexes: vec![],
+            vectoriser_config: None,
         }))
         .await
         .unwrap();
@@ -3158,12 +3216,14 @@ mod tests {
                 dimensions: Some(3),
                 metric: trondb_tql::Metric::Cosine,
                 sparse: false,
+                fields: vec![],
             }],
             fields: vec![trondb_tql::FieldDecl {
                 name: "name".into(),
                 field_type: trondb_tql::FieldType::Text,
             }],
             indexes: vec![],
+            vectoriser_config: None,
         }))
         .await
         .unwrap();

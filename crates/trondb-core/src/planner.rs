@@ -58,6 +58,7 @@ pub struct CreateCollectionPlan {
     pub representations: Vec<trondb_tql::RepresentationDecl>,
     pub fields: Vec<trondb_tql::FieldDecl>,
     pub indexes: Vec<trondb_tql::IndexDecl>,
+    pub vectoriser_config: Option<trondb_tql::VectoriserConfigDecl>,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +266,7 @@ pub fn plan(
             representations: s.representations.clone(),
             fields: s.fields.clone(),
             indexes: s.indexes.clone(),
+            vectoriser_config: s.vectoriser_config.clone(),
         })),
 
         Statement::Insert(s) => Ok(Plan::Insert(InsertPlan {
@@ -429,6 +431,8 @@ mod tests {
             filter: None,
             confidence: Some(0.8),
             limit: Some(5),
+        query_text: None,
+        using_repr: None,
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -474,6 +478,8 @@ mod tests {
             filter: None,
             confidence: None,
             limit: Some(10),
+        query_text: None,
+        using_repr: None,
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -494,6 +500,8 @@ mod tests {
             filter: None,
             confidence: None,
             limit: Some(10),
+        query_text: None,
+        using_repr: None,
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -517,6 +525,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: Metric::Cosine,
                 sparse: false,
+            fields: vec![],
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -527,6 +536,7 @@ mod tests {
                 fields: vec!["city".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         });
 
         let stmt = Statement::Search(SearchStmt {
@@ -537,6 +547,8 @@ mod tests {
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
             confidence: None,
             limit: Some(10),
+        query_text: None,
+        using_repr: None,
         });
         let p = plan(&stmt, &schemas).unwrap();
         match p {
@@ -561,9 +573,11 @@ mod tests {
                 dimensions: Some(3),
                 metric: Metric::Cosine,
                 sparse: false,
+            fields: vec![],
             }],
             fields: vec![],
             indexes: vec![],
+            vectoriser_config: None,
         });
 
         let stmt = Statement::Search(SearchStmt {
@@ -574,6 +588,8 @@ mod tests {
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
             confidence: None,
             limit: Some(10),
+        query_text: None,
+        using_repr: None,
         });
         let result = plan(&stmt, &schemas);
         assert!(result.is_err());
@@ -596,6 +612,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: Metric::Cosine,
                 sparse: false,
+            fields: vec![],
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -606,6 +623,7 @@ mod tests {
                 fields: vec!["city".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         });
 
         let stmt = Statement::Fetch(FetchStmt {
@@ -637,6 +655,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: Metric::Cosine,
                 sparse: false,
+            fields: vec![],
             }],
             fields: vec![StoredField {
                 name: "score".into(),
@@ -647,6 +666,7 @@ mod tests {
                 fields: vec!["score".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         });
 
         let stmt = Statement::Fetch(FetchStmt {
@@ -697,6 +717,7 @@ mod tests {
                 dimensions: Some(3),
                 metric: Metric::Cosine,
                 sparse: false,
+            fields: vec![],
             }],
             fields: vec![StoredField {
                 name: "score".into(),
@@ -707,6 +728,7 @@ mod tests {
                 fields: vec!["score".into()],
                 partial_condition: None,
             }],
+            vectoriser_config: None,
         });
 
         let stmt = Statement::Fetch(FetchStmt {

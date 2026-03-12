@@ -82,12 +82,14 @@ async fn loopback_create_insert_fetch() {
             dimensions: Some(3),
             metric: Metric::Cosine,
             sparse: false,
+            fields: vec![],
         }],
         fields: vec![FieldDecl {
             name: "title".into(),
             field_type: FieldType::Text,
         }],
         indexes: vec![],
+        vectoriser_config: None,
     });
     let create_result = remote.execute(&create_plan).await.unwrap();
     assert!(

@@ -135,6 +135,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         let result = remote.execute(&plan).await.unwrap();
         assert_eq!(result.rows.len(), 1);

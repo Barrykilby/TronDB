@@ -88,6 +88,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         let proto_plan: pb::PlanRequest = (&plan).into();
         let response = client
@@ -142,6 +143,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         let proto_plan: pb::PlanRequest = (&plan).into();
         let response = client
@@ -178,6 +180,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         let proto_plan: pb::PlanRequest = (&plan).into();
         let result = client.execute(tonic::Request::new(proto_plan)).await;
@@ -210,6 +213,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         let proto_plan: pb::PlanRequest = (&plan).into();
         let response = client

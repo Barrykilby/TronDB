@@ -503,6 +503,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         let request = tonic::Request::new((&plan).into());
         let response = service.execute(request).await.unwrap();
@@ -524,6 +525,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         engine.execute(&plan).await.unwrap();
 
@@ -678,6 +680,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         engine.execute(&create_plan).await.unwrap();
 
@@ -707,6 +710,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         let request = tonic::Request::new((&plan).into());
 
@@ -750,6 +754,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         let request = tonic::Request::new((&plan).into());
         let result = service.execute(request).await;
@@ -771,6 +776,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         let request = tonic::Request::new((&plan).into());
 

@@ -180,6 +180,60 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect(&Token::LParen)?;
 
+        // Parse optional collection-level vectoriser config tokens BEFORE declarations
+        let mut vec_model = None;
+        let mut vec_model_path = None;
+        let mut vec_device = None;
+        let mut vec_type = None;
+        let mut vec_endpoint = None;
+        let mut vec_auth = None;
+
+        loop {
+            match self.peek() {
+                Some(Token::Model) if vec_model.is_none() => {
+                    self.advance();
+                    vec_model = Some(self.expect_string_lit()?);
+                }
+                Some(Token::ModelPath) => {
+                    self.advance();
+                    vec_model_path = Some(self.expect_string_lit()?);
+                }
+                Some(Token::TokenDevice) => {
+                    self.advance();
+                    vec_device = Some(self.expect_string_lit()?);
+                }
+                Some(Token::TokenVectoriser) => {
+                    self.advance();
+                    vec_type = Some(self.expect_string_lit()?);
+                }
+                Some(Token::TokenEndpoint) => {
+                    self.advance();
+                    vec_endpoint = Some(self.expect_string_lit()?);
+                }
+                Some(Token::TokenAuth) => {
+                    self.advance();
+                    vec_auth = Some(self.expect_string_lit()?);
+                }
+                _ => break,
+            }
+        }
+
+        let vectoriser_config = if vec_model.is_some() || vec_model_path.is_some()
+            || vec_device.is_some() || vec_type.is_some()
+            || vec_endpoint.is_some() || vec_auth.is_some()
+        {
+            Some(VectoriserConfigDecl {
+                model: vec_model,
+                model_path: vec_model_path,
+                device: vec_device,
+                vectoriser_type: vec_type,
+                endpoint: vec_endpoint,
+                auth: vec_auth,
+            })
+        } else {
+            None
+        };
+
         let mut representations = Vec::new();
         let mut fields = Vec::new();
         let mut indexes = Vec::new();
@@ -223,6 +277,7 @@ impl Parser {
             representations,
             fields,
             indexes,
+            vectoriser_config,
         }))
     }
 
@@ -233,6 +288,7 @@ impl Parser {
         let mut dimensions = None;
         let mut metric = Metric::Cosine;
         let mut sparse = false;
+        let mut fields = Vec::new();
 
         // Parse optional attributes in any order
         loop {
@@ -261,11 +317,21 @@ impl Parser {
                         _ => return Err(ParseError::InvalidSyntax("expected true or false after SPARSE".into())),
                     }
                 }
+                Some(Token::Fields) => {
+                    self.advance(); // FIELDS
+                    self.expect(&Token::LParen)?;
+                    fields.push(self.expect_ident()?);
+                    while self.peek() == Some(&Token::Comma) {
+                        self.advance();
+                        fields.push(self.expect_ident()?);
+                    }
+                    self.expect(&Token::RParen)?;
+                }
                 _ => break,
             }
         }
 
-        Ok(RepresentationDecl { name, model, dimensions, metric, sparse })
+        Ok(RepresentationDecl { name, model, dimensions, metric, sparse, fields })
     }
 
     fn parse_field_decl(&mut self) -> Result<FieldDecl, ParseError> {
@@ -743,6 +809,8 @@ impl Parser {
             filter,
             confidence,
             limit,
+            query_text: None,
+            using_repr: None,
         }))
     }
 
@@ -1486,5 +1554,97 @@ mod tests {
     fn parse_update_rejects_null() {
         let err = parse("UPDATE 'v1' IN venues SET name = NULL;").unwrap_err();
         assert!(matches!(err, ParseError::UnexpectedToken { .. }));
+    }
+
+    #[test]
+    fn parse_representation_with_fields() {
+        let stmt = parse("CREATE COLLECTION events (
+            FIELD name TEXT,
+            FIELD description TEXT,
+            REPRESENTATION semantic DIMENSIONS 384 FIELDS (name, description),
+        );").unwrap();
+        match stmt {
+            Statement::CreateCollection(c) => {
+                assert_eq!(c.representations.len(), 1);
+                assert_eq!(c.representations[0].fields, vec!["name", "description"]);
+            }
+            _ => panic!("expected CreateCollection"),
+        }
+    }
+
+    #[test]
+    fn parse_representation_without_fields_is_passthrough() {
+        let stmt = parse("CREATE COLLECTION venues (
+            REPRESENTATION identity DIMENSIONS 384,
+        );").unwrap();
+        match stmt {
+            Statement::CreateCollection(c) => {
+                assert!(c.representations[0].fields.is_empty());
+                assert!(c.vectoriser_config.is_none());
+            }
+            _ => panic!("expected CreateCollection"),
+        }
+    }
+
+    #[test]
+    fn parse_collection_with_vectoriser_config() {
+        let stmt = parse("CREATE COLLECTION events (
+            MODEL 'bge-small-en-v1.5'
+            MODEL_PATH '/models/bge.onnx'
+            DEVICE 'cpu'
+            FIELD name TEXT,
+            REPRESENTATION semantic DIMENSIONS 384 FIELDS (name),
+        );").unwrap();
+        match stmt {
+            Statement::CreateCollection(c) => {
+                let vc = c.vectoriser_config.unwrap();
+                assert_eq!(vc.model.unwrap(), "bge-small-en-v1.5");
+                assert_eq!(vc.model_path.unwrap(), "/models/bge.onnx");
+                assert_eq!(vc.device.unwrap(), "cpu");
+            }
+            _ => panic!("expected CreateCollection"),
+        }
+    }
+
+    #[test]
+    fn parse_collection_external_vectoriser() {
+        let stmt = parse("CREATE COLLECTION events (
+            MODEL 'text-embedding-3-small'
+            VECTORISER 'external'
+            ENDPOINT 'https://api.openai.com/v1/embeddings'
+            AUTH 'env:OPENAI_API_KEY'
+            FIELD name TEXT,
+            REPRESENTATION embed DIMENSIONS 1536 FIELDS (name),
+        );").unwrap();
+        match stmt {
+            Statement::CreateCollection(c) => {
+                let vc = c.vectoriser_config.unwrap();
+                assert_eq!(vc.vectoriser_type.unwrap(), "external");
+                assert_eq!(vc.endpoint.unwrap(), "https://api.openai.com/v1/embeddings");
+                assert_eq!(vc.auth.unwrap(), "env:OPENAI_API_KEY");
+            }
+            _ => panic!("expected CreateCollection"),
+        }
+    }
+
+    #[test]
+    fn parse_existing_create_collection_syntax_unchanged() {
+        let stmt = parse("CREATE COLLECTION venues (
+            REPRESENTATION default MODEL 'jina-v4' DIMENSIONS 1024 METRIC COSINE,
+            FIELD status TEXT,
+            INDEX idx_status ON (status),
+        );").unwrap();
+        match stmt {
+            Statement::CreateCollection(c) => {
+                assert_eq!(c.name, "venues");
+                assert_eq!(c.representations.len(), 1);
+                assert_eq!(c.representations[0].model, Some("jina-v4".into()));
+                assert!(c.representations[0].fields.is_empty());
+                assert!(c.vectoriser_config.is_none());
+                assert_eq!(c.fields.len(), 1);
+                assert_eq!(c.indexes.len(), 1);
+            }
+            _ => panic!("expected CreateCollection"),
+        }
     }
 }

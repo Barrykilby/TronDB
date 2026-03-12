@@ -119,6 +119,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         engine.execute(&plan).await.unwrap();
 
@@ -228,6 +229,7 @@ mod tests {
             representations: vec![],
             fields: vec![],
             indexes: vec![],
+        vectoriser_config: None,
         });
         engine.execute(&plan).await.unwrap();
 

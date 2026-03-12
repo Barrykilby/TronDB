@@ -862,9 +862,11 @@ mod tests {
                     dimensions: Some(3),
                     metric: crate::types::Metric::Cosine,
                     sparse: false,
+                fields: vec![],
                 }],
                 fields: vec![],
                 indexes: vec![],
+                vectoriser_config: None,
             };
             let coll_payload = rmp_serde::to_vec_named(&schema).unwrap();
             writer.append(
