@@ -200,8 +200,9 @@ fn search_strategy_to_proto(ss: &SearchStrategy) -> i32 {
         SearchStrategy::Hnsw => pb::SearchStrategyProto::SearchStrategyHnsw as i32,
         SearchStrategy::Sparse => pb::SearchStrategyProto::SearchStrategySparse as i32,
         SearchStrategy::Hybrid => pb::SearchStrategyProto::SearchStrategyHybrid as i32,
-        // NaturalLanguage resolves to HNSW after encode_query — serialise as Hnsw for now
-        SearchStrategy::NaturalLanguage => pb::SearchStrategyProto::SearchStrategyHnsw as i32,
+        SearchStrategy::NaturalLanguage => {
+            pb::SearchStrategyProto::SearchStrategyNaturalLanguage as i32
+        }
     }
 }
 
@@ -209,6 +210,9 @@ fn proto_to_search_strategy(val: i32) -> SearchStrategy {
     match val {
         x if x == pb::SearchStrategyProto::SearchStrategySparse as i32 => SearchStrategy::Sparse,
         x if x == pb::SearchStrategyProto::SearchStrategyHybrid as i32 => SearchStrategy::Hybrid,
+        x if x == pb::SearchStrategyProto::SearchStrategyNaturalLanguage as i32 => {
+            SearchStrategy::NaturalLanguage
+        }
         _ => SearchStrategy::Hnsw,
     }
 }
@@ -431,6 +435,8 @@ impl From<&Plan> for pb::PlanRequest {
                     strategy: search_strategy_to_proto(&sp.strategy),
                     has_dense: sp.dense_vector.is_some(),
                     has_sparse: sp.sparse_vector.is_some(),
+                    query_text: sp.query_text.clone(),
+                    using_repr: sp.using_repr.clone(),
                 }),
 
                 Plan::Explain(inner) => PP::Explain(Box::new(pb::ExplainPlan {
@@ -615,8 +621,8 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     k: sp.k as usize,
                     confidence_threshold: sp.confidence_threshold,
                     strategy: proto_to_search_strategy(sp.strategy),
-                    query_text: None,
-                    using_repr: None,
+                    query_text: sp.query_text,
+                    using_repr: sp.using_repr,
                 }))
             }
 

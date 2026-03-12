@@ -86,6 +86,8 @@ message SearchPlan {
     SearchStrategyProto strategy = 9;
     bool has_dense = 10;                   // disambiguate empty vec from None
     bool has_sparse = 11;
+    optional string query_text = 12;
+    optional string using_repr = 13;
 }
 
 message ExplainPlan {
@@ -271,6 +273,7 @@ enum SearchStrategyProto {
     SEARCH_STRATEGY_HNSW = 0;
     SEARCH_STRATEGY_SPARSE = 1;
     SEARCH_STRATEGY_HYBRID = 2;
+    SEARCH_STRATEGY_NATURAL_LANGUAGE = 3;
 }
 
 enum FetchStrategyProto {
