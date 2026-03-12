@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 use trondb_core::Engine;
 use trondb_core::planner::Plan;
@@ -9,17 +10,27 @@ use trondb_proto::pb::tron_node_server::TronNode;
 use trondb_routing::health::{HealthSignal, NodeStatus};
 use trondb_routing::node::{NodeId, NodeRole};
 use crate::config::NodeRoleConfig;
+use crate::replication::ReplicaTracker;
 use crate::stream_health::spawn_health_stream;
 
 pub struct TronNodeService {
     engine: Arc<Engine>,
     role: NodeRoleConfig,
     primary_channel: Option<tonic::transport::Channel>,  // for write forwarding
+    tracker: Option<Arc<ReplicaTracker>>,
 }
 
 impl TronNodeService {
     pub fn new(engine: Arc<Engine>, role: NodeRoleConfig) -> Self {
-        Self { engine, role, primary_channel: None }
+        Self { engine, role, primary_channel: None, tracker: None }
+    }
+
+    pub fn new_with_tracker(
+        engine: Arc<Engine>,
+        role: NodeRoleConfig,
+        tracker: Arc<ReplicaTracker>,
+    ) -> Self {
+        Self { engine, role, primary_channel: None, tracker: Some(tracker) }
     }
 
     pub fn with_primary(mut self, channel: tonic::transport::Channel) -> Self {
@@ -92,9 +103,93 @@ impl TronNode for TronNodeService {
 
     async fn stream_wal(
         &self,
-        _: Request<tonic::Streaming<pb::WalAck>>,
+        request: Request<tonic::Streaming<pb::WalAck>>,
     ) -> Result<Response<Self::StreamWalStream>, Status> {
-        Err(Status::unimplemented("implemented in Task 11"))
+        let tracker = self.tracker.as_ref().ok_or_else(|| {
+            Status::failed_precondition("WAL streaming not available on this node")
+        })?;
+
+        let mut client_stream = request.into_inner();
+
+        // Step 1: Read the initial WalAck to get the replica's last confirmed LSN
+        let initial_ack = client_stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("no initial WalAck received"))?
+            .map_err(|e| Status::internal(format!("error reading initial ack: {e}")))?;
+        let last_confirmed_lsn = initial_ack.confirmed_lsn;
+
+        // Generate a unique replica ID
+        let replica_id = format!("replica-{}", uuid_v4_simple());
+
+        // Step 2: Create channel and register replica in tracker
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<pb::WalRecordMessage, Status>>(256);
+        let wal_tx = {
+            // Create a sender that wraps records in Ok for the gRPC stream
+            let (wal_sender, mut wal_receiver) =
+                tokio::sync::mpsc::channel::<pb::WalRecordMessage>(256);
+
+            // Spawn forwarder: wal_receiver -> tx (wrapping in Ok)
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+                while let Some(record) = wal_receiver.recv().await {
+                    if tx_clone.send(Ok(record)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            wal_sender
+        };
+
+        tracker.register(replica_id.clone(), wal_tx);
+
+        // Step 3: Catch-up — read WAL records after last_confirmed_lsn
+        let engine = self.engine.clone();
+        let tx_catchup = tx.clone();
+        let catchup_lsn = last_confirmed_lsn;
+
+        tokio::spawn(async move {
+            match engine.wal_records_since(catchup_lsn).await {
+                Ok(records) => {
+                    for record in &records {
+                        let proto: pb::WalRecordMessage = record.into();
+                        if tx_catchup.send(Ok(proto)).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx_catchup
+                        .send(Err(Status::internal(format!("WAL catch-up failed: {e}"))))
+                        .await;
+                }
+            }
+        });
+
+        // Step 4: Background task to read WalAck messages from client stream
+        let tracker_clone = tracker.clone();
+        let replica_id_clone = replica_id.clone();
+        let tracker_for_cleanup = tracker.clone();
+        let replica_id_for_cleanup = replica_id.clone();
+
+        tokio::spawn(async move {
+            while let Some(result) = client_stream.next().await {
+                match result {
+                    Ok(ack) => {
+                        tracker_clone.update_confirmed_lsn(
+                            &replica_id_clone,
+                            ack.confirmed_lsn,
+                        );
+                    }
+                    Err(_) => break, // client error — stop processing acks
+                }
+            }
+            // Client disconnected — clean up
+            tracker_for_cleanup.disconnect(&replica_id_for_cleanup);
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
     type StreamLocationUpdatesStream =
@@ -155,6 +250,17 @@ impl TronNodeService {
     }
 }
 
+/// Generate a simple unique ID without pulling in the uuid crate.
+fn uuid_v4_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tid = std::thread::current().id();
+    format!("{ts:x}-{tid:?}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +297,146 @@ mod tests {
         let response = service.execute(request).await.unwrap();
         let result = QueryResult::try_from(response.into_inner()).unwrap();
         assert_eq!(result.rows.len(), 1); // status row
+    }
+
+    #[tokio::test]
+    async fn wal_stream_catches_up_replica() {
+        use tokio_stream::StreamExt;
+
+        // Step 1: Create engine and insert data to generate WAL records
+        let (engine, _) = Engine::open(test_config()).await.unwrap();
+        let engine = Arc::new(engine);
+
+        // Execute a CREATE COLLECTION to generate WAL records
+        let plan = Plan::CreateCollection(CreateCollectionPlan {
+            name: "wal_test".into(),
+            representations: vec![],
+            fields: vec![],
+            indexes: vec![],
+        });
+        engine.execute(&plan).await.unwrap();
+
+        // Verify the engine has WAL records
+        let head_lsn = engine.wal_head_lsn();
+        assert!(head_lsn > 0, "expected WAL records after insert, head_lsn={head_lsn}");
+
+        // Step 2: Create service with tracker
+        let tracker = Arc::new(ReplicaTracker::new());
+        let service = TronNodeService::new_with_tracker(
+            engine.clone(),
+            NodeRoleConfig::Primary,
+            tracker.clone(),
+        );
+
+        // Step 3: Start gRPC server on a random port
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            tonic::transport::Server::builder()
+                .add_service(pb::tron_node_server::TronNodeServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Step 4: Connect as a replica client
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = pb::tron_node_client::TronNodeClient::new(channel);
+
+        // Send initial WalAck with LSN=0 (request all records)
+        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel::<pb::WalAck>(16);
+        ack_tx
+            .send(pb::WalAck { confirmed_lsn: 0 })
+            .await
+            .unwrap();
+
+        let ack_stream = tokio_stream::wrappers::ReceiverStream::new(ack_rx);
+        let response = client.stream_wal(ack_stream).await.unwrap();
+        let mut wal_stream = response.into_inner();
+
+        // Step 5: Receive catch-up WAL records
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(500), wal_stream.next()).await {
+                Ok(Some(Ok(record))) => {
+                    received.push(record);
+                }
+                Ok(Some(Err(e))) => {
+                    panic!("error receiving WAL record: {e}");
+                }
+                Ok(None) => break,             // stream ended
+                Err(_) => break,               // timeout — no more records coming
+            }
+        }
+
+        // Step 6: Verify records have LSN > 0
+        assert!(
+            !received.is_empty(),
+            "expected catch-up WAL records but received none"
+        );
+        for record in &received {
+            assert!(record.lsn > 0, "expected LSN > 0, got {}", record.lsn);
+        }
+
+        // Verify at least one record has the max LSN (head_lsn)
+        let max_received_lsn = received.iter().map(|r| r.lsn).max().unwrap();
+        assert!(
+            max_received_lsn >= head_lsn,
+            "expected max received LSN >= head_lsn ({head_lsn}), got {max_received_lsn}"
+        );
+
+        // Clean up
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn wal_stream_without_tracker_returns_error() {
+        // Service without a tracker should return a gRPC error
+        let (engine, _) = Engine::open(test_config()).await.unwrap();
+        let engine = Arc::new(engine);
+        let service = TronNodeService::new(engine.clone(), NodeRoleConfig::Primary);
+
+        // Start a gRPC server
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            tonic::transport::Server::builder()
+                .add_service(pb::tron_node_server::TronNodeServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = pb::tron_node_client::TronNodeClient::new(channel);
+
+        // Send initial WalAck
+        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel::<pb::WalAck>(1);
+        ack_tx.send(pb::WalAck { confirmed_lsn: 0 }).await.unwrap();
+        let ack_stream = tokio_stream::wrappers::ReceiverStream::new(ack_rx);
+
+        let result = client.stream_wal(ack_stream).await;
+        assert!(result.is_err(), "expected error when tracker is absent");
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        server_task.abort();
     }
 }

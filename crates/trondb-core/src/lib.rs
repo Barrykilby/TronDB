@@ -415,6 +415,51 @@ impl Engine {
         self.executor.wal_writer()
     }
 
+    /// Read all WAL records with LSN > `since_lsn` from segment files.
+    ///
+    /// Returns raw records in LSN order (including control records like
+    /// TxBegin/TxCommit). Used by the replication layer to catch-up replicas.
+    pub async fn wal_records_since(&self, since_lsn: u64) -> Result<Vec<WalRecord>, EngineError> {
+        let wal_dir = self.executor.wal_writer().wal_dir().to_path_buf();
+        if !wal_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        // Read all segments and collect records with lsn > since_lsn
+        let mut segment_ids = Vec::new();
+        let mut entries = tokio::fs::read_dir(&wal_dir)
+            .await
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| EngineError::Storage(e.to_string()))?
+        {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(id) = trondb_wal::segment::segment_id_from_filename(name) {
+                    segment_ids.push(id);
+                }
+            }
+        }
+        segment_ids.sort();
+
+        let mut records = Vec::new();
+        for seg_id in &segment_ids {
+            let path = wal_dir.join(trondb_wal::segment::segment_filename(*seg_id));
+            let seg_records = trondb_wal::segment::WalSegment::read_all(&path)
+                .await
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+            for r in seg_records {
+                if r.lsn > since_lsn {
+                    records.push(r);
+                }
+            }
+        }
+
+        records.sort_by_key(|r| r.lsn);
+        Ok(records)
+    }
+
     /// Read entity data from a specific tier's partition.
     pub fn read_tiered(
         &self,

@@ -2156,7 +2156,9 @@ dependencies = [
 name = "trondb-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
+ "dashmap",
  "prost",
  "serde",
  "sysinfo",
