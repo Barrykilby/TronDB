@@ -12,6 +12,7 @@ use trondb_routing::health::{HealthSignal, NodeStatus};
 use trondb_routing::node::{NodeId, NodeRole};
 use crate::config::{NodeRoleConfig, ReplicationConfig};
 use crate::location_stream::spawn_location_stream;
+use crate::metrics::SystemMetrics;
 use crate::replication::ReplicaTracker;
 use crate::stream_health::spawn_health_stream;
 
@@ -22,6 +23,7 @@ pub struct TronNodeService {
     tracker: Option<Arc<ReplicaTracker>>,
     replication_config: ReplicationConfig,
     location_broadcast: Option<broadcast::Sender<pb::LocationUpdateMessage>>,
+    system_metrics: Arc<SystemMetrics>,
 }
 
 impl TronNodeService {
@@ -33,6 +35,7 @@ impl TronNodeService {
             tracker: None,
             replication_config: ReplicationConfig::default(),
             location_broadcast: None,
+            system_metrics: Arc::new(SystemMetrics::new()),
         }
     }
 
@@ -48,6 +51,7 @@ impl TronNodeService {
             tracker: Some(tracker),
             replication_config: ReplicationConfig::default(),
             location_broadcast: None,
+            system_metrics: Arc::new(SystemMetrics::new()),
         }
     }
 
@@ -64,6 +68,7 @@ impl TronNodeService {
             tracker: Some(tracker),
             replication_config,
             location_broadcast: None,
+            system_metrics: Arc::new(SystemMetrics::new()),
         }
     }
 
@@ -338,10 +343,12 @@ impl TronNode for TronNodeService {
 }
 
 impl TronNodeService {
-    /// Compute a HealthSignal from the local engine state.
-    /// Uses estimated values until Task 17 (real metrics) replaces them.
+    /// Compute a HealthSignal from the local engine state, using real
+    /// CPU/RAM metrics from `sysinfo`.
     fn compute_local_health(&self) -> HealthSignal {
         let entity_count = self.engine.entity_count() as u64;
+        let cpu = self.system_metrics.cpu_utilisation();
+        let ram = self.system_metrics.ram_pressure();
         HealthSignal {
             node_id: NodeId::from_string("local"),
             node_role: match self.role {
@@ -354,8 +361,8 @@ impl TronNodeService {
                 .unwrap_or_default()
                 .as_millis() as i64,
             sequence: 0,
-            cpu_utilisation: 0.0, // placeholder until Task 17
-            ram_pressure: entity_count as f32 / 100_000.0,
+            cpu_utilisation: cpu,
+            ram_pressure: ram,
             hot_entity_count: entity_count,
             hot_tier_capacity: 100_000,
             warm_entity_count: 0,

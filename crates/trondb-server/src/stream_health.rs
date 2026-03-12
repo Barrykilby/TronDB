@@ -11,6 +11,7 @@ use trondb_proto::pb;
 use trondb_routing::health::{HealthSignal, NodeStatus};
 use trondb_routing::node::{NodeId, NodeRole};
 use crate::config::NodeRoleConfig;
+use crate::metrics::SystemMetrics;
 
 /// Spawn a background task that periodically computes a [`HealthSignal`] from
 /// `engine`, converts it to [`pb::HealthSignalResponse`], wraps it in
@@ -28,12 +29,13 @@ pub fn spawn_health_stream(
     tx: tokio::sync::mpsc::Sender<Result<pb::HealthSignalResponse, Status>>,
     interval: Duration,
 ) -> JoinHandle<()> {
+    let system_metrics = Arc::new(SystemMetrics::new());
     tokio::spawn(async move {
         let mut sequence: u64 = 0;
         loop {
             tokio::time::sleep(interval).await;
 
-            let signal = compute_health(&engine, &role, sequence);
+            let signal = compute_health(&engine, &role, sequence, &system_metrics);
             let proto: pb::HealthSignalResponse = (&signal).into();
 
             if tx.send(Ok(proto)).await.is_err() {
@@ -46,9 +48,17 @@ pub fn spawn_health_stream(
     })
 }
 
-/// Build a [`HealthSignal`] from current engine state.
-fn compute_health(engine: &Engine, role: &NodeRoleConfig, sequence: u64) -> HealthSignal {
+/// Build a [`HealthSignal`] from current engine state, using real
+/// CPU/RAM metrics from `sysinfo`.
+fn compute_health(
+    engine: &Engine,
+    role: &NodeRoleConfig,
+    sequence: u64,
+    system_metrics: &SystemMetrics,
+) -> HealthSignal {
     let entity_count = engine.entity_count() as u64;
+    let cpu = system_metrics.cpu_utilisation();
+    let ram = system_metrics.ram_pressure();
     HealthSignal {
         node_id: NodeId::from_string("local"),
         node_role: match role {
@@ -61,8 +71,8 @@ fn compute_health(engine: &Engine, role: &NodeRoleConfig, sequence: u64) -> Heal
             .unwrap_or_default()
             .as_millis() as i64,
         sequence,
-        cpu_utilisation: 0.0,
-        ram_pressure: entity_count as f32 / 100_000.0,
+        cpu_utilisation: cpu,
+        ram_pressure: ram,
         hot_entity_count: entity_count,
         hot_tier_capacity: 100_000,
         warm_entity_count: 0,

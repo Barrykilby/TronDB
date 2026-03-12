@@ -7,6 +7,7 @@ use trondb_proto::pb;
 
 pub mod config;
 pub mod location_stream;
+pub mod metrics;
 pub mod remote_node;
 pub mod replication;
 pub mod scatter;
