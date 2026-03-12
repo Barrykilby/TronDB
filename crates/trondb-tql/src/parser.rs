@@ -136,6 +136,7 @@ impl Parser {
             Some(Token::Delete) => self.parse_delete(),
             Some(Token::Traverse) => self.parse_traverse(),
             Some(Token::Confirm) => self.parse_confirm_edge(),
+            Some(Token::Infer) => self.parse_infer(),
             Some(tok) => {
                 let tok_str = format!("{tok:?}");
                 let pos = self.tokens[self.pos].1.start;
@@ -1062,6 +1063,54 @@ impl Parser {
         self.expect(&Token::RBracket)?;
         Ok(values)
     }
+
+    /// Parse: INFER EDGES FROM <string_lit> [VIA <ident> (, <ident>)*] RETURNING (TOP <int> | ALL) [CONFIDENCE > <float>] ;
+    fn parse_infer(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // INFER
+        self.expect(&Token::Edges)?;
+        self.expect(&Token::From)?;
+        let from_id = self.expect_string_lit()?;
+
+        // Optional VIA clause: comma-separated edge type identifiers
+        let edge_types = if self.peek() == Some(&Token::Via) {
+            self.advance(); // VIA
+            let mut types = vec![self.expect_ident()?];
+            while self.peek() == Some(&Token::Comma) {
+                self.advance(); // ,
+                types.push(self.expect_ident()?);
+            }
+            types
+        } else {
+            Vec::new()
+        };
+
+        // RETURNING (TOP <int> | ALL)
+        self.expect(&Token::Returning)?;
+        let limit = if self.peek() == Some(&Token::Top) {
+            self.advance(); // TOP
+            Some(self.expect_int()? as usize)
+        } else {
+            self.expect(&Token::All)?;
+            None
+        };
+
+        // Optional CONFIDENCE > <float>
+        let confidence_floor = if self.peek() == Some(&Token::Confidence) {
+            self.advance(); // CONFIDENCE
+            self.expect(&Token::Gt)?;
+            Some(self.parse_number_as_f64()? as f32)
+        } else {
+            None
+        };
+
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::Infer(InferStmt {
+            from_id,
+            edge_types,
+            limit,
+            confidence_floor,
+        }))
+    }
 }
 
 /// Parse a TQL statement from the given input string.
@@ -1640,6 +1689,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_create_edge_with_infer_auto() {
+        let stmt = parse(
+            "CREATE EDGE performs_at FROM acts TO venues DECAY EXPONENTIAL RATE 0.05 FLOOR 0.1 PRUNE 0.05 INFER AUTO CONFIDENCE > 0.75 LIMIT 5;"
+        ).unwrap();
+        match stmt {
+            Statement::CreateEdgeType(s) => {
+                let ic = s.inference_config.unwrap();
+                assert!(ic.auto);
+                assert_eq!(ic.confidence_floor, Some(0.75));
+                assert_eq!(ic.limit, Some(5));
+            }
+            _ => panic!("expected CreateEdgeType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_edge_infer_auto_no_params() {
+        let stmt = parse("CREATE EDGE likes FROM users TO venues INFER AUTO;").unwrap();
+        match stmt {
+            Statement::CreateEdgeType(s) => {
+                let ic = s.inference_config.unwrap();
+                assert!(ic.auto);
+                assert!(ic.confidence_floor.is_none());
+                assert!(ic.limit.is_none());
+            }
+            _ => panic!("expected CreateEdgeType"),
+        }
+    }
+
+    #[test]
+    fn parse_create_edge_without_infer() {
+        let stmt = parse("CREATE EDGE likes FROM users TO venues;").unwrap();
+        match stmt {
+            Statement::CreateEdgeType(s) => {
+                assert!(s.inference_config.is_none());
+            }
+            _ => panic!("expected CreateEdgeType"),
+        }
+    }
+
+    #[test]
     fn parse_update_single_field() {
         let stmt = parse("UPDATE 'v1' IN venues SET name = 'New Name';").unwrap();
         match stmt {
@@ -1815,6 +1905,45 @@ mod tests {
                 assert!(s.limit.is_none());
             }
             _ => panic!("expected ExplainHistory"),
+        }
+    }
+
+    #[test]
+    fn parse_infer_basic() {
+        let stmt = parse("INFER EDGES FROM 'ent1' RETURNING TOP 10;").unwrap();
+        match stmt {
+            Statement::Infer(s) => {
+                assert_eq!(s.from_id, "ent1");
+                assert!(s.edge_types.is_empty());
+                assert_eq!(s.limit, Some(10));
+                assert!(s.confidence_floor.is_none());
+            }
+            _ => panic!("expected Infer"),
+        }
+    }
+
+    #[test]
+    fn parse_infer_with_via_and_confidence() {
+        let stmt = parse("INFER EDGES FROM 'ent1' VIA performs_at, headlined_by RETURNING TOP 5 CONFIDENCE > 0.80;").unwrap();
+        match stmt {
+            Statement::Infer(s) => {
+                assert_eq!(s.edge_types, vec!["performs_at", "headlined_by"]);
+                assert_eq!(s.limit, Some(5));
+                assert_eq!(s.confidence_floor, Some(0.80));
+            }
+            _ => panic!("expected Infer"),
+        }
+    }
+
+    #[test]
+    fn parse_infer_all() {
+        let stmt = parse("INFER EDGES FROM 'ent1' RETURNING ALL CONFIDENCE > 0.90;").unwrap();
+        match stmt {
+            Statement::Infer(s) => {
+                assert!(s.limit.is_none());
+                assert_eq!(s.confidence_floor, Some(0.90));
+            }
+            _ => panic!("expected Infer"),
         }
     }
 }
