@@ -29,6 +29,7 @@ async fn main() {
             ..Default::default()
         },
         snapshot_interval_secs: 60,
+        hnsw_snapshot_interval_secs: 300,
     };
 
     println!("TronDB v0.2.0 — inference-first storage engine");

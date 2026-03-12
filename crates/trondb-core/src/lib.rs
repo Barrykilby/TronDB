@@ -33,6 +33,7 @@ pub struct EngineConfig {
     pub data_dir: PathBuf,
     pub wal: WalConfig,
     pub snapshot_interval_secs: u64,
+    pub hnsw_snapshot_interval_secs: u64,
 }
 
 pub struct Engine {
@@ -312,8 +313,8 @@ impl Engine {
         };
 
         // Spawn background HNSW snapshot task
-        let hnsw_snapshot_handle = if config.snapshot_interval_secs > 0 {
-            let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
+        let hnsw_snapshot_handle = if config.hnsw_snapshot_interval_secs > 0 {
+            let interval = std::time::Duration::from_secs(config.hnsw_snapshot_interval_secs);
             let snap_dir = config.data_dir.join("hnsw_snapshots");
             let indexes_arc = Arc::clone(executor.indexes());
             let wal_arc = executor.wal_writer();
@@ -512,6 +513,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
         let (engine, _) = Engine::open(config).await.unwrap();
         (engine, dir)
@@ -685,6 +687,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         // Insert data
@@ -803,6 +806,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
         let (engine, _) = Engine::open(config).await.unwrap();
 
@@ -828,6 +832,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         // Write data
@@ -1019,6 +1024,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         // Insert edge
@@ -1053,6 +1059,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         // Phase 1: Create collection with sparse repr, insert entity
@@ -1087,6 +1094,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         {
@@ -1123,6 +1131,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         {
@@ -1321,6 +1330,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         // Insert data
@@ -1361,6 +1371,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
         let (engine, _) = Engine::open(config).await.unwrap();
 
@@ -1397,6 +1408,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
         let (engine, _) = Engine::open(config).await.unwrap();
 
@@ -1420,6 +1432,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         // Insert then delete
@@ -1453,6 +1466,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         // Insert entities and create snapshot
@@ -1494,6 +1508,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         // Session 1: create, insert, update, snapshot
@@ -1558,6 +1573,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 1, // 1 second for testing
+            hnsw_snapshot_interval_secs: 1, // 1 second for testing
         };
 
         let (engine, _) = Engine::open(config.clone()).await.unwrap();
@@ -1592,6 +1608,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0, // no periodic — rely on Drop
+            hnsw_snapshot_interval_secs: 0,
         };
 
         {

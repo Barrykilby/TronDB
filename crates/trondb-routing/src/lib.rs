@@ -39,6 +39,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
         let (engine, _) = trondb_core::Engine::open(cfg).await.unwrap();
         std::sync::Arc::new(engine)
@@ -77,6 +78,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
         let (engine, _) = trondb_core::Engine::open(cfg).await.unwrap();
         let engine = std::sync::Arc::new(engine);
@@ -116,6 +118,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
         let (engine, _) = trondb_core::Engine::open(cfg).await.unwrap();
         let engine = std::sync::Arc::new(engine);
@@ -645,6 +648,7 @@ mod tests {
                 ..Default::default()
             },
             snapshot_interval_secs: 0,
+            hnsw_snapshot_interval_secs: 0,
         };
 
         // Create an engine and write an AffinityGroup WAL record
