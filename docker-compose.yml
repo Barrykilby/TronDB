@@ -1,0 +1,36 @@
+services:
+  primary:
+    build: .
+    environment:
+      TRONDB_NODE_ID: primary
+      TRONDB_ROLE: primary
+      TRONDB_BIND_ADDR: "0.0.0.0:9400"
+      TRONDB_PEERS: "replica-1:replica:replica-1:9400"
+    volumes:
+      - primary-data:/data/trondb
+    ports:
+      - "9400:9400"
+
+  replica-1:
+    build: .
+    environment:
+      TRONDB_NODE_ID: replica-1
+      TRONDB_ROLE: replica
+      TRONDB_BIND_ADDR: "0.0.0.0:9400"
+      TRONDB_PEERS: "primary:primary:primary:9400"
+    volumes:
+      - replica-data:/data/trondb
+
+  router-1:
+    build: .
+    environment:
+      TRONDB_NODE_ID: router-1
+      TRONDB_ROLE: router
+      TRONDB_BIND_ADDR: "0.0.0.0:9400"
+      TRONDB_PEERS: "primary:primary:primary:9400,replica-1:replica:replica-1:9400"
+    ports:
+      - "9401:9400"
+
+volumes:
+  primary-data:
+  replica-data:
