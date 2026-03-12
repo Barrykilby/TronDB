@@ -233,6 +233,14 @@ impl LocationTable {
         self.mutation_counter.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Return all entries currently in the Dirty state.
+    pub fn iter_dirty(&self) -> Vec<(ReprKey, LocationDescriptor)> {
+        self.descriptors.iter()
+            .filter(|entry| entry.value().state == LocState::Dirty)
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
     /// Number of descriptors in the table.
     pub fn len(&self) -> usize {
         self.descriptors.len()

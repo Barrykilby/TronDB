@@ -172,6 +172,8 @@ impl Engine {
             // are already populated and will be caught up via incremental WAL replay.
             if let Ok(entities) = executor.scan_collection(&collection_name) {
                 for entity in &entities {
+                    // Track entity → collection mapping (for recompute_dirty)
+                    executor.entity_collections().insert(entity.id.clone(), collection_name.clone());
                     for repr in &entity.representations {
                         match &repr.vector {
                             types::VectorData::Dense(ref vec_f32) => {
@@ -578,6 +580,12 @@ impl Engine {
     /// Returns a reference to the location table. Alias for `location()`.
     pub fn location_table(&self) -> &location::LocationTable {
         self.location()
+    }
+
+    /// Trigger background recomputation of all dirty representations.
+    /// Returns the number of representations that were recomputed.
+    pub async fn trigger_cascade_recompute(&self) -> Result<usize, EngineError> {
+        self.executor.recompute_dirty().await
     }
 }
 
@@ -2100,5 +2108,169 @@ mod tests {
 
         assert_eq!(desc_name.state, crate::location::LocState::Clean, "name_repr should stay Clean");
         assert_eq!(desc_desc.state, crate::location::LocState::Dirty, "desc_repr should be Dirty");
+    }
+
+    #[tokio::test]
+    async fn dirty_repr_recomputed_to_clean() {
+        let (engine, _dir) = test_engine().await;
+
+        // Create collection with a FIELDS-based representation
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name), \
+            );"
+        ).await.unwrap();
+
+        // Register mock vectoriser
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT — auto-vectorise creates entity + location entry (Clean)
+        engine.execute_tql(
+            "INSERT INTO events (id, name) VALUES ('e1', 'Jazz');"
+        ).await.unwrap();
+
+        let key = crate::location::ReprKey {
+            entity_id: crate::types::LogicalId::from_string("e1"),
+            repr_index: 0,
+        };
+        let desc = engine.location().get(&key).expect("should have location entry after INSERT");
+        assert_eq!(desc.state, crate::location::LocState::Clean, "should be Clean after INSERT");
+
+        // UPDATE a contributing field — should mark Dirty
+        engine.execute_tql(
+            "UPDATE 'e1' IN events SET name = 'Blues';"
+        ).await.unwrap();
+
+        let desc = engine.location().get(&key).expect("should have location entry after UPDATE");
+        assert_eq!(desc.state, crate::location::LocState::Dirty, "should be Dirty after UPDATE");
+
+        // Trigger recompute
+        let count = engine.trigger_cascade_recompute().await.unwrap();
+        assert_eq!(count, 1, "should have recomputed 1 dirty representation");
+
+        // Verify location entry is now Clean
+        let desc = engine.location().get(&key).expect("should have location entry after recompute");
+        assert_eq!(desc.state, crate::location::LocState::Clean, "should be Clean after recompute");
+    }
+
+    #[tokio::test]
+    async fn recompute_dirty_returns_zero_when_all_clean() {
+        let (engine, _dir) = test_engine().await;
+
+        // Create collection with a FIELDS-based representation
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name), \
+            );"
+        ).await.unwrap();
+
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT — auto-vectorise creates entity (Clean)
+        engine.execute_tql(
+            "INSERT INTO events (id, name) VALUES ('e1', 'Jazz');"
+        ).await.unwrap();
+
+        // No UPDATE — everything is Clean
+        let count = engine.trigger_cascade_recompute().await.unwrap();
+        assert_eq!(count, 0, "should have nothing to recompute when all Clean");
+    }
+
+    #[tokio::test]
+    async fn recompute_dirty_updates_vector_data() {
+        let (engine, _dir) = test_engine().await;
+
+        // Create collection with a FIELDS-based representation
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name), \
+            );"
+        ).await.unwrap();
+
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT
+        engine.execute_tql(
+            "INSERT INTO events (id, name) VALUES ('e1', 'Jazz');"
+        ).await.unwrap();
+
+        // Capture original vector
+        let original = engine.execute_tql("FETCH * FROM events WHERE id = 'e1';").await.unwrap();
+        assert_eq!(original.rows.len(), 1);
+
+        // UPDATE a contributing field
+        engine.execute_tql(
+            "UPDATE 'e1' IN events SET name = 'Blues';"
+        ).await.unwrap();
+
+        // Trigger recompute — mock vectoriser produces different vector for different input
+        let count = engine.trigger_cascade_recompute().await.unwrap();
+        assert_eq!(count, 1);
+
+        // Verify entity is still fetchable after recompute
+        let after = engine.execute_tql("FETCH * FROM events WHERE id = 'e1';").await.unwrap();
+        assert_eq!(after.rows.len(), 1);
+        assert_eq!(
+            after.rows[0].values.get("name"),
+            Some(&Value::String("Blues".into())),
+            "metadata should reflect the UPDATE"
+        );
+    }
+
+    #[tokio::test]
+    async fn recompute_dirty_handles_multiple_entities() {
+        let (engine, _dir) = test_engine().await;
+
+        engine.execute_tql(
+            "CREATE COLLECTION events (\
+                MODEL 'mock-model' \
+                FIELD name TEXT, \
+                REPRESENTATION semantic DIMENSIONS 8 FIELDS (name), \
+            );"
+        ).await.unwrap();
+
+        let mock = Arc::new(test_vectoriser::TestMockVectoriser::new(8));
+        engine.vectoriser_registry().register("events", "semantic", mock);
+
+        // INSERT two entities
+        engine.execute_tql(
+            "INSERT INTO events (id, name) VALUES ('e1', 'Jazz');"
+        ).await.unwrap();
+        engine.execute_tql(
+            "INSERT INTO events (id, name) VALUES ('e2', 'Rock');"
+        ).await.unwrap();
+
+        // UPDATE both
+        engine.execute_tql(
+            "UPDATE 'e1' IN events SET name = 'Blues';"
+        ).await.unwrap();
+        engine.execute_tql(
+            "UPDATE 'e2' IN events SET name = 'Metal';"
+        ).await.unwrap();
+
+        // Trigger recompute — should recompute both
+        let count = engine.trigger_cascade_recompute().await.unwrap();
+        assert_eq!(count, 2, "should have recomputed 2 dirty representations");
+
+        // Both should be Clean now
+        let key1 = crate::location::ReprKey {
+            entity_id: crate::types::LogicalId::from_string("e1"),
+            repr_index: 0,
+        };
+        let key2 = crate::location::ReprKey {
+            entity_id: crate::types::LogicalId::from_string("e2"),
+            repr_index: 0,
+        };
+        assert_eq!(engine.location().get(&key1).unwrap().state, crate::location::LocState::Clean);
+        assert_eq!(engine.location().get(&key2).unwrap().state, crate::location::LocState::Clean);
     }
 }

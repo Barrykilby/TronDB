@@ -38,6 +38,8 @@ pub struct Executor {
     adjacency: AdjacencyIndex,
     edge_types: DashMap<String, EdgeType>,
     vectoriser_registry: Arc<VectoriserRegistry>,
+    /// Reverse map: entity_id → collection name (for recompute_dirty)
+    entity_collections: DashMap<LogicalId, String>,
 }
 
 impl Executor {
@@ -58,6 +60,7 @@ impl Executor {
             adjacency: AdjacencyIndex::new(),
             edge_types: DashMap::new(),
             vectoriser_registry,
+            entity_collections: DashMap::new(),
         }
     }
 
@@ -84,6 +87,9 @@ impl Executor {
                 RecordType::EntityWrite => {
                     let entity: Entity = rmp_serde::from_slice(&record.payload)
                         .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+                    // Track entity → collection mapping (for recompute_dirty)
+                    self.entity_collections.insert(entity.id.clone(), record.collection.clone());
 
                     // Idempotent: overwrite with WAL version (WAL is authoritative)
                     if self.store.has_collection(&record.collection) {
@@ -449,6 +455,9 @@ impl Executor {
                 // Apply to Fjall
                 self.store.insert(&p.collection, entity.clone())?;
                 self.store.persist()?;
+
+                // Track entity → collection mapping (for recompute_dirty)
+                self.entity_collections.insert(entity_id.clone(), p.collection.clone());
 
                 // Apply to Location Table
                 for (idx, repr) in entity.representations.iter().enumerate() {
@@ -1404,6 +1413,115 @@ impl Executor {
 
     pub fn scan_edges(&self, edge_type: &str) -> Result<Vec<Edge>, EngineError> {
         self.store.scan_edges(edge_type)
+    }
+
+    pub fn entity_collections(&self) -> &DashMap<LogicalId, String> {
+        &self.entity_collections
+    }
+
+    /// Look up which collection an entity belongs to (via the reverse map).
+    fn find_collection_for_entity(&self, entity_id: &LogicalId) -> Result<String, EngineError> {
+        self.entity_collections
+            .get(entity_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| EngineError::EntityNotFound(entity_id.to_string()))
+    }
+
+    /// Scan for Dirty representations, re-encode via the vectoriser,
+    /// write the new vector, and transition back to Clean.
+    pub async fn recompute_dirty(&self) -> Result<usize, EngineError> {
+        let dirty_keys = self.location.iter_dirty();
+        let mut recomputed = 0;
+
+        for (repr_key, _loc_desc) in &dirty_keys {
+            let collection = match self.find_collection_for_entity(&repr_key.entity_id) {
+                Ok(c) => c,
+                Err(_) => continue, // entity might have been deleted
+            };
+
+            let entity = match self.store.get(&collection, &repr_key.entity_id) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let schema = match self.schemas.get(&collection) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+
+            let repr_idx = repr_key.repr_index as usize;
+            if repr_idx >= schema.representations.len() {
+                continue;
+            }
+
+            let stored_repr = &schema.representations[repr_idx];
+            if stored_repr.fields.is_empty() {
+                continue; // passthrough — no auto-recomputation
+            }
+
+            // Build FieldSet from current metadata
+            let field_set: FieldSet = stored_repr
+                .fields
+                .iter()
+                .filter_map(|f| entity.metadata.get(f).map(|v| (f.clone(), v.to_string())))
+                .collect();
+
+            let vectoriser = match self.vectoriser_registry.get(&collection, &stored_repr.name) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // Transition to Recomputing
+            self.location.transition(repr_key, LocState::Recomputing)?;
+
+            // Encode new vector
+            let vector_data = vectoriser
+                .encode(&field_set)
+                .await
+                .map_err(|e| EngineError::Storage(format!("recompute failed: {e}")))?;
+
+            let model_id = vectoriser.model_id();
+            let recipe_hash =
+                crate::vectoriser::compute_recipe_hash(model_id, &stored_repr.fields);
+
+            // Update entity with new vector + Clean state
+            let mut updated_entity = entity.clone();
+            if repr_idx < updated_entity.representations.len() {
+                updated_entity.representations[repr_idx].vector = vector_data;
+                updated_entity.representations[repr_idx].state = ReprState::Clean;
+                updated_entity.representations[repr_idx].recipe_hash = recipe_hash;
+            }
+
+            // WAL: ReprWrite
+            let tx_id = self.wal.next_tx_id();
+            self.wal
+                .append(RecordType::TxBegin, &collection, tx_id, 1, vec![]);
+            let payload = rmp_serde::to_vec_named(&updated_entity)
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+            self.wal
+                .append(RecordType::ReprWrite, &collection, tx_id, 1, payload);
+            self.wal.commit(tx_id).await?;
+
+            // Fjall persist
+            self.store.insert(&collection, updated_entity.clone())?;
+            self.store.persist()?;
+
+            // Update HNSW index
+            if let Some(repr) = updated_entity.representations.get(repr_idx) {
+                if let VectorData::Dense(ref vec_f32) = repr.vector {
+                    let hnsw_key = format!("{}:{}", collection, repr.name);
+                    if let Some(hnsw) = self.indexes.get(&hnsw_key) {
+                        hnsw.insert(&repr_key.entity_id, vec_f32);
+                    }
+                }
+            }
+
+            // Transition to Clean
+            self.location.transition(repr_key, LocState::Clean)?;
+            recomputed += 1;
+        }
+
+        Ok(recomputed)
     }
 }
 
