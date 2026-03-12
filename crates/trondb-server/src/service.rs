@@ -9,7 +9,7 @@ use trondb_proto::pb;
 use trondb_proto::pb::tron_node_server::TronNode;
 use trondb_routing::health::{HealthSignal, NodeStatus};
 use trondb_routing::node::{NodeId, NodeRole};
-use crate::config::NodeRoleConfig;
+use crate::config::{NodeRoleConfig, ReplicationConfig};
 use crate::replication::ReplicaTracker;
 use crate::stream_health::spawn_health_stream;
 
@@ -18,11 +18,18 @@ pub struct TronNodeService {
     role: NodeRoleConfig,
     primary_channel: Option<tonic::transport::Channel>,  // for write forwarding
     tracker: Option<Arc<ReplicaTracker>>,
+    replication_config: ReplicationConfig,
 }
 
 impl TronNodeService {
     pub fn new(engine: Arc<Engine>, role: NodeRoleConfig) -> Self {
-        Self { engine, role, primary_channel: None, tracker: None }
+        Self {
+            engine,
+            role,
+            primary_channel: None,
+            tracker: None,
+            replication_config: ReplicationConfig::default(),
+        }
     }
 
     pub fn new_with_tracker(
@@ -30,7 +37,28 @@ impl TronNodeService {
         role: NodeRoleConfig,
         tracker: Arc<ReplicaTracker>,
     ) -> Self {
-        Self { engine, role, primary_channel: None, tracker: Some(tracker) }
+        Self {
+            engine,
+            role,
+            primary_channel: None,
+            tracker: Some(tracker),
+            replication_config: ReplicationConfig::default(),
+        }
+    }
+
+    pub fn new_with_tracker_and_config(
+        engine: Arc<Engine>,
+        role: NodeRoleConfig,
+        tracker: Arc<ReplicaTracker>,
+        replication_config: ReplicationConfig,
+    ) -> Self {
+        Self {
+            engine,
+            role,
+            primary_channel: None,
+            tracker: Some(tracker),
+            replication_config,
+        }
     }
 
     pub fn with_primary(mut self, channel: tonic::transport::Channel) -> Self {
@@ -61,6 +89,53 @@ impl TronNode for TronNodeService {
         // Write forwarding: non-primary nodes forward writes to primary
         if self.role != NodeRoleConfig::Primary && Self::is_write_plan(&plan) {
             return self.forward_to_primary(&plan).await;
+        }
+
+        // Semi-synchronous write path (primary only for write plans)
+        if self.role == NodeRoleConfig::Primary && Self::is_write_plan(&plan) {
+            if let Some(tracker) = &self.tracker {
+                let cfg = &self.replication_config;
+
+                // Check require_replica: fail fast if no replicas connected
+                if cfg.require_replica && tracker.connected_count() == 0 {
+                    return Err(Status::unavailable(
+                        "no replicas connected and require_replica is true",
+                    ));
+                }
+
+                // Capture LSN before execution
+                let lsn_before = self.engine.wal_head_lsn();
+
+                // Execute locally
+                let result = self.engine.execute(&plan).await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+
+                // Get LSN after execution; if unchanged, no WAL was written — skip broadcast
+                let lsn_after = self.engine.wal_head_lsn();
+
+                if lsn_after > lsn_before && tracker.connected_count() > 0 {
+                    // Broadcast new WAL records to all replicas
+                    if let Ok(records) = self.engine.wal_records_since(lsn_before).await {
+                        for record in &records {
+                            let proto: pb::WalRecordMessage = record.into();
+                            tracker.broadcast(&proto).await;
+                        }
+                    }
+
+                    // Wait for ack (semi-sync: timeout is non-fatal)
+                    let timeout = Duration::from_millis(cfg.ack_timeout_ms);
+                    match tracker.wait_for_ack(lsn_after, cfg.min_ack_replicas, timeout).await {
+                        Ok(()) => {} // replicas confirmed
+                        Err(e) => {
+                            // Log warning but still return success (semi-sync, not strict sync)
+                            eprintln!("[semi-sync] replication wait timed out: {e}");
+                        }
+                    }
+                }
+
+                let proto_result: pb::QueryResponse = (&result).into();
+                return Ok(Response::new(proto_result));
+            }
         }
 
         let result = self.engine.execute(&plan).await
@@ -438,5 +513,143 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn semi_sync_write_waits_for_replica_ack() {
+        // Setup engine and tracker
+        let (engine, _) = Engine::open(test_config()).await.unwrap();
+        let engine = Arc::new(engine);
+        let tracker = Arc::new(ReplicaTracker::new());
+
+        // Use a short ack_timeout so the test doesn't take forever on failure
+        let replication_config = crate::config::ReplicationConfig {
+            min_ack_replicas: 1,
+            ack_timeout_ms: 2000, // 2 second timeout
+            require_replica: false,
+        };
+
+        // Register a fake replica channel: we'll simulate confirmation after 50ms
+        let (replica_tx, _replica_rx) = tokio::sync::mpsc::channel::<pb::WalRecordMessage>(64);
+        tracker.register("fake-replica".into(), replica_tx);
+
+        // Clone tracker for the background confirmer task
+        let tracker_for_ack = tracker.clone();
+
+        // First create a collection so we have a schema for INSERT
+        let create_plan = Plan::CreateCollection(CreateCollectionPlan {
+            name: "semi_sync_test".into(),
+            representations: vec![],
+            fields: vec![],
+            indexes: vec![],
+        });
+        engine.execute(&create_plan).await.unwrap();
+
+        // Build the service with tracker and replication config
+        let service = TronNodeService::new_with_tracker_and_config(
+            engine.clone(),
+            NodeRoleConfig::Primary,
+            tracker.clone(),
+            replication_config,
+        );
+
+        // Spawn a task that confirms the replica ack after 50ms delay.
+        // It will watch the WAL head LSN and acknowledge it.
+        let engine_for_ack = engine.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Acknowledge the current WAL head LSN
+            let lsn = engine_for_ack.wal_head_lsn();
+            // Give it a bit more time so the write plan's LSN is covered
+            let confirm_lsn = lsn + 10; // generously above any new records
+            tracker_for_ack.update_confirmed_lsn("fake-replica", confirm_lsn);
+        });
+
+        // Measure the time the write takes — it should block until the replica confirms
+        let plan = Plan::CreateCollection(CreateCollectionPlan {
+            name: "another_collection".into(),
+            representations: vec![],
+            fields: vec![],
+            indexes: vec![],
+        });
+        let request = tonic::Request::new((&plan).into());
+
+        let start = std::time::Instant::now();
+        let response = service.execute(request).await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Verify the response is valid
+        let result = QueryResult::try_from(response.into_inner()).unwrap();
+        assert_eq!(result.rows.len(), 1, "expected status row from CreateCollection");
+
+        // The write should have waited for the replica ack (~50ms delay)
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "expected execute to wait for replica ack (>=40ms), but it took only {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn semi_sync_require_replica_fails_when_no_replicas() {
+        let (engine, _) = Engine::open(test_config()).await.unwrap();
+        let engine = Arc::new(engine);
+        let tracker = Arc::new(ReplicaTracker::new()); // no replicas registered
+
+        let replication_config = crate::config::ReplicationConfig {
+            min_ack_replicas: 1,
+            ack_timeout_ms: 1000,
+            require_replica: true, // strict: must have at least one replica
+        };
+
+        let service = TronNodeService::new_with_tracker_and_config(
+            engine.clone(),
+            NodeRoleConfig::Primary,
+            tracker.clone(),
+            replication_config,
+        );
+
+        let plan = Plan::CreateCollection(CreateCollectionPlan {
+            name: "strict_coll".into(),
+            representations: vec![],
+            fields: vec![],
+            indexes: vec![],
+        });
+        let request = tonic::Request::new((&plan).into());
+        let result = service.execute(request).await;
+
+        assert!(result.is_err(), "expected error when require_replica=true and no replicas");
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn semi_sync_no_tracker_succeeds_immediately() {
+        // Without a tracker, writes should succeed immediately (single-node mode)
+        let (engine, _) = Engine::open(test_config()).await.unwrap();
+        let engine = Arc::new(engine);
+        let service = TronNodeService::new(engine.clone(), NodeRoleConfig::Primary);
+
+        let plan = Plan::CreateCollection(CreateCollectionPlan {
+            name: "no_tracker_coll".into(),
+            representations: vec![],
+            fields: vec![],
+            indexes: vec![],
+        });
+        let request = tonic::Request::new((&plan).into());
+
+        let start = std::time::Instant::now();
+        let response = service.execute(request).await.unwrap();
+        let elapsed = start.elapsed();
+
+        let result = QueryResult::try_from(response.into_inner()).unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        // Should complete quickly without any replication wait
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "expected fast execution without tracker, took {:?}",
+            elapsed
+        );
     }
 }
