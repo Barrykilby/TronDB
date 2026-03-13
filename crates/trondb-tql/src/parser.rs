@@ -696,6 +696,16 @@ impl Parser {
 
     fn parse_traverse(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // TRAVERSE
+
+        // Detect TRAVERSE MATCH vs legacy TRAVERSE
+        // Legacy: TRAVERSE edge_type FROM 'id' ...
+        // New:    TRAVERSE FROM 'id' MATCH (a)-[e:TYPE]->(b) ...
+        if self.peek() == Some(&Token::From) {
+            // New TRAVERSE MATCH syntax
+            return self.parse_traverse_match();
+        }
+
+        // Legacy syntax: TRAVERSE edge_type FROM 'id' [DEPTH n] [LIMIT n];
         let edge_type = self.expect_ident()?;
         self.expect(&Token::From)?;
         let from_id = self.expect_string_lit()?;
@@ -721,6 +731,101 @@ impl Parser {
             edge_type,
             from_id,
             depth,
+            limit,
+        }))
+    }
+
+    fn parse_traverse_match(&mut self) -> Result<Statement, ParseError> {
+        // Already consumed: TRAVERSE
+        // Now: FROM 'id' MATCH (a)-[e:TYPE]->(b) DEPTH min..max [CONFIDENCE > threshold] [LIMIT n];
+        self.expect(&Token::From)?;
+        let from_id = self.expect_string_lit()?;
+        self.expect(&Token::Match)?;
+
+        // Parse pattern: (source_var) edge_pattern (target_var)
+        self.expect(&Token::LParen)?;
+        let source_var = self.expect_ident()?;
+        self.expect(&Token::RParen)?;
+
+        // Parse edge pattern: -[var:TYPE]-> or -[var:TYPE]- or -[var]->
+        self.expect(&Token::Dash)?;
+        self.expect(&Token::LBracket)?;
+
+        // Optional variable and/or edge type
+        let mut variable = None;
+        let mut edge_type = None;
+
+        if let Some(Token::Ident(_)) = self.peek() {
+            let ident = self.expect_ident()?;
+            if self.peek() == Some(&Token::Colon) {
+                // variable:TYPE
+                self.advance(); // :
+                variable = Some(ident);
+                edge_type = Some(self.expect_ident()?);
+            } else {
+                // Just a variable, no type
+                variable = Some(ident);
+            }
+        }
+
+        self.expect(&Token::RBracket)?;
+
+        // Determine direction: -> (forward) or - (undirected)
+        let direction = if self.peek() == Some(&Token::Arrow) {
+            self.advance();
+            EdgeDirection::Forward
+        } else if self.peek() == Some(&Token::Dash) {
+            self.advance();
+            EdgeDirection::Undirected
+        } else {
+            return Err(ParseError::InvalidQuery(
+                "expected -> or - after edge pattern".into(),
+            ));
+        };
+
+        self.expect(&Token::LParen)?;
+        let target_var = self.expect_ident()?;
+        self.expect(&Token::RParen)?;
+
+        // DEPTH min..max
+        self.expect(&Token::Depth)?;
+        let min_depth = self.expect_int()? as usize;
+        self.expect(&Token::DotDot)?;
+        let max_depth = self.expect_int()? as usize;
+
+        // Optional CONFIDENCE > threshold
+        let confidence_threshold = if self.peek() == Some(&Token::Confidence) {
+            self.advance();
+            self.expect(&Token::Gt)?;
+            Some(self.expect_float_or_int()?)
+        } else {
+            None
+        };
+
+        // Optional LIMIT
+        let limit = if self.peek() == Some(&Token::Limit) {
+            self.advance();
+            Some(self.expect_int()? as usize)
+        } else {
+            None
+        };
+
+        self.expect(&Token::Semicolon)?;
+
+        Ok(Statement::TraverseMatch(TraverseMatchStmt {
+            from_id,
+            pattern: MatchPattern {
+                source_var,
+                edge: EdgePattern {
+                    variable,
+                    edge_type,
+                    direction,
+                },
+                target_var,
+            },
+            min_depth,
+            max_depth,
+            confidence_threshold,
             limit,
         }))
     }
@@ -2677,6 +2782,85 @@ mod tests {
                 assert_eq!(j.limit, Some(10));
             }
             _ => panic!("expected FetchJoin"),
+        }
+    }
+
+    #[test]
+    fn parse_traverse_match_forward() {
+        let stmt = parse(
+            "TRAVERSE FROM 'ent_abc123' MATCH (a)-[e:RELATED_TO]->(b) DEPTH 1..3 CONFIDENCE > 0.70;"
+        ).unwrap();
+        match stmt {
+            Statement::TraverseMatch(t) => {
+                assert_eq!(t.from_id, "ent_abc123");
+                assert_eq!(t.pattern.source_var, "a");
+                assert_eq!(t.pattern.target_var, "b");
+                assert_eq!(t.pattern.edge.variable, Some("e".into()));
+                assert_eq!(t.pattern.edge.edge_type, Some("RELATED_TO".into()));
+                assert_eq!(t.pattern.edge.direction, EdgeDirection::Forward);
+                assert_eq!(t.min_depth, 1);
+                assert_eq!(t.max_depth, 3);
+                assert_eq!(t.confidence_threshold, Some(0.70));
+            }
+            _ => panic!("expected TraverseMatch"),
+        }
+    }
+
+    #[test]
+    fn parse_traverse_match_undirected() {
+        let stmt = parse(
+            "TRAVERSE FROM 'x' MATCH (a)-[e:KNOWS]-(b) DEPTH 1..2;"
+        ).unwrap();
+        match stmt {
+            Statement::TraverseMatch(t) => {
+                assert_eq!(t.pattern.edge.direction, EdgeDirection::Undirected);
+                assert_eq!(t.pattern.edge.edge_type, Some("KNOWS".into()));
+                assert_eq!(t.min_depth, 1);
+                assert_eq!(t.max_depth, 2);
+                assert!(t.confidence_threshold.is_none());
+            }
+            _ => panic!("expected TraverseMatch"),
+        }
+    }
+
+    #[test]
+    fn parse_traverse_match_no_edge_type() {
+        let stmt = parse(
+            "TRAVERSE FROM 'x' MATCH (a)-[e]->(b) DEPTH 1..5;"
+        ).unwrap();
+        match stmt {
+            Statement::TraverseMatch(t) => {
+                assert_eq!(t.pattern.edge.variable, Some("e".into()));
+                assert!(t.pattern.edge.edge_type.is_none());
+            }
+            _ => panic!("expected TraverseMatch"),
+        }
+    }
+
+    #[test]
+    fn parse_traverse_match_with_limit() {
+        let stmt = parse(
+            "TRAVERSE FROM 'x' MATCH (a)-[e:KNOWS]->(b) DEPTH 1..3 LIMIT 10;"
+        ).unwrap();
+        match stmt {
+            Statement::TraverseMatch(t) => {
+                assert_eq!(t.limit, Some(10));
+            }
+            _ => panic!("expected TraverseMatch"),
+        }
+    }
+
+    #[test]
+    fn parse_old_traverse_still_works() {
+        // Existing TRAVERSE syntax must continue to work
+        let stmt = parse("TRAVERSE knows FROM 'v1' DEPTH 3;").unwrap();
+        match stmt {
+            Statement::Traverse(t) => {
+                assert_eq!(t.edge_type, "knows");
+                assert_eq!(t.from_id, "v1");
+                assert_eq!(t.depth, 3);
+            }
+            _ => panic!("expected Traverse (legacy)"),
         }
     }
 }
