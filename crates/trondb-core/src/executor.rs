@@ -11972,4 +11972,92 @@ mod tests {
         // spoke1 should rank first (closest to query vector [0.9, 0.1, 0.0])
         assert_eq!(ids[0], "spoke1", "spoke1 should rank first (highest cosine similarity to query)");
     }
+
+    // -----------------------------------------------------------------------
+    // Task 8: EXPLAIN shows WITHIN subquery info
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn explain_search_within() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a dense representation
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "dense".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Create edge type
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "link".into(),
+            from_collection: "items".into(),
+            to_collection: "items".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Build a SearchPlan with a within clause
+        let within_plan = TraverseMatchPlan {
+            from_id: "a".into(),
+            pattern: trondb_tql::MatchPattern {
+                source_var: "a".into(),
+                edge: trondb_tql::EdgePattern {
+                    variable: Some("e".into()),
+                    edge_type: Some("link".into()),
+                    direction: trondb_tql::EdgeDirection::Forward,
+                },
+                target_var: "b".into(),
+            },
+            min_depth: 1,
+            max_depth: 2,
+            confidence_threshold: None,
+            temporal: None,
+            limit: None,
+        };
+
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 5,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: Some("dense".into()),
+            hints: vec![],
+            two_pass: None,
+            within: Some(Box::new(within_plan)),
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(search_plan)))
+            .await
+            .unwrap();
+
+        // EXPLAIN output must contain a "within" property row
+        let within_row = result.rows.iter().find(|r| {
+            r.values.get("property") == Some(&Value::String("within".into()))
+        });
+        assert!(within_row.is_some(), "EXPLAIN should emit a 'within' property row");
+
+        let value = within_row.unwrap().values.get("value").unwrap();
+        let value_str = format!("{:?}", value);
+        assert!(
+            value_str.contains("TRAVERSE") || value_str.contains("link"),
+            "WITHIN value should mention TRAVERSE or edge type: {value_str}"
+        );
+    }
 }
