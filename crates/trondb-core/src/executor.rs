@@ -4450,6 +4450,19 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
                     .join(", ");
                 props.push(("hints", hints_str));
             }
+            if let Some(ref within) = p.within {
+                let edge_type = within.pattern.edge.edge_type.as_deref().unwrap_or("*");
+                let direction = match within.pattern.edge.direction {
+                    trondb_tql::EdgeDirection::Forward => "->",
+                    trondb_tql::EdgeDirection::Backward => "<-",
+                    trondb_tql::EdgeDirection::Undirected => "-",
+                };
+                props.push(("within", format!(
+                    "TRAVERSE FROM '{}' -[:{}]{} DEPTH {}..{}",
+                    within.from_id, edge_type, direction,
+                    within.min_depth, within.max_depth,
+                )));
+            }
         }
         Plan::Insert(p) => {
             props.push(("mode", "Deterministic".into()));
@@ -11849,5 +11862,114 @@ mod tests {
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 0, "expected 0 results for empty subgraph");
+    }
+
+    #[tokio::test]
+    async fn search_within_traverse_end_to_end() {
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a dense representation (3 dims)
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "docs".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "dense".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "title".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "related".into(),
+            from_collection: "docs".into(),
+            to_collection: "docs".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Insert entities: hub with two spokes, plus an isolated island
+        for (id, title, vec) in &[
+            ("hub",    "central hub",      vec![0.5_f64, 0.5, 0.0]),
+            ("spoke1", "first spoke",      vec![0.9_f64, 0.1, 0.0]),
+            ("spoke2", "second spoke",     vec![0.1_f64, 0.9, 0.0]),
+            ("island", "isolated island",  vec![0.5_f64, 0.5, 0.0]),
+        ] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "docs".into(),
+                fields: vec!["id".into(), "title".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(title.to_string())],
+                vectors: vec![("dense".into(), trondb_tql::VectorLiteral::Dense(vec.clone()))],
+                collocate_with: None,
+                affinity_group: None,
+                valid_from: None,
+                valid_to: None,
+            })).await.unwrap();
+        }
+
+        // Edges: hub -> spoke1, hub -> spoke2 (island is disconnected)
+        for to_id in &["spoke1", "spoke2"] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "related".into(),
+                from_id: "hub".into(),
+                to_id: to_id.to_string(),
+                metadata: vec![],
+                valid_from: None,
+                valid_to: None,
+            })).await.unwrap();
+        }
+
+        // SEARCH WITHIN TRAVERSE: vector closest to spoke1, but only within hub's 1-hop neighbourhood
+        let result = exec.execute(&Plan::Search(SearchPlan {
+            collection: "docs".into(),
+            fields: trondb_tql::FieldList::All,
+            dense_vector: Some(vec![0.9, 0.1, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 5,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: Some("dense".into()),
+            hints: vec![],
+            two_pass: None,
+            within: Some(Box::new(TraverseMatchPlan {
+                from_id: "hub".into(),
+                pattern: MatchPattern {
+                    source_var: "a".into(),
+                    edge: EdgePattern {
+                        variable: Some("e".into()),
+                        edge_type: Some("related".into()),
+                        direction: EdgeDirection::Forward,
+                    },
+                    target_var: "b".into(),
+                },
+                min_depth: 1,
+                max_depth: 1,
+                confidence_threshold: None,
+                temporal: None,
+                limit: None,
+            })),
+        })).await.unwrap();
+
+        // Should find spoke1 and spoke2 but NOT island (even though island has a similar vector)
+        let ids: Vec<String> = result.rows.iter()
+            .filter_map(|r| r.values.get("id").map(|v| v.to_string()))
+            .collect();
+        assert_eq!(ids.len(), 2, "expected 2 results (spoke1 and spoke2), got: {:?}", ids);
+        assert!(ids.contains(&"spoke1".to_string()), "expected spoke1 in results");
+        assert!(ids.contains(&"spoke2".to_string()), "expected spoke2 in results");
+        assert!(!ids.contains(&"island".to_string()), "island must not appear — it is disconnected");
+        // spoke1 should rank first (closest to query vector [0.9, 0.1, 0.0])
+        assert_eq!(ids[0], "spoke1", "spoke1 should rank first (highest cosine similarity to query)");
     }
 }
