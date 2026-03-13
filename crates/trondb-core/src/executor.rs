@@ -48,6 +48,10 @@ pub struct Executor {
     inference_queue: Arc<DashSet<LogicalId>>,
     /// Cost provider for ACU estimation
     cost_provider: Arc<dyn CostProvider>,
+    /// Prometheus-compatible metrics
+    engine_metrics: Arc<crate::metrics::EngineMetrics>,
+    /// Slow query log
+    slow_log: Arc<crate::slow_log::SlowQueryLog>,
 }
 
 impl Executor {
@@ -73,6 +77,10 @@ impl Executor {
             inference_audit,
             inference_queue: Arc::new(DashSet::new()),
             cost_provider: Arc::new(ConstantCostProvider),
+            engine_metrics: Arc::new(crate::metrics::EngineMetrics::new()),
+            slow_log: Arc::new(crate::slow_log::SlowQueryLog::new(
+                crate::slow_log::SlowQueryConfig::default(),
+            )),
         }
     }
 
@@ -277,6 +285,7 @@ impl Executor {
     }
 
     pub async fn execute(&self, plan: &Plan) -> Result<QueryResult, EngineError> {
+        tracing::debug!(plan = ?std::mem::discriminant(plan), "executing plan");
         let start = Instant::now();
 
         // Cost estimation + budget check (skip for EXPLAIN -- it reports cost, doesn't enforce)
@@ -311,7 +320,9 @@ impl Executor {
             }
         };
 
-        match plan {
+        self.engine_metrics.inflight_queries.inc();
+
+        let result = match plan {
             Plan::CreateCollection(p) => {
                 // Validate no duplicate representation names
                 let mut repr_names = HashSet::new();
@@ -415,6 +426,7 @@ impl Executor {
             }
 
             Plan::Insert(p) => {
+                tracing::debug!(collection = %p.collection, "executing INSERT");
                 // Look up schema and validate collection exists
                 let schema = self.schemas.get(&p.collection)
                     .ok_or_else(|| EngineError::CollectionNotFound(p.collection.clone()))?
@@ -700,6 +712,7 @@ impl Executor {
             }
 
             Plan::Fetch(p) => {
+                tracing::debug!(collection = %p.collection, strategy = ?p.strategy, "executing FETCH");
                 match &p.strategy {
                     FetchStrategy::FieldIndexLookup(index_name) => {
                         // Look up via FieldIndex
@@ -847,6 +860,7 @@ impl Executor {
             }
 
             Plan::Search(p) => {
+                tracing::debug!(collection = %p.collection, k = p.k, strategy = ?p.strategy, "executing SEARCH");
                 // Validate collection exists
                 if !self.store.has_collection(&p.collection) {
                     return Err(EngineError::CollectionNotFound(p.collection.clone()));
@@ -2475,6 +2489,54 @@ impl Executor {
                 })
             }
 
+            Plan::Checkpoint(_) => {
+                // Trigger WAL checkpoint — writes a 0xFF record and snapshots location table
+                let snapshot_path = std::path::Path::new("checkpoint");
+                let checkpoint_lsn = self.wal.checkpoint(snapshot_path).await?;
+
+                // Snapshot the location table
+                let _snapshot_bytes = self.location.snapshot(checkpoint_lsn)
+                    .map_err(|e| EngineError::Storage(format!("location snapshot failed: {e}")))?;
+
+                Ok(QueryResult {
+                    columns: vec!["checkpoint_lsn".into(), "message".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("checkpoint_lsn".into(), Value::Int(checkpoint_lsn as i64)),
+                            ("message".into(), Value::String("checkpoint complete".into())),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
+                    },
+                })
+            }
+
+            Plan::Upsert(p) => {
+                tracing::debug!(collection = %p.collection, "executing UPSERT");
+                // UPSERT is semantically identical to INSERT —
+                // our INSERT already overwrites on duplicate ID.
+                // Delegate by constructing an equivalent InsertPlan.
+                let insert_plan = Plan::Insert(crate::planner::InsertPlan {
+                    collection: p.collection.clone(),
+                    fields: p.fields.clone(),
+                    values: p.values.clone(),
+                    vectors: p.vectors.clone(),
+                    collocate_with: None,
+                    affinity_group: None,
+                    valid_from: None,
+                    valid_to: None,
+                });
+                // Delegate to the INSERT handler via Box::pin to avoid infinite-size future
+                return Box::pin(self.execute(&insert_plan)).await;
+            }
+
             Plan::TraverseMatch(p) => {
                 let max_depth = p.max_depth.min(10); // cap at 10
                 let min_depth = p.min_depth;
@@ -2671,7 +2733,245 @@ impl Executor {
                     },
                 })
             }
+
+            Plan::Backup(p) => {
+                let backup_path = std::path::Path::new(&p.path);
+                let count = self.store.snapshot_to(backup_path)?;
+
+                Ok(QueryResult {
+                    columns: vec!["backed_up".into(), "path".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("backed_up".into(), Value::Int(count as i64)),
+                            ("path".into(), Value::String(p.path.clone())),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
+                    },
+                })
+            }
+
+            Plan::Restore(_p) => {
+                // Restore is a destructive operation -- return informational response.
+                // Full restore requires engine restart, so we return instructions.
+                Ok(QueryResult {
+                    columns: vec!["message".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("message".into(), Value::String(
+                                "RESTORE requires engine restart. Copy backup files to data dir and restart.".into()
+                            )),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
+                    },
+                })
+            }
+
+            Plan::AlterCollection(p) => {
+                let mut schema = self.store.get_collection_schema(&p.collection)?;
+
+                match &p.operation {
+                    trondb_tql::AlterCollectionOp::RenameField { old_name, new_name } => {
+                        // Find and rename the field in the schema
+                        let field = schema.fields.iter_mut()
+                            .find(|f| f.name == *old_name)
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                format!("field '{}' not found in collection '{}'", old_name, p.collection)
+                            ))?;
+                        field.name = new_name.clone();
+
+                        // Rename field in all entities
+                        let entities = self.store.scan(&p.collection)?;
+                        let tx_id = self.wal.next_tx_id();
+                        self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+
+                        for mut entity in entities {
+                            if let Some(value) = entity.metadata.remove(old_name) {
+                                entity.metadata.insert(new_name.clone(), value);
+                                let payload = rmp_serde::to_vec_named(&entity)
+                                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                                self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
+                                self.store.insert(&p.collection, entity)?;
+                            }
+                        }
+
+                        self.wal.commit(tx_id).await?;
+                    }
+                    trondb_tql::AlterCollectionOp::DropField { field_name } => {
+                        // Remove field from schema
+                        schema.fields.retain(|f| f.name != *field_name);
+
+                        // Remove field value from all entities
+                        let entities = self.store.scan(&p.collection)?;
+                        let tx_id = self.wal.next_tx_id();
+                        self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+
+                        for mut entity in entities {
+                            if entity.metadata.remove(field_name).is_some() {
+                                let payload = rmp_serde::to_vec_named(&entity)
+                                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                                self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
+                                self.store.insert(&p.collection, entity)?;
+                            }
+                        }
+
+                        self.wal.commit(tx_id).await?;
+                    }
+                }
+
+                // Update schema in store and cache
+                self.store.update_collection_schema(&schema)?;
+                self.schemas.insert(p.collection.clone(), schema);
+
+                Ok(QueryResult {
+                    columns: vec!["message".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("message".into(), Value::String(format!("collection '{}' altered", p.collection))),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
+                    },
+                })
+            }
+
+            Plan::Import(p) => {
+                // Validate collection exists
+                let _schema = self.schemas.get(&p.collection)
+                    .ok_or_else(|| EngineError::CollectionNotFound(p.collection.clone()))?
+                    .clone();
+
+                // Read JSONL file line by line
+                let content = std::fs::read_to_string(&p.path)
+                    .map_err(|e| EngineError::Storage(format!("import read: {e}")))?;
+
+                let mut imported = 0i64;
+
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let obj: serde_json::Value = serde_json::from_str(line)
+                        .map_err(|e| EngineError::Storage(format!("import parse: {e}")))?;
+
+                    let map = obj.as_object()
+                        .ok_or_else(|| EngineError::Storage("import: each line must be a JSON object".into()))?;
+
+                    // Extract id or generate one
+                    let entity_id = map.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| LogicalId::from_string(s))
+                        .unwrap_or_default();
+
+                    let mut entity = Entity::new(entity_id.clone());
+                    for (key, value) in map {
+                        if key == "id" {
+                            continue;
+                        }
+                        let val = match value {
+                            serde_json::Value::String(s) => Value::String(s.clone()),
+                            serde_json::Value::Number(n) => {
+                                if let Some(i) = n.as_i64() {
+                                    Value::Int(i)
+                                } else if let Some(f) = n.as_f64() {
+                                    Value::Float(f)
+                                } else {
+                                    Value::Null
+                                }
+                            }
+                            serde_json::Value::Bool(b) => Value::Bool(*b),
+                            serde_json::Value::Null => Value::Null,
+                            _ => Value::String(value.to_string()),
+                        };
+                        entity.metadata.insert(key.clone(), val);
+                    }
+
+                    // WAL + Fjall insert
+                    let tx_id = self.wal.next_tx_id();
+                    self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+                    let payload = rmp_serde::to_vec_named(&entity)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
+                    self.wal.commit(tx_id).await?;
+                    self.store.insert(&p.collection, entity)?;
+
+                    self.entity_collections.insert(entity_id, p.collection.clone());
+                    imported += 1;
+                }
+
+                self.store.persist()?;
+
+                Ok(QueryResult {
+                    columns: vec!["imported".into(), "collection".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("imported".into(), Value::Int(imported)),
+                            ("collection".into(), Value::String(p.collection.clone())),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
+                    },
+                })
+            }
+        };
+
+        // Instrumentation (runs for every query path)
+        let elapsed = start.elapsed();
+        self.engine_metrics.inflight_queries.dec();
+        self.engine_metrics.queries_total.inc();
+        self.engine_metrics.query_duration_seconds.observe_duration(elapsed);
+
+        match &result {
+            Ok(_) => {
+                // Check for slow query
+                if let Some(ref est) = cost_estimate {
+                    self.slow_log.maybe_log(&format!("{:?}", plan), est, elapsed);
+                }
+                // Track inserts
+                match plan {
+                    Plan::Insert(_) | Plan::Upsert(_) => {
+                        self.engine_metrics.inserts_total.inc();
+                    }
+                    _ => {}
+                }
+            }
+            Err(_) => {
+                self.engine_metrics.queries_error_total.inc();
+            }
         }
+
+        result
     }
 
     pub fn entity_count(&self) -> usize {
@@ -2756,6 +3056,14 @@ impl Executor {
 
     pub fn inference_queue(&self) -> &Arc<DashSet<LogicalId>> {
         &self.inference_queue
+    }
+
+    pub fn engine_metrics(&self) -> &Arc<crate::metrics::EngineMetrics> {
+        &self.engine_metrics
+    }
+
+    pub fn slow_query_log(&self) -> &Arc<crate::slow_log::SlowQueryLog> {
+        &self.slow_log
     }
 
     /// Drain the inference work queue and run background inference for each entity.
@@ -3689,6 +3997,9 @@ fn plan_collection_name(plan: &Plan) -> Option<&str> {
         Plan::Promote(p) => Some(&p.collection),
         Plan::ExplainTiers(p) => Some(&p.collection),
         Plan::Join(p) => Some(&p.from_collection),
+        Plan::Upsert(p) => Some(&p.collection),
+        Plan::AlterCollection(p) => Some(&p.collection),
+        Plan::Import(p) => Some(&p.collection),
         _ => None,
     }
 }
@@ -3923,6 +4234,43 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             }
             props.push(("tier", "Ram".into()));
         }
+        Plan::Upsert(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "UPSERT".into()));
+            props.push(("collection", p.collection.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
+        Plan::Checkpoint(_) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "CHECKPOINT".into()));
+            props.push(("tier", "WAL".into()));
+        }
+        Plan::Backup(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "BACKUP".into()));
+            props.push(("path", p.path.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
+        Plan::Restore(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "RESTORE".into()));
+            props.push(("path", p.path.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
+        Plan::AlterCollection(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "ALTER COLLECTION".into()));
+            props.push(("collection", p.collection.clone()));
+            props.push(("operation", format!("{:?}", p.operation)));
+            props.push(("tier", "Fjall".into()));
+        }
+        Plan::Import(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "IMPORT".into()));
+            props.push(("collection", p.collection.clone()));
+            props.push(("path", p.path.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
     }
 
     props
@@ -3946,7 +4294,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraverseMatchPlan, TraversePlan};
+    use crate::planner::{AlterCollectionPlan, BackupPlan, CheckpointPlan, ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, ImportPlan, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraverseMatchPlan, TraversePlan, UpsertPlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -10218,5 +10566,488 @@ mod tests {
             r.values.get("property") == Some(&Value::String("temporal".into()))
         });
         assert!(temporal_shown, "EXPLAIN should show temporal clause");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 15: Operational Excellence tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_upsert_insert_when_not_exists() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // UPSERT when entity doesn't exist -> creates it
+        exec.execute(&Plan::Upsert(UpsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("Venue A".into())],
+            vectors: vec![],
+        }))
+        .await
+        .unwrap();
+
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::Eq("id".into(), Literal::String("v1".into()))),
+                temporal: None,
+                order_by: vec![],
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+                hints: vec![],
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Venue A".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_upsert_update_when_exists() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // First insert
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("Old".into()))], None).await;
+
+        // UPSERT same ID -> updates
+        exec.execute(&Plan::Upsert(UpsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("New".into())],
+            vectors: vec![],
+        }))
+        .await
+        .unwrap();
+
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::Eq("id".into(), Literal::String("v1".into()))),
+                temporal: None,
+                order_by: vec![],
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+                hints: vec![],
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("New".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_checkpoint() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        let result = exec.execute(&Plan::Checkpoint(CheckpointPlan)).await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        // Should return a row with checkpoint info
+        assert!(result.rows[0].values.contains_key("checkpoint_lsn"));
+    }
+
+    #[tokio::test]
+    async fn metrics_incremented_on_query() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        insert_entity(
+            &exec,
+            "venues",
+            "v1",
+            vec![("name", Literal::String("A".into()))],
+            None,
+        )
+        .await;
+
+        // Execute a fetch
+        exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // queries_total should be at least 3 (create + insert + fetch)
+        assert!(
+            exec.engine_metrics().queries_total.get() >= 3,
+            "Expected queries_total >= 3, got {}",
+            exec.engine_metrics().queries_total.get()
+        );
+        // inserts_total should be at least 1
+        assert!(
+            exec.engine_metrics().inserts_total.get() >= 1,
+            "Expected inserts_total >= 1, got {}",
+            exec.engine_metrics().inserts_total.get()
+        );
+        // No queries should be inflight after completion
+        assert_eq!(exec.engine_metrics().inflight_queries.get(), 0);
+    }
+
+    // --- BACKUP / RESTORE ---
+
+    #[tokio::test]
+    async fn execute_backup_creates_files() {
+        let (exec, dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("A".into()))], None).await;
+
+        let backup_dir = dir.path().join("backup");
+        let result = exec.execute(&Plan::Backup(BackupPlan {
+            path: backup_dir.to_string_lossy().to_string(),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(backup_dir.join("schemas.jsonl").exists());
+        assert!(backup_dir.join("venues.jsonl").exists());
+        // backed_up count: 1 schema + 1 entity = 2
+        assert_eq!(result.rows[0].values.get("backed_up"), Some(&Value::Int(2)));
+    }
+
+    #[tokio::test]
+    async fn execute_restore_returns_message() {
+        let (exec, _dir) = setup_executor().await;
+
+        let result = exec.execute(&Plan::Restore(crate::planner::RestorePlan {
+            path: "/tmp/nonexistent".into(),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].values.get("message").is_some());
+    }
+
+    // --- ALTER COLLECTION ---
+
+    #[tokio::test]
+    async fn execute_alter_collection_rename_field() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "test_alter".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "old_name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Insert an entity with the old field name
+        insert_entity(&exec, "test_alter", "e1", vec![("old_name", Literal::String("value".into()))], None).await;
+
+        // Rename field
+        exec.execute(&Plan::AlterCollection(AlterCollectionPlan {
+            collection: "test_alter".into(),
+            operation: trondb_tql::AlterCollectionOp::RenameField {
+                old_name: "old_name".into(),
+                new_name: "new_name".into(),
+            },
+        })).await.unwrap();
+
+        // Verify entity has renamed field
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_alter".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].values.contains_key("new_name"));
+        assert!(!result.rows[0].values.contains_key("old_name"));
+    }
+
+    #[tokio::test]
+    async fn execute_alter_collection_drop_field() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "test_drop".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl {
+                    name: "keep_me".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+                trondb_tql::FieldDecl {
+                    name: "drop_me".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Insert an entity with both fields
+        insert_entity(
+            &exec, "test_drop", "e1",
+            vec![
+                ("keep_me", Literal::String("stays".into())),
+                ("drop_me", Literal::String("goes".into())),
+            ],
+            None,
+        ).await;
+
+        // Drop field
+        exec.execute(&Plan::AlterCollection(AlterCollectionPlan {
+            collection: "test_drop".into(),
+            operation: trondb_tql::AlterCollectionOp::DropField {
+                field_name: "drop_me".into(),
+            },
+        })).await.unwrap();
+
+        // Verify entity has only keep_me
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_drop".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].values.contains_key("keep_me"));
+        assert!(!result.rows[0].values.contains_key("drop_me"));
+    }
+
+    // --- IMPORT ---
+
+    #[tokio::test]
+    async fn execute_import_jsonl() {
+        let (exec, dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Create a JSONL file
+        let import_path = dir.path().join("import.jsonl");
+        std::fs::write(&import_path, r#"{"id":"v1","name":"Venue A"}
+{"id":"v2","name":"Venue B"}
+"#).unwrap();
+
+        let result = exec.execute(&Plan::Import(ImportPlan {
+            collection: "venues".into(),
+            path: import_path.to_string_lossy().to_string(),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("imported"),
+            Some(&Value::Int(2))
+        );
+
+        // Verify entities exist
+        let fetch = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(fetch.rows.len(), 2);
+    }
+
+    /// End-to-end integration test exercising UPSERT, CHECKPOINT, ALTER COLLECTION,
+    /// and IMPORT — all Phase 15 operational features in a single workflow.
+    #[tokio::test]
+    async fn integration_phase15_upsert_checkpoint_alter_import() {
+        let (exec, dir) = setup_executor().await;
+
+        // Create a collection with fields for this test
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "test_p15".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl {
+                    name: "id".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+                trondb_tql::FieldDecl {
+                    name: "name".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+                trondb_tql::FieldDecl {
+                    name: "city".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        }))
+        .await
+        .unwrap();
+
+        // --- UPSERT (insert, entity doesn't exist yet) ---
+        exec.execute(&Plan::Upsert(UpsertPlan {
+            collection: "test_p15".into(),
+            fields: vec!["id".into(), "name".into(), "city".into()],
+            values: vec![
+                Literal::String("e1".into()),
+                Literal::String("First".into()),
+                Literal::String("London".into()),
+            ],
+            vectors: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // --- UPSERT (update, same ID → should overwrite) ---
+        exec.execute(&Plan::Upsert(UpsertPlan {
+            collection: "test_p15".into(),
+            fields: vec!["id".into(), "name".into(), "city".into()],
+            values: vec![
+                Literal::String("e1".into()),
+                Literal::String("Updated".into()),
+                Literal::String("Paris".into()),
+            ],
+            vectors: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Verify the update took effect
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_p15".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 1, "UPSERT should overwrite, not duplicate");
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Updated".into()))
+        );
+        assert_eq!(
+            result.rows[0].values.get("city"),
+            Some(&Value::String("Paris".into()))
+        );
+
+        // --- CHECKPOINT ---
+        let ckpt = exec.execute(&Plan::Checkpoint(CheckpointPlan)).await.unwrap();
+        assert_eq!(ckpt.rows.len(), 1);
+        assert!(
+            ckpt.rows[0].values.contains_key("checkpoint_lsn"),
+            "CHECKPOINT should return checkpoint_lsn"
+        );
+
+        // --- ALTER COLLECTION RENAME FIELD ---
+        exec.execute(&Plan::AlterCollection(AlterCollectionPlan {
+            collection: "test_p15".into(),
+            operation: trondb_tql::AlterCollectionOp::RenameField {
+                old_name: "city".into(),
+                new_name: "location".into(),
+            },
+        }))
+        .await
+        .unwrap();
+
+        // Verify the rename: "city" no longer exists, "location" does
+        let after_rename = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_p15".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(after_rename.rows.len(), 1);
+        assert!(
+            after_rename.rows[0].values.get("city").is_none(),
+            "renamed field 'city' should no longer exist"
+        );
+        assert_eq!(
+            after_rename.rows[0].values.get("location"),
+            Some(&Value::String("Paris".into())),
+            "renamed field 'location' should have the old value"
+        );
+
+        // --- IMPORT ---
+        let import_path = dir.path().join("import.jsonl");
+        std::fs::write(&import_path, r#"{"id":"e2","name":"Imported1","location":"Berlin"}
+{"id":"e3","name":"Imported2","location":"Tokyo"}
+"#).unwrap();
+
+        let import_result = exec.execute(&Plan::Import(ImportPlan {
+            collection: "test_p15".into(),
+            path: import_path.to_string_lossy().to_string(),
+        })).await.unwrap();
+        assert_eq!(
+            import_result.rows[0].values.get("imported"),
+            Some(&Value::Int(2)),
+            "IMPORT should report 2 entities imported"
+        );
+
+        // Verify all 3 entities now exist
+        let final_fetch = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_p15".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(final_fetch.rows.len(), 3, "should have 3 entities total after import");
+
+        // --- Metrics verification ---
+        assert!(exec.engine_metrics().queries_total.get() > 0, "queries_total should be incremented");
+        assert!(exec.engine_metrics().inserts_total.get() > 0, "inserts_total should be incremented");
     }
 }

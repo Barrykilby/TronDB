@@ -756,6 +756,70 @@ impl From<&Plan> for pb::PlanRequest {
                         temporal: p.temporal.as_ref().map(temporal_clause_to_proto),
                     })
                 }
+
+                Plan::Checkpoint(_) => {
+                    PP::Checkpoint(pb::CheckpointPlanProto {})
+                }
+
+                Plan::Upsert(p) => {
+                    PP::Upsert(pb::UpsertPlanProto {
+                        collection: p.collection.clone(),
+                        fields: p.fields.clone(),
+                        values: p.values.iter().map(literal_to_proto).collect(),
+                        vectors: p
+                            .vectors
+                            .iter()
+                            .map(|(name, vl)| pb::NamedVector {
+                                name: name.clone(),
+                                vector: Some(vector_literal_to_proto(vl)),
+                            })
+                            .collect(),
+                    })
+                }
+
+                Plan::Backup(p) => {
+                    PP::Backup(pb::BackupPlanProto {
+                        path: p.path.clone(),
+                    })
+                }
+
+                Plan::Restore(p) => {
+                    PP::Restore(pb::RestorePlanProto {
+                        path: p.path.clone(),
+                    })
+                }
+
+                Plan::AlterCollection(p) => {
+                    use trondb_tql::AlterCollectionOp;
+                    let operation = match &p.operation {
+                        AlterCollectionOp::RenameField { old_name, new_name } => {
+                            Some(pb::alter_collection_plan_proto::Operation::RenameField(
+                                pb::RenameFieldOp {
+                                    old_name: old_name.clone(),
+                                    new_name: new_name.clone(),
+                                },
+                            ))
+                        }
+                        AlterCollectionOp::DropField { field_name } => {
+                            Some(pb::alter_collection_plan_proto::Operation::DropField(
+                                pb::DropFieldOp {
+                                    field_name: field_name.clone(),
+                                },
+                            ))
+                        }
+                    };
+                    PP::AlterCollection(pb::AlterCollectionPlanProto {
+                        collection: p.collection.clone(),
+                        operation,
+                    })
+                }
+
+                Plan::Import(p) => {
+                    PP::ImportPlan(pb::ImportPlanProto {
+                        collection: p.collection.clone(),
+                        path: p.path.clone(),
+                    })
+                }
             }),
         }
     }
@@ -1060,6 +1124,62 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     limit: p.limit.map(|l| l as usize),
                 }))
             }
+
+            PP::Checkpoint(_) => Ok(Plan::Checkpoint(CheckpointPlan)),
+
+            PP::Upsert(p) => {
+                let vectors = p
+                    .vectors
+                    .iter()
+                    .map(|nv| {
+                        let vl = proto_to_vector_literal(
+                            nv.vector.as_ref().ok_or("missing named vector")?,
+                        )?;
+                        Ok((nv.name.clone(), vl))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let values = p
+                    .values
+                    .iter()
+                    .map(proto_to_literal)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Plan::Upsert(UpsertPlan {
+                    collection: p.collection,
+                    fields: p.fields,
+                    values,
+                    vectors,
+                }))
+            }
+
+            PP::Backup(p) => Ok(Plan::Backup(BackupPlan {
+                path: p.path,
+            })),
+
+            PP::Restore(p) => Ok(Plan::Restore(RestorePlan {
+                path: p.path,
+            })),
+
+            PP::AlterCollection(p) => {
+                use pb::alter_collection_plan_proto::Operation;
+                let operation = match p.operation.ok_or("missing alter collection operation")? {
+                    Operation::RenameField(rf) => trondb_tql::AlterCollectionOp::RenameField {
+                        old_name: rf.old_name,
+                        new_name: rf.new_name,
+                    },
+                    Operation::DropField(df) => trondb_tql::AlterCollectionOp::DropField {
+                        field_name: df.field_name,
+                    },
+                };
+                Ok(Plan::AlterCollection(AlterCollectionPlan {
+                    collection: p.collection,
+                    operation,
+                }))
+            }
+
+            PP::ImportPlan(p) => Ok(Plan::Import(ImportPlan {
+                collection: p.collection,
+                path: p.path,
+            })),
         }
     }
 }

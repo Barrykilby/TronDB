@@ -124,13 +124,65 @@ impl Parser {
             Some(Token::Promote) => self.parse_promote(),
             Some(Token::Alter) => {
                 self.advance(); // ALTER
-                self.expect(&Token::Entity)?;
-                let entity_id = self.expect_string_lit()?;
-                self.expect(&Token::Drop)?;
-                self.expect(&Token::Affinity)?;
-                self.expect(&Token::Group)?;
-                self.expect(&Token::Semicolon)?;
-                Ok(Statement::AlterEntityDropAffinity(AlterEntityDropAffinityStmt { entity_id }))
+                match self.peek() {
+                    Some(Token::Entity) => {
+                        self.advance(); // ENTITY
+                        let entity_id = self.expect_string_lit()?;
+                        self.expect(&Token::Drop)?;
+                        self.expect(&Token::Affinity)?;
+                        self.expect(&Token::Group)?;
+                        self.expect(&Token::Semicolon)?;
+                        Ok(Statement::AlterEntityDropAffinity(AlterEntityDropAffinityStmt { entity_id }))
+                    }
+                    Some(Token::Collection) => {
+                        self.advance(); // COLLECTION
+                        let collection = self.expect_ident()?;
+                        match self.peek() {
+                            Some(Token::Rename) => {
+                                self.advance(); // RENAME
+                                self.expect(&Token::Field)?;
+                                let old_name = self.expect_ident()?;
+                                self.expect(&Token::To)?;
+                                let new_name = self.expect_ident()?;
+                                self.expect(&Token::Semicolon)?;
+                                Ok(Statement::AlterCollection(AlterCollectionStmt {
+                                    collection,
+                                    operation: AlterCollectionOp::RenameField { old_name, new_name },
+                                }))
+                            }
+                            Some(Token::Drop) => {
+                                self.advance(); // DROP
+                                self.expect(&Token::Field)?;
+                                let field_name = self.expect_ident()?;
+                                self.expect(&Token::Semicolon)?;
+                                Ok(Statement::AlterCollection(AlterCollectionStmt {
+                                    collection,
+                                    operation: AlterCollectionOp::DropField { field_name },
+                                }))
+                            }
+                            Some(tok) => {
+                                let tok_str = format!("{tok:?}");
+                                let pos = self.tokens[self.pos].1.start;
+                                Err(ParseError::UnexpectedToken {
+                                    pos,
+                                    expected: "RENAME or DROP".into(),
+                                    got: tok_str,
+                                })
+                            }
+                            None => Err(ParseError::UnexpectedEof("expected RENAME or DROP".into())),
+                        }
+                    }
+                    Some(tok) => {
+                        let tok_str = format!("{tok:?}");
+                        let pos = self.tokens[self.pos].1.start;
+                        Err(ParseError::UnexpectedToken {
+                            pos,
+                            expected: "ENTITY or COLLECTION".into(),
+                            got: tok_str,
+                        })
+                    }
+                    None => Err(ParseError::UnexpectedEof("expected ENTITY or COLLECTION".into())),
+                }
             }
             Some(Token::Update) => self.parse_update(),
             Some(Token::Delete) => self.parse_delete(),
@@ -138,6 +190,34 @@ impl Parser {
             Some(Token::Confirm) => self.parse_confirm_edge(),
             Some(Token::Infer) => self.parse_infer(),
             Some(Token::Drop) => self.parse_drop(),
+            Some(Token::Checkpoint) => {
+                self.advance(); // CHECKPOINT
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::Checkpoint(CheckpointStmt))
+            }
+            Some(Token::Backup) => {
+                self.advance(); // BACKUP
+                self.expect(&Token::To)?;
+                let path = self.expect_string_lit()?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::Backup(BackupStmt { path }))
+            }
+            Some(Token::Restore) => {
+                self.advance(); // RESTORE
+                self.expect(&Token::From)?;
+                let path = self.expect_string_lit()?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::Restore(RestoreStmt { path }))
+            }
+            Some(Token::Import) => {
+                self.advance(); // IMPORT
+                self.expect(&Token::Into)?;
+                let collection = self.expect_ident()?;
+                self.expect(&Token::From)?;
+                let path = self.expect_string_lit()?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::Import(ImportStmt { collection, path }))
+            }
             Some(tok) => {
                 let tok_str = format!("{tok:?}");
                 let pos = self.tokens[self.pos].1.start;
@@ -494,6 +574,14 @@ impl Parser {
 
     fn parse_insert(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // INSERT
+
+        // Check for INSERT OR UPDATE
+        if self.peek() == Some(&Token::Or) {
+            self.advance(); // OR
+            self.expect(&Token::Update)?;
+            return self.parse_upsert_entity();
+        }
+
         match self.peek() {
             Some(Token::Into) => self.parse_insert_entity(),
             Some(Token::Edge) => self.parse_insert_edge(),
@@ -502,12 +590,72 @@ impl Parser {
                 let pos = self.tokens[self.pos].1.start;
                 Err(ParseError::UnexpectedToken {
                     pos,
-                    expected: "INTO or EDGE".to_string(),
+                    expected: "INTO, EDGE, or OR".to_string(),
                     got: tok_str,
                 })
             }
-            None => Err(ParseError::UnexpectedEof("expected INTO or EDGE".to_string())),
+            None => Err(ParseError::UnexpectedEof("expected INTO, EDGE, or OR".to_string())),
         }
+    }
+
+    fn parse_upsert_entity(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Into)?;
+        let collection = self.expect_ident()?;
+        self.expect(&Token::LParen)?;
+
+        let mut fields = vec![self.expect_ident()?];
+        while self.peek() == Some(&Token::Comma) {
+            self.advance();
+            fields.push(self.expect_ident()?);
+        }
+        self.expect(&Token::RParen)?;
+
+        self.expect(&Token::Values)?;
+        self.expect(&Token::LParen)?;
+
+        let mut values = vec![self.parse_literal()?];
+        while self.peek() == Some(&Token::Comma) {
+            self.advance();
+            values.push(self.parse_literal()?);
+        }
+        self.expect(&Token::RParen)?;
+
+        // Parse named representation vectors
+        let mut vectors = Vec::new();
+        while self.peek() == Some(&Token::Representation) {
+            self.advance(); // REPRESENTATION
+            let repr_name = self.expect_name()?;
+            match self.peek() {
+                Some(Token::Vector) => {
+                    self.advance();
+                    let vec = self.parse_float_list()?;
+                    vectors.push((repr_name, VectorLiteral::Dense(vec)));
+                }
+                Some(Token::Sparse) => {
+                    self.advance();
+                    let vec = self.parse_sparse_vector_list()?;
+                    vectors.push((repr_name, VectorLiteral::Sparse(vec)));
+                }
+                Some(tok) => {
+                    let tok_str = format!("{tok:?}");
+                    let pos = self.tokens[self.pos].1.start;
+                    return Err(ParseError::UnexpectedToken {
+                        pos,
+                        expected: "VECTOR or SPARSE".into(),
+                        got: tok_str,
+                    });
+                }
+                None => return Err(ParseError::UnexpectedEof("expected VECTOR or SPARSE".into())),
+            }
+        }
+
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::Upsert(UpsertStmt {
+            collection,
+            fields,
+            values,
+            vectors,
+        }))
     }
 
     fn parse_insert_entity(&mut self) -> Result<Statement, ParseError> {
@@ -3090,5 +3238,149 @@ mod tests {
             }
             _ => panic!("expected InsertEdge"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 15: Operational Excellence parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_upsert_basic() {
+        let stmt = parse("INSERT OR UPDATE INTO venues (id, name) VALUES ('v1', 'Updated Venue');").unwrap();
+        match stmt {
+            Statement::Upsert(u) => {
+                assert_eq!(u.collection, "venues");
+                assert_eq!(u.fields, vec!["id", "name"]);
+                assert_eq!(u.values.len(), 2);
+                assert!(u.vectors.is_empty());
+            }
+            other => panic!("expected Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_upsert_with_vector() {
+        let stmt = parse("INSERT OR UPDATE INTO venues (id, name) VALUES ('v1', 'X') REPRESENTATION default VECTOR [1.0, 2.0, 3.0];").unwrap();
+        match stmt {
+            Statement::Upsert(u) => {
+                assert_eq!(u.collection, "venues");
+                assert_eq!(u.vectors.len(), 1);
+                assert_eq!(u.vectors[0].0, "default");
+            }
+            other => panic!("expected Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_without_or_update_still_works() {
+        let stmt = parse("INSERT INTO venues (id, name) VALUES ('v1', 'Venue');").unwrap();
+        assert!(matches!(stmt, Statement::Insert(_)));
+    }
+
+    #[test]
+    fn parse_checkpoint() {
+        let stmt = parse("CHECKPOINT;").unwrap();
+        assert!(matches!(stmt, Statement::Checkpoint(_)));
+    }
+
+    #[test]
+    fn parse_checkpoint_case_insensitive() {
+        let stmt = parse("checkpoint;").unwrap();
+        assert!(matches!(stmt, Statement::Checkpoint(_)));
+    }
+
+    // --- BACKUP / RESTORE ---
+
+    #[test]
+    fn parse_backup() {
+        let stmt = parse("BACKUP TO '/tmp/backup';").unwrap();
+        match stmt {
+            Statement::Backup(b) => assert_eq!(b.path, "/tmp/backup"),
+            other => panic!("expected Backup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore() {
+        let stmt = parse("RESTORE FROM '/tmp/backup';").unwrap();
+        match stmt {
+            Statement::Restore(r) => assert_eq!(r.path, "/tmp/backup"),
+            other => panic!("expected Restore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_backup_case_insensitive() {
+        let stmt = parse("backup to '/tmp/backup';").unwrap();
+        assert!(matches!(stmt, Statement::Backup(_)));
+    }
+
+    #[test]
+    fn parse_restore_case_insensitive() {
+        let stmt = parse("restore from '/tmp/backup';").unwrap();
+        assert!(matches!(stmt, Statement::Restore(_)));
+    }
+
+    // --- ALTER COLLECTION ---
+
+    #[test]
+    fn parse_alter_collection_rename_field() {
+        let stmt = parse("ALTER COLLECTION venues RENAME FIELD old_name TO new_name;").unwrap();
+        match stmt {
+            Statement::AlterCollection(a) => {
+                assert_eq!(a.collection, "venues");
+                match a.operation {
+                    AlterCollectionOp::RenameField { old_name, new_name } => {
+                        assert_eq!(old_name, "old_name");
+                        assert_eq!(new_name, "new_name");
+                    }
+                    _ => panic!("expected RenameField"),
+                }
+            }
+            other => panic!("expected AlterCollection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_collection_drop_field() {
+        let stmt = parse("ALTER COLLECTION venues DROP FIELD status;").unwrap();
+        match stmt {
+            Statement::AlterCollection(a) => {
+                assert_eq!(a.collection, "venues");
+                match a.operation {
+                    AlterCollectionOp::DropField { field_name } => {
+                        assert_eq!(field_name, "status");
+                    }
+                    _ => panic!("expected DropField"),
+                }
+            }
+            other => panic!("expected AlterCollection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_entity_drop_affinity_still_works() {
+        let stmt = parse("ALTER ENTITY 'e1' DROP AFFINITY GROUP;").unwrap();
+        assert!(matches!(stmt, Statement::AlterEntityDropAffinity(_)));
+    }
+
+    // --- IMPORT ---
+
+    #[test]
+    fn parse_import() {
+        let stmt = parse("IMPORT INTO venues FROM '/data/venues.jsonl';").unwrap();
+        match stmt {
+            Statement::Import(i) => {
+                assert_eq!(i.collection, "venues");
+                assert_eq!(i.path, "/data/venues.jsonl");
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_import_case_insensitive() {
+        let stmt = parse("import into venues from '/data/venues.jsonl';").unwrap();
+        assert!(matches!(stmt, Statement::Import(_)));
     }
 }

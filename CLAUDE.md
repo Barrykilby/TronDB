@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 14: Bi-Temporal Model.
+Inference-first storage engine. Phase 15: Operational Excellence.
 
 ## Project Structure
 
@@ -221,3 +221,29 @@ Inference-first storage engine. Phase 14: Bi-Temporal Model.
   - AST: TemporalClause enum (AsOf, ValidDuring, AsOfTransaction)
   - Proto: TemporalClauseProto, ValidDuringProto messages
   - Timestamp parsing: ISO 8601 (YYYY-MM-DDTHH:MM:SSZ), date-only (YYYY-MM-DD), millis-as-string
+- Operational Excellence (Phase 15)
+  - UPSERT: INSERT OR UPDATE semantics — atomic create-or-update by entity ID
+    - Syntax: INSERT OR UPDATE INTO collection (fields) VALUES (values) [REPRESENTATION ...];
+    - Functionally delegates to INSERT (which already handles overwrites)
+  - CHECKPOINT: admin command to trigger WAL checkpoint + location table snapshot
+    - Syntax: CHECKPOINT;
+    - Writes 0xFF WAL record, returns checkpoint_lsn
+  - Prometheus metrics: Counter, Gauge, Histogram in trondb-core/src/metrics.rs
+    - EngineMetrics: queries_total, queries_error_total, inserts_total, entities_total,
+      collections_total, wal_writes_total, query_duration_seconds, inflight_queries
+    - Prometheus text exposition format via render()
+    - HTTP endpoint on port 9401 in trondb-server (lightweight TCP, spawned as background task)
+  - Slow query log: ACU-threshold logging in trondb-core/src/slow_log.rs
+    - SlowQueryConfig: acu_threshold (default 100.0), max_entries (default 1000)
+    - Ring buffer of SlowQueryEntry, tracing::warn on slow queries
+  - Backup/restore: BACKUP TO '/path'; exports schemas + entities as JSON-lines
+    - RESTORE FROM '/path'; informational (requires engine restart)
+  - Schema migration: ALTER COLLECTION name RENAME FIELD old TO new;
+    - ALTER COLLECTION name DROP FIELD field_name;
+    - Updates schema + migrates all existing entities
+  - Bulk import: IMPORT INTO collection FROM '/path/to/file.jsonl';
+    - Reads JSON objects line-by-line, creates entities with WAL logging
+  - OpenTelemetry tracing scaffolding: tracing::debug! spans on execute, INSERT, FETCH, SEARCH, UPSERT
+    - Future OTel export via tracing subscriber layer (OTEL_EXPORTER_OTLP_ENDPOINT)
+  - Proto/gRPC: proper proto messages for UPSERT, CHECKPOINT, BACKUP, RESTORE, ALTER COLLECTION, IMPORT
+  - Benchmark suite: criterion benches for INSERT throughput, FETCH full scan, point lookup

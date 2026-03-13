@@ -309,6 +309,21 @@ pub enum Token {
     #[token("MATCH", priority = 10, ignore(ascii_case))]
     Match,
 
+    #[token("CHECKPOINT", priority = 10, ignore(ascii_case))]
+    Checkpoint,
+
+    #[token("BACKUP", priority = 10, ignore(ascii_case))]
+    Backup,
+
+    #[token("RESTORE", priority = 10, ignore(ascii_case))]
+    Restore,
+
+    #[token("RENAME", priority = 10, ignore(ascii_case))]
+    Rename,
+
+    #[token("IMPORT", priority = 10, ignore(ascii_case))]
+    Import,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
@@ -885,5 +900,11 @@ mod tests {
         assert_eq!(tokens[22], Token::Gt);
         assert_eq!(tokens[23], Token::FloatLit(0.70));
         assert_eq!(tokens[24], Token::Semicolon);
+    }
+
+    #[test]
+    fn lex_checkpoint_keyword() {
+        assert_eq!(lex("CHECKPOINT"), vec![Token::Checkpoint]);
+        assert_eq!(lex("checkpoint"), vec![Token::Checkpoint]);
     }
 }
