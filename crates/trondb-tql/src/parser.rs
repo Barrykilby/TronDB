@@ -767,6 +767,7 @@ impl Parser {
             collection,
             fields,
             filter,
+            order_by: vec![],
             limit,
         }))
     }
@@ -1005,21 +1006,63 @@ impl Parser {
     }
 
     fn parse_where_comparison(&mut self) -> Result<WhereClause, ParseError> {
+        // Handle NOT prefix
+        if self.peek() == Some(&Token::Not) {
+            self.advance();
+            let inner = self.parse_where_comparison()?;
+            return Ok(WhereClause::Not(Box::new(inner)));
+        }
+
         let field = self.expect_ident()?;
-        match self.advance() {
-            Some((Token::Eq, _)) => Ok(WhereClause::Eq(field, self.parse_literal()?)),
-            Some((Token::Gt, _)) => Ok(WhereClause::Gt(field, self.parse_literal()?)),
-            Some((Token::Lt, _)) => Ok(WhereClause::Lt(field, self.parse_literal()?)),
-            Some((Token::Gte, _)) => Ok(WhereClause::Gte(field, self.parse_literal()?)),
-            Some((Token::Lte, _)) => Ok(WhereClause::Lte(field, self.parse_literal()?)),
-            Some((tok, pos)) => Err(ParseError::UnexpectedToken {
-                pos,
-                expected: "comparison operator (=, >, <, >=, <=)".to_string(),
-                got: format!("{tok:?}"),
+
+        // IS NULL / IS NOT NULL
+        if self.peek() == Some(&Token::Is) {
+            self.advance();
+            if self.peek() == Some(&Token::Not) {
+                self.advance();
+                self.expect(&Token::Null)?;
+                return Ok(WhereClause::IsNotNull(field));
+            }
+            self.expect(&Token::Null)?;
+            return Ok(WhereClause::IsNull(field));
+        }
+
+        // IN (val1, val2, ...)
+        if self.peek() == Some(&Token::In) {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            let mut values = vec![self.parse_literal()?];
+            while self.peek() == Some(&Token::Comma) {
+                self.advance();
+                values.push(self.parse_literal()?);
+            }
+            self.expect(&Token::RParen)?;
+            return Ok(WhereClause::In(field, values));
+        }
+
+        // LIKE 'pattern'
+        if self.peek() == Some(&Token::Like) {
+            self.advance();
+            let pattern = self.expect_string_lit()?;
+            return Ok(WhereClause::Like(field, pattern));
+        }
+
+        // Existing operators: =, !=, >, <, >=, <=
+        let op = self.advance().ok_or_else(|| ParseError::UnexpectedEof("expected operator".into()))?;
+        let lit = self.parse_literal()?;
+
+        match op.0 {
+            Token::Eq => Ok(WhereClause::Eq(field, lit)),
+            Token::Neq => Ok(WhereClause::Neq(field, lit)),
+            Token::Gt => Ok(WhereClause::Gt(field, lit)),
+            Token::Lt => Ok(WhereClause::Lt(field, lit)),
+            Token::Gte => Ok(WhereClause::Gte(field, lit)),
+            Token::Lte => Ok(WhereClause::Lte(field, lit)),
+            _ => Err(ParseError::UnexpectedToken {
+                pos: op.1,
+                expected: "comparison operator".into(),
+                got: format!("{:?}", op.0),
             }),
-            None => Err(ParseError::UnexpectedEof(
-                "expected comparison operator".to_string(),
-            )),
         }
     }
 
@@ -1364,6 +1407,7 @@ mod tests {
                 collection: "venues".to_string(),
                 fields: FieldList::All,
                 filter: None,
+                order_by: vec![],
                 limit: None,
             })
         );
@@ -1944,6 +1988,79 @@ mod tests {
                 assert_eq!(s.confidence_floor, Some(0.90));
             }
             _ => panic!("expected Infer"),
+        }
+    }
+
+    #[test]
+    fn parse_where_not() {
+        let stmt = parse("FETCH * FROM venues WHERE NOT name = 'hidden';").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert!(matches!(f.filter, Some(WhereClause::Not(_))));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_where_is_null() {
+        let stmt = parse("FETCH * FROM venues WHERE description IS NULL;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.filter, Some(WhereClause::IsNull("description".into())));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_where_is_not_null() {
+        let stmt = parse("FETCH * FROM venues WHERE description IS NOT NULL;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.filter, Some(WhereClause::IsNotNull("description".into())));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_where_in_list() {
+        let stmt = parse("FETCH * FROM venues WHERE category IN ('music', 'theatre', 'comedy');").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                match f.filter {
+                    Some(WhereClause::In(field, values)) => {
+                        assert_eq!(field, "category");
+                        assert_eq!(values.len(), 3);
+                        assert_eq!(values[0], Literal::String("music".into()));
+                    }
+                    other => panic!("expected In, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_where_like() {
+        let stmt = parse("FETCH * FROM venues WHERE name LIKE 'Jazz%';").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.filter, Some(WhereClause::Like("name".into(), "Jazz%".into())));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_where_neq() {
+        let stmt = parse("FETCH * FROM venues WHERE status != 'archived';").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.filter, Some(WhereClause::Neq("status".into(), Literal::String("archived".into()))));
+            }
+            _ => panic!("expected Fetch"),
         }
     }
 }
