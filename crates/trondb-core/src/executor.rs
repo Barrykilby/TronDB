@@ -359,6 +359,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -627,6 +629,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -669,6 +673,8 @@ impl Executor {
                                 entities_scanned: entity_ids.len(),
                                 mode: QueryMode::Deterministic,
                                 tier: "FieldIndex".into(),
+                                cost: None,
+                                warnings: vec![],
                             },
                         })
                     }
@@ -714,6 +720,8 @@ impl Executor {
                                 entities_scanned: entity_ids.len(),
                                 mode: QueryMode::Deterministic,
                                 tier: "FieldIndex".into(),
+                                cost: None,
+                                warnings: vec![],
                             },
                         })
                     }
@@ -750,6 +758,8 @@ impl Executor {
                                 entities_scanned: scanned,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
+                                cost: None,
+                                warnings: vec![],
                             },
                         })
                     }
@@ -981,6 +991,8 @@ impl Executor {
                         entities_scanned: final_results.len(),
                         mode: QueryMode::Probabilistic,
                         tier: "Ram".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -995,6 +1007,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1061,6 +1075,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1128,6 +1144,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1178,6 +1196,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1262,6 +1282,8 @@ impl Executor {
                         entities_scanned: scanned,
                         mode: QueryMode::Deterministic,
                         tier: "Ram".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1282,6 +1304,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Routing".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1300,6 +1324,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Routing".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1395,6 +1421,8 @@ impl Executor {
                         entities_scanned: 1,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1424,6 +1452,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1496,6 +1526,8 @@ impl Executor {
                             entities_scanned: 0,
                             mode: QueryMode::Probabilistic,
                             tier: "Ram".into(),
+                            cost: None,
+                            warnings: vec![],
                         },
                     });
                 }
@@ -1608,6 +1640,8 @@ impl Executor {
                         entities_scanned: all_candidates.len(),
                         mode: QueryMode::Probabilistic,
                         tier: "Ram".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1682,6 +1716,8 @@ impl Executor {
                                 entities_scanned: 0,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
+                                cost: None,
+                                warnings: vec![],
                             },
                         })
                     }
@@ -1731,6 +1767,8 @@ impl Executor {
                                 entities_scanned: 0,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
+                                cost: None,
+                                warnings: vec![],
                             },
                         })
                     }
@@ -1786,6 +1824,8 @@ impl Executor {
                                 entities_scanned: 0,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
+                                cost: None,
+                                warnings: vec![],
                             },
                         })
                     }
@@ -1818,6 +1858,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Ram".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1876,6 +1918,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -1917,6 +1961,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }
@@ -2038,6 +2084,8 @@ impl Executor {
                         entities_scanned: 1,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 })
             }

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::cost::AcuEstimate;
 use crate::types::Value;
+use crate::warning::PlanWarning;
 
 #[derive(Debug, Clone)]
 pub struct QueryResult {
@@ -22,6 +24,8 @@ pub struct QueryStats {
     pub entities_scanned: usize,
     pub mode: QueryMode,
     pub tier: String,
+    pub cost: Option<AcuEstimate>,
+    pub warnings: Vec<PlanWarning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

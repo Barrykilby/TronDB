@@ -129,6 +129,8 @@ impl TryFrom<pb::QueryResponse> for QueryResult {
             entities_scanned: stats_proto.entities_scanned as usize,
             mode: proto_to_mode(stats_proto.mode)?,
             tier: stats_proto.tier,
+            cost: None,
+            warnings: vec![],
         };
 
         Ok(QueryResult {
@@ -167,6 +169,8 @@ mod tests {
                 entities_scanned: 1000,
                 mode: QueryMode::Probabilistic,
                 tier: "hot".into(),
+                cost: None,
+                warnings: vec![],
             },
         };
         let proto: pb::QueryResponse = (&result).into();
@@ -204,6 +208,8 @@ mod tests {
                 entities_scanned: 0,
                 mode: QueryMode::Deterministic,
                 tier: "hot".into(),
+                cost: None,
+                warnings: vec![],
             },
         };
         let proto: pb::QueryResponse = (&result).into();
@@ -222,6 +228,8 @@ mod tests {
                 entities_scanned: 0,
                 mode: QueryMode::Deterministic,
                 tier: "hot".into(),
+                cost: None,
+                warnings: vec![],
             },
         };
         let proto: pb::QueryResponse = (&result).into();

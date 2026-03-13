@@ -60,6 +60,8 @@ pub fn merge_dense_results(results: Vec<QueryResult>, limit: usize) -> QueryResu
             entities_scanned: total_scanned,
             mode: QueryMode::Probabilistic,
             tier: "scatter-gather".to_string(),
+            cost: None,
+            warnings: vec![],
         },
     }
 }
@@ -145,6 +147,8 @@ pub fn merge_hybrid_results(results: Vec<QueryResult>, limit: usize) -> QueryRes
             entities_scanned: total_scanned,
             mode: QueryMode::Probabilistic,
             tier: "scatter-gather".to_string(),
+            cost: None,
+            warnings: vec![],
         },
     }
 }
@@ -236,6 +240,8 @@ fn empty_result() -> QueryResult {
             entities_scanned: 0,
             mode: QueryMode::Probabilistic,
             tier: "scatter-gather".to_string(),
+            cost: None,
+            warnings: vec![],
         },
     }
 }
@@ -269,6 +275,8 @@ mod tests {
                 entities_scanned,
                 mode: QueryMode::Probabilistic,
                 tier: "hot".to_string(),
+                cost: None,
+                warnings: vec![],
             },
         }
     }
@@ -412,6 +420,8 @@ mod tests {
                 entities_scanned: 10,
                 mode: QueryMode::Probabilistic,
                 tier: "hot".to_string(),
+                cost: None,
+                warnings: vec![],
             },
         };
 
@@ -423,6 +433,8 @@ mod tests {
                 entities_scanned: 15,
                 mode: QueryMode::Probabilistic,
                 tier: "hot".to_string(),
+                cost: None,
+                warnings: vec![],
             },
         };
 

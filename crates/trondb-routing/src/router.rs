@@ -313,6 +313,8 @@ impl SemanticRouter {
                         entities_scanned: 0,
                         mode: trondb_core::result::QueryMode::Deterministic,
                         tier: "Routing".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 });
             }
@@ -352,6 +354,8 @@ impl SemanticRouter {
                         entities_scanned: 0,
                         mode: trondb_core::result::QueryMode::Deterministic,
                         tier: "Routing".into(),
+                        cost: None,
+                        warnings: vec![],
                     },
                 });
             }
@@ -470,6 +474,8 @@ fn ok_result(msg: &str) -> QueryResult {
             entities_scanned: 0,
             mode: QueryMode::Deterministic,
             tier: "Routing".into(),
+            cost: None,
+            warnings: vec![],
         },
     }
 }
