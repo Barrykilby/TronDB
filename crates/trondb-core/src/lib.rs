@@ -642,6 +642,11 @@ impl Engine {
         self.location()
     }
 
+    /// Returns a reference to the engine metrics (Prometheus-compatible).
+    pub fn metrics(&self) -> &std::sync::Arc<metrics::EngineMetrics> {
+        self.executor.engine_metrics()
+    }
+
     /// Trigger background recomputation of all dirty representations.
     /// Returns the number of representations that were recomputed.
     pub async fn trigger_cascade_recompute(&self) -> Result<usize, EngineError> {
