@@ -300,6 +300,18 @@ pub enum Token {
     #[token("CHECKPOINT", priority = 10, ignore(ascii_case))]
     Checkpoint,
 
+    #[token("BACKUP", priority = 10, ignore(ascii_case))]
+    Backup,
+
+    #[token("RESTORE", priority = 10, ignore(ascii_case))]
+    Restore,
+
+    #[token("RENAME", priority = 10, ignore(ascii_case))]
+    Rename,
+
+    #[token("IMPORT", priority = 10, ignore(ascii_case))]
+    Import,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),

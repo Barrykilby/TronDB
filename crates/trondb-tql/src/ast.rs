@@ -25,6 +25,10 @@ pub enum Statement {
     TraverseMatch(TraverseMatchStmt),
     Upsert(UpsertStmt),
     Checkpoint(CheckpointStmt),
+    Backup(BackupStmt),
+    Restore(RestoreStmt),
+    AlterCollection(AlterCollectionStmt),
+    Import(ImportStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -444,4 +448,38 @@ pub struct TraverseMatchStmt {
     pub max_depth: usize,
     pub confidence_threshold: Option<f64>,
     pub limit: Option<usize>,
+}
+
+// --- BACKUP / RESTORE ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackupStmt {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreStmt {
+    pub path: String,
+}
+
+// --- Schema Migration ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterCollectionOp {
+    RenameField { old_name: String, new_name: String },
+    DropField { field_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterCollectionStmt {
+    pub collection: String,
+    pub operation: AlterCollectionOp,
+}
+
+// --- BULK IMPORT ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportStmt {
+    pub collection: String,
+    pub path: String,
 }

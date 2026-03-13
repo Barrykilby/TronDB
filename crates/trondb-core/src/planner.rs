@@ -61,6 +61,10 @@ pub enum Plan {
     TraverseMatch(TraverseMatchPlan),
     Upsert(UpsertPlan),
     Checkpoint(CheckpointPlan),
+    Backup(BackupPlan),
+    Restore(RestorePlan),
+    AlterCollection(AlterCollectionPlan),
+    Import(ImportPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +202,28 @@ pub struct UpdateEntityPlan {
 
 #[derive(Debug, Clone)]
 pub struct CheckpointPlan;
+
+#[derive(Debug, Clone)]
+pub struct BackupPlan {
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestorePlan {
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterCollectionPlan {
+    pub collection: String,
+    pub operation: trondb_tql::AlterCollectionOp,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportPlan {
+    pub collection: String,
+    pub path: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct UpsertPlan {
@@ -580,6 +606,19 @@ pub fn plan(
             values: s.values.clone(),
             vectors: s.vectors.clone(),
         })),
+
+        Statement::Backup(s) => Ok(Plan::Backup(BackupPlan { path: s.path.clone() })),
+        Statement::Restore(s) => Ok(Plan::Restore(RestorePlan { path: s.path.clone() })),
+
+        Statement::AlterCollection(s) => Ok(Plan::AlterCollection(AlterCollectionPlan {
+            collection: s.collection.clone(),
+            operation: s.operation.clone(),
+        })),
+
+        Statement::Import(s) => Ok(Plan::Import(ImportPlan {
+            collection: s.collection.clone(),
+            path: s.path.clone(),
+        })),
     }
 }
 
@@ -667,12 +706,13 @@ pub fn estimate_plan_cost(
         | Plan::CreateAffinityGroup(_) | Plan::AlterEntityDropAffinity(_)
         | Plan::Demote(_) | Plan::Promote(_) | Plan::UpdateEntity(_)
         | Plan::ConfirmEdge(_) | Plan::DropCollection(_) | Plan::DropEdgeType(_)
-        | Plan::Upsert(_) => {
+        | Plan::Upsert(_) | Plan::Backup(_) | Plan::AlterCollection(_)
+        | Plan::Import(_) => {
             AcuEstimate::single("write", 1, cost.write_base_acu())
         }
         // Metadata / explain operations are free
         Plan::Explain(_) | Plan::ExplainTiers(_) | Plan::ExplainHistory(_)
-        | Plan::Checkpoint(_) => {
+        | Plan::Checkpoint(_) | Plan::Restore(_) => {
             AcuEstimate::zero()
         }
     }
