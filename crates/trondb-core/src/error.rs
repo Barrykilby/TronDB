@@ -64,6 +64,9 @@ pub enum EngineError {
         got: String,
     },
 
+    #[error("join error: {0}")]
+    JoinError(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }

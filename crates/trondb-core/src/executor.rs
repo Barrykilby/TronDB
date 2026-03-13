@@ -21,7 +21,7 @@ use crate::types::{
     StoredField, StoredIndex, StoredRepresentation, Value, VectorData,
 };
 use crate::vectoriser::{FieldSet, VectoriserRegistry};
-use trondb_tql::{FieldList, Literal, VectorLiteral, WhereClause};
+use trondb_tql::{FieldList, JoinFieldList, JoinType, Literal, VectorLiteral, WhereClause};
 use trondb_wal::{RecordType, WalRecord, WalWriter};
 
 // ---------------------------------------------------------------------------
@@ -2042,10 +2042,211 @@ impl Executor {
                 })
             }
 
-            Plan::Join(_p) => {
-                Err(EngineError::InvalidQuery(
-                    "JOIN execution not yet implemented".into(),
-                ))
+            Plan::Join(p) => {
+                // Build alias → collection mapping
+                let mut alias_to_collection: HashMap<String, String> = HashMap::new();
+                alias_to_collection.insert(p.from_alias.clone(), p.from_collection.clone());
+                for join in &p.joins {
+                    alias_to_collection.insert(join.alias.clone(), join.collection.clone());
+                }
+
+                // Fetch all entities from the left (FROM) collection
+                let left_entities: Vec<Entity> = self.store
+                    .scan(&p.from_collection)?;
+
+                let mut rows = Vec::new();
+                let limit = p.limit.unwrap_or(usize::MAX);
+
+                for left_entity in &left_entities {
+                    let mut combined_row: HashMap<String, Value> = HashMap::new();
+
+                    // Add left entity fields with alias prefix
+                    combined_row.insert(
+                        format!("{}.id", p.from_alias),
+                        Value::String(left_entity.id.to_string()),
+                    );
+                    for (k, v) in &left_entity.metadata {
+                        combined_row.insert(format!("{}.{}", p.from_alias, k), v.clone());
+                    }
+
+                    let mut matched = true;
+
+                    for join in &p.joins {
+                        // Get the left-side join field value
+                        let left_field_val = if join.on_left.field == "id" {
+                            Some(Value::String(left_entity.id.to_string()))
+                        } else {
+                            left_entity.metadata.get(&join.on_left.field).cloned()
+                        };
+
+                        let right_entity = match &left_field_val {
+                            Some(Value::String(ref id_str)) => {
+                                if join.confidence_threshold.is_some() {
+                                    // Probabilistic join: look up via AdjacencyIndex
+                                    let source_id = LogicalId::from_string(id_str);
+                                    let mut best_match: Option<(Entity, f32)> = None;
+                                    let threshold = join.confidence_threshold.unwrap_or(0.0) as f32;
+
+                                    for et_entry in self.edge_types.iter() {
+                                        let et = et_entry.value();
+                                        if et.from_collection == *alias_to_collection.get(&join.on_left.alias).unwrap_or(&String::new())
+                                            && et.to_collection == join.collection
+                                        {
+                                            let entries = self.adjacency.get(&source_id, &et.name);
+                                            for entry in &entries {
+                                                if entry.confidence >= threshold {
+                                                    if let Ok(right_ent) = self.store.get(&join.collection, &entry.to_id) {
+                                                        if best_match.as_ref().map(|(_, c)| entry.confidence > *c).unwrap_or(true) {
+                                                            best_match = Some((right_ent, entry.confidence));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    best_match
+                                } else {
+                                    // Structural join: use the field value as a lookup key
+                                    if join.on_right.field == "id" {
+                                        // Direct ID lookup
+                                        self.store.get(&join.collection, &LogicalId::from_string(id_str))
+                                            .ok().map(|e| (e, 1.0f32))
+                                    } else {
+                                        // Need to scan right collection for matching field value
+                                        let mut found = None;
+                                        if let Ok(right_entities) = self.store.scan(&join.collection) {
+                                            for right_ent in right_entities {
+                                                let right_val = if join.on_right.field == "id" {
+                                                    Some(Value::String(right_ent.id.to_string()))
+                                                } else {
+                                                    right_ent.metadata.get(&join.on_right.field).cloned()
+                                                };
+                                                if right_val.as_ref() == left_field_val.as_ref() {
+                                                    found = Some((right_ent, 1.0f32));
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        found
+                                    }
+                                }
+                            }
+                            _ => None,
+                        };
+
+                        match (right_entity, &join.join_type) {
+                            (Some((right_ent, confidence)), _) => {
+                                // Add right entity fields with alias prefix
+                                combined_row.insert(
+                                    format!("{}.id", join.alias),
+                                    Value::String(right_ent.id.to_string()),
+                                );
+                                for (k, v) in &right_ent.metadata {
+                                    combined_row.insert(format!("{}.{}", join.alias, k), v.clone());
+                                }
+                                // Add _edge.confidence if this is a probabilistic join
+                                if join.confidence_threshold.is_some() {
+                                    combined_row.insert(
+                                        "_edge.confidence".into(),
+                                        Value::Float(confidence as f64),
+                                    );
+                                }
+                            }
+                            (None, JoinType::Inner) => {
+                                matched = false;
+                                break;
+                            }
+                            (None, JoinType::Left) | (None, JoinType::Full) => {
+                                // Left/Full: include left row with NULLs for right side
+                                combined_row.insert(format!("{}.id", join.alias), Value::Null);
+                            }
+                            (None, JoinType::Right) => {
+                                // Right join: skip this left entity
+                                matched = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !matched {
+                        continue;
+                    }
+
+                    // Apply WHERE filter on combined row
+                    if let Some(ref filter) = p.filter {
+                        if !join_row_matches(&combined_row, filter) {
+                            continue;
+                        }
+                    }
+
+                    // Project requested fields
+                    let projected = project_join_row(&combined_row, &p.fields);
+                    rows.push(projected);
+
+                    if rows.len() >= limit {
+                        break;
+                    }
+                }
+
+                // For RIGHT and FULL joins, also scan unmatched right entities
+                for join in &p.joins {
+                    if matches!(join.join_type, JoinType::Right | JoinType::Full) {
+                        if let Ok(right_entities) = self.store.scan(&join.collection) {
+                            for right_ent in right_entities {
+                                // Check if this right entity was already matched
+                                let right_id_key = format!("{}.id", join.alias);
+                                let right_id_str = right_ent.id.to_string();
+                                let already_matched = rows.iter().any(|r| {
+                                    r.values.get(&right_id_key)
+                                        .map(|v| matches!(v, Value::String(s) if s == &right_id_str))
+                                        .unwrap_or(false)
+                                });
+                                if already_matched {
+                                    continue;
+                                }
+
+                                let mut combined_row: HashMap<String, Value> = HashMap::new();
+                                // NULLs for left side
+                                combined_row.insert(format!("{}.id", p.from_alias), Value::Null);
+                                // Right side fields
+                                combined_row.insert(
+                                    format!("{}.id", join.alias),
+                                    Value::String(right_ent.id.to_string()),
+                                );
+                                for (k, v) in &right_ent.metadata {
+                                    combined_row.insert(format!("{}.{}", join.alias, k), v.clone());
+                                }
+
+                                if let Some(ref filter) = p.filter {
+                                    if !join_row_matches(&combined_row, filter) {
+                                        continue;
+                                    }
+                                }
+
+                                let projected = project_join_row(&combined_row, &p.fields);
+                                rows.push(projected);
+
+                                if rows.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let scanned = rows.len();
+
+                Ok(QueryResult {
+                    columns: build_join_columns(&rows, &p.fields),
+                    rows,
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: scanned,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                    },
+                })
             }
         }
     }
@@ -2716,6 +2917,99 @@ fn value_lt(a: &Value, b: &Value) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// JOIN helpers
+// ---------------------------------------------------------------------------
+
+fn join_row_matches(combined: &HashMap<String, Value>, clause: &WhereClause) -> bool {
+    // WHERE clauses in JOIN context use qualified field names (e.g., "e.type")
+    // The combined row already has alias-qualified keys
+    match clause {
+        WhereClause::Eq(field, lit) => {
+            let expected = literal_to_value(lit);
+            combined.get(field).map(|v| *v == expected).unwrap_or(false)
+        }
+        WhereClause::Neq(field, lit) => {
+            let expected = literal_to_value(lit);
+            combined.get(field).map(|v| *v != expected).unwrap_or(true)
+        }
+        WhereClause::Gt(field, lit) => {
+            let threshold = literal_to_value(lit);
+            combined.get(field).map(|v| value_gt(v, &threshold)).unwrap_or(false)
+        }
+        WhereClause::Lt(field, lit) => {
+            let threshold = literal_to_value(lit);
+            combined.get(field).map(|v| value_lt(v, &threshold)).unwrap_or(false)
+        }
+        WhereClause::Gte(field, lit) => {
+            let threshold = literal_to_value(lit);
+            combined.get(field).map(|v| value_gt(v, &threshold) || v == &threshold).unwrap_or(false)
+        }
+        WhereClause::Lte(field, lit) => {
+            let threshold = literal_to_value(lit);
+            combined.get(field).map(|v| value_lt(v, &threshold) || v == &threshold).unwrap_or(false)
+        }
+        WhereClause::And(l, r) => join_row_matches(combined, l) && join_row_matches(combined, r),
+        WhereClause::Or(l, r) => join_row_matches(combined, l) || join_row_matches(combined, r),
+        WhereClause::Not(inner) => !join_row_matches(combined, inner),
+        WhereClause::IsNull(field) => {
+            combined.get(field).map(|v| matches!(v, Value::Null)).unwrap_or(true)
+        }
+        WhereClause::IsNotNull(field) => {
+            combined.get(field).map(|v| !matches!(v, Value::Null)).unwrap_or(false)
+        }
+        WhereClause::In(field, values) => {
+            let fv = combined.get(field);
+            values.iter().any(|lit| {
+                let expected = literal_to_value(lit);
+                fv.map(|v| *v == expected).unwrap_or(false)
+            })
+        }
+        WhereClause::Like(field, pattern) => {
+            combined.get(field).and_then(|v| match v {
+                Value::String(s) => Some(like_match(s, pattern)),
+                _ => None,
+            }).unwrap_or(false)
+        }
+    }
+}
+
+fn project_join_row(combined: &HashMap<String, Value>, fields: &JoinFieldList) -> Row {
+    let values = match fields {
+        JoinFieldList::All => combined.clone(),
+        JoinFieldList::Named(qfs) => {
+            let mut projected = HashMap::new();
+            for qf in qfs {
+                let key = format!("{}.{}", qf.alias, qf.field);
+                let val = combined.get(&key).cloned().unwrap_or(Value::Null);
+                projected.insert(key, val);
+            }
+            projected
+        }
+    };
+    Row { values, score: None }
+}
+
+fn build_join_columns(rows: &[Row], fields: &JoinFieldList) -> Vec<String> {
+    match fields {
+        JoinFieldList::Named(qfs) => {
+            qfs.iter().map(|qf| format!("{}.{}", qf.alias, qf.field)).collect()
+        }
+        JoinFieldList::All => {
+            let mut cols = Vec::new();
+            for row in rows {
+                for key in row.values.keys() {
+                    if !cols.contains(key) {
+                        cols.push(key.clone());
+                    }
+                }
+            }
+            cols.sort();
+            cols
+        }
+    }
+}
+
 fn build_columns(rows: &[Row], fields: &FieldList) -> Vec<String> {
     match fields {
         FieldList::Named(names) => {
@@ -3043,7 +3337,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
+    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraversePlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -7136,5 +7430,261 @@ mod tests {
             }))
             .await;
         assert!(err.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // JOIN tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn join_inner_structural() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collections
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+                trondb_tql::FieldDecl { name: "venue_id".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "venues".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "address".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Insert venue
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "address".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("123 Main St".into())],
+            vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
+        })).await.unwrap();
+
+        // Insert person referencing venue
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "people".into(),
+            fields: vec!["id".into(), "name".into(), "venue_id".into()],
+            values: vec![
+                Literal::String("p1".into()),
+                Literal::String("Alice".into()),
+                Literal::String("v1".into()),
+            ],
+            vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![0.0, 1.0, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
+        })).await.unwrap();
+
+        // Execute INNER JOIN
+        use trondb_tql::{JoinClause, JoinType, QualifiedField};
+        let result = exec.execute(&Plan::Join(JoinPlan {
+            fields: trondb_tql::JoinFieldList::Named(vec![
+                QualifiedField { alias: "p".into(), field: "name".into() },
+                QualifiedField { alias: "v".into(), field: "address".into() },
+            ]),
+            from_collection: "people".into(),
+            from_alias: "p".into(),
+            joins: vec![JoinClause {
+                join_type: JoinType::Inner,
+                collection: "venues".into(),
+                alias: "v".into(),
+                on_left: QualifiedField { alias: "p".into(), field: "venue_id".into() },
+                on_right: QualifiedField { alias: "v".into(), field: "id".into() },
+                confidence_threshold: None,
+            }],
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("p.name"),
+            Some(&Value::String("Alice".into()))
+        );
+        assert_eq!(
+            result.rows[0].values.get("v.address"),
+            Some(&Value::String("123 Main St".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn join_inner_no_match() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collections
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+                trondb_tql::FieldDecl { name: "venue_id".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "venues".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Insert person with non-existent venue_id
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "people".into(),
+            fields: vec!["id".into(), "name".into(), "venue_id".into()],
+            values: vec![
+                Literal::String("p1".into()),
+                Literal::String("Alice".into()),
+                Literal::String("nonexistent".into()),
+            ],
+            vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![0.0, 1.0, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
+        })).await.unwrap();
+
+        // INNER JOIN should return 0 rows (no matching venue)
+        use trondb_tql::{JoinClause, JoinType, QualifiedField};
+        let result = exec.execute(&Plan::Join(JoinPlan {
+            fields: trondb_tql::JoinFieldList::All,
+            from_collection: "people".into(),
+            from_alias: "p".into(),
+            joins: vec![JoinClause {
+                join_type: JoinType::Inner,
+                collection: "venues".into(),
+                alias: "v".into(),
+                on_left: QualifiedField { alias: "p".into(), field: "venue_id".into() },
+                on_right: QualifiedField { alias: "v".into(), field: "id".into() },
+                confidence_threshold: None,
+            }],
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn join_left_includes_unmatched() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collections
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+                trondb_tql::FieldDecl { name: "venue_id".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "venues".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Insert person with no matching venue
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "people".into(),
+            fields: vec!["id".into(), "name".into(), "venue_id".into()],
+            values: vec![
+                Literal::String("p1".into()),
+                Literal::String("Alice".into()),
+                Literal::String("nonexistent".into()),
+            ],
+            vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![0.0, 1.0, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
+        })).await.unwrap();
+
+        // LEFT JOIN should return 1 row with NULLs for venue fields
+        use trondb_tql::{JoinClause, JoinType, QualifiedField};
+        let result = exec.execute(&Plan::Join(JoinPlan {
+            fields: trondb_tql::JoinFieldList::Named(vec![
+                QualifiedField { alias: "p".into(), field: "name".into() },
+                QualifiedField { alias: "v".into(), field: "id".into() },
+            ]),
+            from_collection: "people".into(),
+            from_alias: "p".into(),
+            joins: vec![JoinClause {
+                join_type: JoinType::Left,
+                collection: "venues".into(),
+                alias: "v".into(),
+                on_left: QualifiedField { alias: "p".into(), field: "venue_id".into() },
+                on_right: QualifiedField { alias: "v".into(), field: "id".into() },
+                confidence_threshold: None,
+            }],
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values.get("v.id"), Some(&Value::Null));
     }
 }
