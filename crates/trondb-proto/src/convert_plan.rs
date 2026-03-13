@@ -7,8 +7,8 @@ use crate::pb;
 use trondb_core::planner::*;
 use trondb_tql::ast::{
     DecayConfigDecl, DecayFnDecl, FieldDecl, FieldList, FieldType, IndexDecl, Literal, Metric,
-    OrderByClause, QueryHint, RepresentationDecl, SortDirection, TierTarget, VectorLiteral,
-    WhereClause,
+    OrderByClause, QueryHint, RepresentationDecl, SortDirection, TemporalClause, TierTarget,
+    VectorLiteral, WhereClause,
 };
 
 // ---------------------------------------------------------------------------
@@ -174,6 +174,37 @@ fn proto_to_vector_literal(proto: &pb::VectorLiteralProto) -> Result<VectorLiter
         Vector::Sparse(s) => Ok(VectorLiteral::Sparse(
             s.entries.iter().map(|e| (e.index, e.value)).collect(),
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal clause helpers
+// ---------------------------------------------------------------------------
+
+fn temporal_clause_to_proto(tc: &TemporalClause) -> pb::TemporalClauseProto {
+    use pb::temporal_clause_proto::Clause;
+    pb::TemporalClauseProto {
+        clause: Some(match tc {
+            TemporalClause::AsOf(ts) => Clause::AsOf(ts.clone()),
+            TemporalClause::ValidDuring(start, end) => {
+                Clause::ValidDuring(pb::ValidDuringProto {
+                    start: start.clone(),
+                    end: end.clone(),
+                })
+            }
+            TemporalClause::AsOfTransaction(lsn) => Clause::AsOfTransaction(*lsn),
+        }),
+    }
+}
+
+fn proto_to_temporal_clause(proto: &pb::TemporalClauseProto) -> Result<TemporalClause, String> {
+    use pb::temporal_clause_proto::Clause;
+    match proto.clause.as_ref().ok_or("missing temporal clause")? {
+        Clause::AsOf(ts) => Ok(TemporalClause::AsOf(ts.clone())),
+        Clause::ValidDuring(vd) => Ok(TemporalClause::ValidDuring(
+            vd.start.clone(), vd.end.clone(),
+        )),
+        Clause::AsOfTransaction(lsn) => Ok(TemporalClause::AsOfTransaction(*lsn)),
     }
 }
 
@@ -488,6 +519,8 @@ impl From<&Plan> for pb::PlanRequest {
                             .collect(),
                         collocate_with,
                         affinity_group: ip.affinity_group.clone(),
+                        valid_from: ip.valid_from.clone(),
+                        valid_to: ip.valid_to.clone(),
                     })
                 }
 
@@ -502,6 +535,7 @@ impl From<&Plan> for pb::PlanRequest {
                         strategy_index_name,
                         order_by: fp.order_by.iter().map(order_by_to_proto).collect(),
                         hints: fp.hints.iter().map(hint_to_proto).collect(),
+                        temporal: fp.temporal.as_ref().map(temporal_clause_to_proto),
                     })
                 }
 
@@ -557,6 +591,8 @@ impl From<&Plan> for pb::PlanRequest {
                             value: Some(literal_to_proto(v)),
                         })
                         .collect(),
+                    valid_from: ie.valid_from.clone(),
+                    valid_to: ie.valid_to.clone(),
                 }),
 
                 Plan::DeleteEntity(de) => PP::DeleteEntity(pb::DeleteEntityPlan {
@@ -717,6 +753,7 @@ impl From<&Plan> for pb::PlanRequest {
                         max_depth: p.max_depth as u64,
                         confidence_threshold: p.confidence_threshold,
                         limit: p.limit.map(|l| l as u64),
+                        temporal: p.temporal.as_ref().map(temporal_clause_to_proto),
                     })
                 }
             }),
@@ -778,8 +815,8 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     vectors,
                     collocate_with,
                     affinity_group: ip.affinity_group,
-                    valid_from: None,
-                    valid_to: None,
+                    valid_from: ip.valid_from,
+                    valid_to: ip.valid_to,
                 }))
             }
 
@@ -787,7 +824,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                 collection: fp.collection,
                 fields: proto_to_field_list(&fp.fields.ok_or("missing fields")?),
                 filter: fp.filter.as_ref().map(proto_to_where_clause).transpose()?,
-                temporal: None,
+                temporal: fp.temporal.as_ref().map(proto_to_temporal_clause).transpose()?,
                 order_by: fp.order_by.iter().map(proto_to_order_by).collect(),
                 limit: fp.limit.map(|l| l as usize),
                 strategy: proto_to_fetch_strategy(fp.strategy, &fp.strategy_index_name),
@@ -859,8 +896,8 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     from_id: ie.from_id,
                     to_id: ie.to_id,
                     metadata,
-                    valid_from: None,
-                    valid_to: None,
+                    valid_from: ie.valid_from,
+                    valid_to: ie.valid_to,
                 }))
             }
 
@@ -1019,7 +1056,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     min_depth: p.min_depth as usize,
                     max_depth: p.max_depth as usize,
                     confidence_threshold: p.confidence_threshold,
-                    temporal: None,
+                    temporal: p.temporal.as_ref().map(proto_to_temporal_clause).transpose()?,
                     limit: p.limit.map(|l| l as usize),
                 }))
             }
@@ -1987,6 +2024,145 @@ mod tests {
                 assert!(sp.two_pass.is_none());
             }
             _ => panic!("expected Search"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Temporal round-trip tests (Task 10)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fetch_plan_temporal_as_of_round_trip() {
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: Some(TemporalClause::AsOf("2025-01-01T00:00:00Z".into())),
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        });
+        let proto = pb::PlanRequest::from(&plan);
+        let restored = Plan::try_from(proto).unwrap();
+        match restored {
+            Plan::Fetch(f) => {
+                assert_eq!(f.temporal, Some(TemporalClause::AsOf("2025-01-01T00:00:00Z".into())));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn fetch_plan_temporal_valid_during_round_trip() {
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: Some(TemporalClause::ValidDuring("2024-01-01".into(), "2024-12-31".into())),
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Fetch(f) => {
+                assert_eq!(f.temporal, Some(TemporalClause::ValidDuring("2024-01-01".into(), "2024-12-31".into())));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn fetch_plan_temporal_as_of_transaction_round_trip() {
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: Some(TemporalClause::AsOfTransaction(42891)),
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Fetch(f) => {
+                assert_eq!(f.temporal, Some(TemporalClause::AsOfTransaction(42891)));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn insert_plan_temporal_round_trip() {
+        let plan = Plan::Insert(InsertPlan {
+            collection: "events".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("e1".into()), Literal::String("Test".into())],
+            vectors: vec![],
+            collocate_with: None,
+            affinity_group: None,
+            valid_from: Some("2024-01-01T00:00:00Z".into()),
+            valid_to: Some("2025-01-01T00:00:00Z".into()),
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Insert(ip) => {
+                assert_eq!(ip.valid_from, Some("2024-01-01T00:00:00Z".into()));
+                assert_eq!(ip.valid_to, Some("2025-01-01T00:00:00Z".into()));
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn insert_edge_plan_temporal_round_trip() {
+        let plan = Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "p1".into(),
+            to_id: "p2".into(),
+            metadata: vec![],
+            valid_from: Some("2024-01-01T00:00:00Z".into()),
+            valid_to: None,
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::InsertEdge(ie) => {
+                assert_eq!(ie.valid_from, Some("2024-01-01T00:00:00Z".into()));
+                assert_eq!(ie.valid_to, None);
+            }
+            _ => panic!("expected InsertEdge"),
+        }
+    }
+
+    #[test]
+    fn traverse_match_temporal_round_trip() {
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+        let plan = Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "p1".into(),
+            pattern: MatchPattern {
+                source_var: "a".into(),
+                edge: EdgePattern {
+                    variable: Some("e".into()),
+                    edge_type: Some("knows".into()),
+                    direction: EdgeDirection::Forward,
+                },
+                target_var: "b".into(),
+            },
+            min_depth: 1,
+            max_depth: 3,
+            confidence_threshold: None,
+            temporal: Some(TemporalClause::AsOf("2024-08-01T00:00:00Z".into())),
+            limit: None,
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::TraverseMatch(tp) => {
+                assert_eq!(tp.temporal, Some(TemporalClause::AsOf("2024-08-01T00:00:00Z".into())));
+            }
+            _ => panic!("expected TraverseMatch"),
         }
     }
 }
