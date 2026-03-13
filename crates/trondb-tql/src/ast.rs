@@ -23,6 +23,12 @@ pub enum Statement {
     DropEdgeType(DropEdgeTypeStmt),
     FetchJoin(FetchJoinStmt),
     TraverseMatch(TraverseMatchStmt),
+    Upsert(UpsertStmt),
+    Checkpoint(CheckpointStmt),
+    Backup(BackupStmt),
+    Restore(RestoreStmt),
+    AlterCollection(AlterCollectionStmt),
+    Import(ImportStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -313,6 +319,21 @@ pub struct UpdateStmt {
     pub assignments: Vec<(String, Literal)>,
 }
 
+// --- CHECKPOINT ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointStmt;
+
+// --- UPSERT (INSERT OR UPDATE) ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertStmt {
+    pub collection: String,
+    pub fields: Vec<String>,
+    pub values: Vec<Literal>,
+    pub vectors: Vec<(String, VectorLiteral)>,
+}
+
 // --- Inference ---
 
 #[derive(Debug, Clone, PartialEq)]
@@ -446,4 +467,38 @@ pub struct TraverseMatchStmt {
     pub confidence_threshold: Option<f64>,
     pub temporal: Option<TemporalClause>,
     pub limit: Option<usize>,
+}
+
+// --- BACKUP / RESTORE ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackupStmt {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreStmt {
+    pub path: String,
+}
+
+// --- Schema Migration ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterCollectionOp {
+    RenameField { old_name: String, new_name: String },
+    DropField { field_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterCollectionStmt {
+    pub collection: String,
+    pub operation: AlterCollectionOp,
+}
+
+// --- BULK IMPORT ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportStmt {
+    pub collection: String,
+    pub path: String,
 }

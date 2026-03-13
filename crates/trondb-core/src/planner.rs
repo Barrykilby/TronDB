@@ -59,6 +59,12 @@ pub enum Plan {
     DropEdgeType(DropEdgeTypePlan),
     Join(JoinPlan),
     TraverseMatch(TraverseMatchPlan),
+    Upsert(UpsertPlan),
+    Checkpoint(CheckpointPlan),
+    Backup(BackupPlan),
+    Restore(RestorePlan),
+    AlterCollection(AlterCollectionPlan),
+    Import(ImportPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +203,39 @@ pub struct UpdateEntityPlan {
     pub entity_id: String,
     pub collection: String,
     pub assignments: Vec<(String, trondb_tql::Literal)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointPlan;
+
+#[derive(Debug, Clone)]
+pub struct BackupPlan {
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestorePlan {
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterCollectionPlan {
+    pub collection: String,
+    pub operation: trondb_tql::AlterCollectionOp,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportPlan {
+    pub collection: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertPlan {
+    pub collection: String,
+    pub fields: Vec<String>,
+    pub values: Vec<Literal>,
+    pub vectors: Vec<(String, VectorLiteral)>,
 }
 
 #[derive(Debug, Clone)]
@@ -570,6 +609,28 @@ pub fn plan(
             temporal: s.temporal.clone(),
             limit: s.limit,
         })),
+
+        Statement::Checkpoint(_) => Ok(Plan::Checkpoint(CheckpointPlan)),
+
+        Statement::Upsert(s) => Ok(Plan::Upsert(UpsertPlan {
+            collection: s.collection.clone(),
+            fields: s.fields.clone(),
+            values: s.values.clone(),
+            vectors: s.vectors.clone(),
+        })),
+
+        Statement::Backup(s) => Ok(Plan::Backup(BackupPlan { path: s.path.clone() })),
+        Statement::Restore(s) => Ok(Plan::Restore(RestorePlan { path: s.path.clone() })),
+
+        Statement::AlterCollection(s) => Ok(Plan::AlterCollection(AlterCollectionPlan {
+            collection: s.collection.clone(),
+            operation: s.operation.clone(),
+        })),
+
+        Statement::Import(s) => Ok(Plan::Import(ImportPlan {
+            collection: s.collection.clone(),
+            path: s.path.clone(),
+        })),
     }
 }
 
@@ -656,11 +717,14 @@ pub fn estimate_plan_cost(
         | Plan::InsertEdge(_) | Plan::DeleteEntity(_) | Plan::DeleteEdge(_)
         | Plan::CreateAffinityGroup(_) | Plan::AlterEntityDropAffinity(_)
         | Plan::Demote(_) | Plan::Promote(_) | Plan::UpdateEntity(_)
-        | Plan::ConfirmEdge(_) | Plan::DropCollection(_) | Plan::DropEdgeType(_) => {
+        | Plan::ConfirmEdge(_) | Plan::DropCollection(_) | Plan::DropEdgeType(_)
+        | Plan::Upsert(_) | Plan::Backup(_) | Plan::AlterCollection(_)
+        | Plan::Import(_) => {
             AcuEstimate::single("write", 1, cost.write_base_acu())
         }
         // Metadata / explain operations are free
-        Plan::Explain(_) | Plan::ExplainTiers(_) | Plan::ExplainHistory(_) => {
+        Plan::Explain(_) | Plan::ExplainTiers(_) | Plan::ExplainHistory(_)
+        | Plan::Checkpoint(_) | Plan::Restore(_) => {
             AcuEstimate::zero()
         }
     }
@@ -1601,6 +1665,24 @@ mod tests {
                 assert_eq!(f.temporal, Some(trondb_tql::TemporalClause::AsOfTransaction(42891)));
             }
             _ => panic!("expected Fetch plan"),
+        }
+    }
+
+    #[test]
+    fn plan_upsert() {
+        let stmt = Statement::Upsert(trondb_tql::UpsertStmt {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("X".into())],
+            vectors: vec![],
+        });
+        let p = plan(&stmt, &empty_schemas()).unwrap();
+        match p {
+            Plan::Upsert(up) => {
+                assert_eq!(up.collection, "venues");
+                assert_eq!(up.fields, vec!["id", "name"]);
+            }
+            _ => panic!("expected UpsertPlan"),
         }
     }
 }

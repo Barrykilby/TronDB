@@ -395,6 +395,58 @@ impl FjallStore {
             .map_err(|e| EngineError::Storage(e.to_string()))
     }
 
+    /// Export all collection schemas and entities to a directory as JSON-lines files.
+    pub fn snapshot_to(&self, backup_dir: &std::path::Path) -> Result<usize, EngineError> {
+        std::fs::create_dir_all(backup_dir)
+            .map_err(|e| EngineError::Storage(format!("backup mkdir: {e}")))?;
+
+        let mut total = 0usize;
+
+        // Export schemas
+        let schemas = self.list_collection_schemas();
+        let schema_path = backup_dir.join("schemas.jsonl");
+        let mut schema_file = std::fs::File::create(&schema_path)
+            .map_err(|e| EngineError::Storage(format!("backup schemas: {e}")))?;
+        for schema in &schemas {
+            let line = serde_json::to_string(schema)
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+            use std::io::Write;
+            writeln!(schema_file, "{}", line)
+                .map_err(|e| EngineError::Storage(e.to_string()))?;
+            total += 1;
+        }
+
+        // Export entities per collection
+        for schema in &schemas {
+            let entities = self.scan(&schema.name)?;
+            let entity_path = backup_dir.join(format!("{}.jsonl", schema.name));
+            let mut entity_file = std::fs::File::create(&entity_path)
+                .map_err(|e| EngineError::Storage(format!("backup entities: {e}")))?;
+            for entity in &entities {
+                let line = serde_json::to_string(entity)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                use std::io::Write;
+                writeln!(entity_file, "{}", line)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+            }
+            total += entities.len();
+        }
+
+        Ok(total)
+    }
+
+    /// Update an existing collection schema in the meta partition.
+    pub fn update_collection_schema(&self, schema: &CollectionSchema) -> Result<(), EngineError> {
+        let key = format!("{COLLECTION_PREFIX}{}", schema.name);
+        let bytes = rmp_serde::to_vec_named(schema)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+        self.meta.insert(&key, bytes)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?;
+        self.keyspace.persist(PersistMode::SyncAll)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     /// Returns the total number of entities across all collections.
     pub fn entity_count(&self) -> usize {
         let mut count = 0;

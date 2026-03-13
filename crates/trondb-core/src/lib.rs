@@ -17,6 +17,8 @@ pub mod vectoriser;
 pub mod cost;
 pub mod warning;
 pub mod optimise;
+pub mod metrics;
+pub mod slow_log;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -640,6 +642,11 @@ impl Engine {
     /// Returns a reference to the location table. Alias for `location()`.
     pub fn location_table(&self) -> &location::LocationTable {
         self.location()
+    }
+
+    /// Returns a reference to the engine metrics (Prometheus-compatible).
+    pub fn metrics(&self) -> &std::sync::Arc<metrics::EngineMetrics> {
+        self.executor.engine_metrics()
     }
 
     /// Trigger background recomputation of all dirty representations.
