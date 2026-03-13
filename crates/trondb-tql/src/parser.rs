@@ -907,8 +907,12 @@ impl Parser {
         self.expect(&Token::From)?;
         let collection = self.expect_ident()?;
 
-        // Even with *, check for AS (JOIN with SELECT *)
-        if self.peek() == Some(&Token::As) {
+        // Parse optional temporal clause (AS OF, VALID DURING, AS OF TRANSACTION)
+        // Note: must be before WHERE. AS OF is disambiguated from AS alias by peek for OF.
+        let temporal = self.parse_temporal_clause()?;
+
+        // Even with *, check for AS (JOIN with SELECT *) — only if no temporal clause consumed AS
+        if temporal.is_none() && self.peek() == Some(&Token::As) {
             let join_fields = match fields {
                 FieldList::All => JoinFieldList::All,
                 FieldList::Named(_names) => {
@@ -947,7 +951,7 @@ impl Parser {
             collection,
             fields,
             filter,
-            temporal: None,
+            temporal,
             order_by,
             limit,
             hints,
@@ -972,6 +976,44 @@ impl Parser {
             }
         }
         Ok(clauses)
+    }
+
+    /// Parse an optional temporal clause after the collection name.
+    /// Handles: AS OF 'timestamp', AS OF TRANSACTION lsn, VALID DURING 'start'..'end'
+    fn parse_temporal_clause(&mut self) -> Result<Option<TemporalClause>, ParseError> {
+        if self.peek() == Some(&Token::As) {
+            // Could be AS OF or AS alias -- peek ahead for OF
+            if self.pos + 1 < self.tokens.len() && self.tokens[self.pos + 1].0 == Token::Of {
+                self.advance(); // AS
+                self.advance(); // OF
+                // AS OF TRANSACTION lsn  or  AS OF 'timestamp'
+                if self.peek() == Some(&Token::Transaction) {
+                    self.advance(); // TRANSACTION
+                    let lsn = self.expect_int()? as u64;
+                    return Ok(Some(TemporalClause::AsOfTransaction(lsn)));
+                } else {
+                    let timestamp = self.expect_string_lit()?;
+                    return Ok(Some(TemporalClause::AsOf(timestamp)));
+                }
+            }
+        }
+
+        if self.peek() == Some(&Token::Valid) {
+            self.advance(); // VALID
+            if self.peek() == Some(&Token::During) {
+                self.advance(); // DURING
+                let start = self.expect_string_lit()?;
+                self.expect(&Token::DotDot)?;
+                let end = self.expect_string_lit()?;
+                return Ok(Some(TemporalClause::ValidDuring(start, end)));
+            } else {
+                return Err(ParseError::InvalidQuery(
+                    "expected DURING after VALID in temporal clause".into(),
+                ));
+            }
+        }
+
+        Ok(None)
     }
 
     fn parse_search(&mut self) -> Result<Statement, ParseError> {
@@ -2868,6 +2910,54 @@ mod tests {
                 assert_eq!(t.depth, 3);
             }
             _ => panic!("expected Traverse (legacy)"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_as_of() {
+        let stmt = parse("FETCH * FROM entities AS OF '2025-01-01T00:00:00Z' WHERE id = 'ent_abc123';").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.collection, "entities");
+                assert_eq!(f.temporal, Some(TemporalClause::AsOf("2025-01-01T00:00:00Z".into())));
+                assert!(f.filter.is_some());
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_valid_during() {
+        let stmt = parse("FETCH * FROM entities VALID DURING '2025-01-01'..'2025-06-30' WHERE category = 'event';").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.temporal, Some(TemporalClause::ValidDuring("2025-01-01".into(), "2025-06-30".into())));
+                assert!(f.filter.is_some());
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_as_of_transaction() {
+        let stmt = parse("FETCH * FROM entities AS OF TRANSACTION 42891 WHERE id = 'ent_abc123';").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.temporal, Some(TemporalClause::AsOfTransaction(42891)));
+                assert!(f.filter.is_some());
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_no_temporal() {
+        let stmt = parse("FETCH * FROM entities WHERE id = 'ent_abc123';").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.temporal, None);
+            }
+            _ => panic!("expected Fetch"),
         }
     }
 }
