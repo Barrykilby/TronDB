@@ -2249,9 +2249,175 @@ impl Executor {
                 })
             }
 
-            Plan::TraverseMatch(_p) => {
-                // Stub: Task 11 will implement the full BFS traversal
-                Err(EngineError::UnsupportedOperation("TRAVERSE MATCH executor not yet implemented".into()))
+            Plan::TraverseMatch(p) => {
+                let max_depth = p.max_depth.min(10); // cap at 10
+                let min_depth = p.min_depth;
+                let confidence_threshold = p.confidence_threshold.unwrap_or(0.0) as f32;
+
+                let from_id = LogicalId::from_string(&p.from_id);
+                let mut visited: HashSet<LogicalId> = HashSet::new();
+                visited.insert(from_id.clone());
+
+                let mut frontier = vec![from_id];
+                let mut rows = Vec::new();
+                let limit = p.limit.unwrap_or(usize::MAX);
+
+                // Optional edge type filter from pattern
+                let edge_type_filter: Option<String> = p.pattern.edge.edge_type.clone();
+
+                for hop in 0..max_depth {
+                    if frontier.is_empty() || rows.len() >= limit {
+                        break;
+                    }
+
+                    let mut next_frontier = Vec::new();
+                    let include_at_depth = hop + 1 >= min_depth;
+
+                    for node_id in &frontier {
+                        // Collect neighbor entries based on direction
+                        // (to_id, confidence, collection)
+                        let mut neighbors: Vec<(LogicalId, f32, String)> = Vec::new();
+
+                        // Get edge types to check: filtered or all
+                        let edge_types_to_check: Vec<EdgeType> = if let Some(ref et_name) = edge_type_filter {
+                            match self.store.get_edge_type(et_name) {
+                                Ok(et) => vec![et],
+                                Err(_) => vec![],
+                            }
+                        } else {
+                            self.edge_types.iter().map(|e| e.value().clone()).collect()
+                        };
+
+                        for et in &edge_types_to_check {
+                            match p.pattern.edge.direction {
+                                trondb_tql::EdgeDirection::Forward => {
+                                    let entries = self.adjacency.get(node_id, &et.name);
+                                    for entry in &entries {
+                                        let effective_conf = if entry.created_at > 0 {
+                                            let now_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_millis() as u64;
+                                            let elapsed = now_ms.saturating_sub(entry.created_at);
+                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                        } else {
+                                            entry.confidence
+                                        };
+                                        if effective_conf >= confidence_threshold {
+                                            neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
+                                        }
+                                    }
+                                }
+                                trondb_tql::EdgeDirection::Backward => {
+                                    let source_ids = self.adjacency.get_backward(node_id, &et.name);
+                                    for source_id in &source_ids {
+                                        let entries = self.adjacency.get(source_id, &et.name);
+                                        for entry in &entries {
+                                            if entry.to_id == *node_id {
+                                                let effective_conf = if entry.created_at > 0 {
+                                                    let now_ms = SystemTime::now()
+                                                        .duration_since(UNIX_EPOCH)
+                                                        .unwrap()
+                                                        .as_millis() as u64;
+                                                    let elapsed = now_ms.saturating_sub(entry.created_at);
+                                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                                } else {
+                                                    entry.confidence
+                                                };
+                                                if effective_conf >= confidence_threshold {
+                                                    neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                trondb_tql::EdgeDirection::Undirected => {
+                                    // Forward direction
+                                    let entries = self.adjacency.get(node_id, &et.name);
+                                    for entry in &entries {
+                                        let effective_conf = if entry.created_at > 0 {
+                                            let now_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_millis() as u64;
+                                            let elapsed = now_ms.saturating_sub(entry.created_at);
+                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                        } else {
+                                            entry.confidence
+                                        };
+                                        if effective_conf >= confidence_threshold {
+                                            neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
+                                        }
+                                    }
+                                    // Backward direction
+                                    let source_ids = self.adjacency.get_backward(node_id, &et.name);
+                                    for source_id in &source_ids {
+                                        let entries = self.adjacency.get(source_id, &et.name);
+                                        for entry in &entries {
+                                            if entry.to_id == *node_id {
+                                                let effective_conf = if entry.created_at > 0 {
+                                                    let now_ms = SystemTime::now()
+                                                        .duration_since(UNIX_EPOCH)
+                                                        .unwrap()
+                                                        .as_millis() as u64;
+                                                    let elapsed = now_ms.saturating_sub(entry.created_at);
+                                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                                } else {
+                                                    entry.confidence
+                                                };
+                                                if effective_conf >= confidence_threshold {
+                                                    neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        for (neighbor_id, confidence, collection) in &neighbors {
+                            if visited.contains(neighbor_id) {
+                                continue;
+                            }
+                            visited.insert(neighbor_id.clone());
+
+                            if include_at_depth {
+                                if let Ok(entity) = self.store.get(collection, neighbor_id) {
+                                    let mut row = entity_to_row(&entity, &FieldList::All);
+                                    // Add _edge.confidence and _depth metadata
+                                    row.values.insert("_edge.confidence".into(), Value::Float(*confidence as f64));
+                                    if let Some(ref et_name) = edge_type_filter {
+                                        row.values.insert("_edge.type".into(), Value::String(et_name.clone()));
+                                    }
+                                    row.values.insert("_depth".into(), Value::Int((hop + 1) as i64));
+                                    rows.push(row);
+                                    if rows.len() >= limit {
+                                        break;
+                                    }
+                                }
+                            }
+                            next_frontier.push(neighbor_id.clone());
+                        }
+                        if rows.len() >= limit {
+                            break;
+                        }
+                    }
+
+                    frontier = next_frontier;
+                }
+
+                let scanned = rows.len();
+
+                Ok(QueryResult {
+                    columns: build_columns(&rows, &FieldList::All),
+                    rows,
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: scanned,
+                        mode: QueryMode::Deterministic,
+                        tier: "Ram".into(),
+                    },
+                })
             }
         }
     }
@@ -3356,7 +3522,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraversePlan};
+    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraverseMatchPlan, TraversePlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -7705,5 +7871,683 @@ mod tests {
 
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values.get("v.id"), Some(&Value::Null));
+    }
+
+    // -----------------------------------------------------------------------
+    // TRAVERSE MATCH tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn traverse_match_forward() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create people collection
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Insert people a -> b -> c
+        for (id, name) in &[("a", "Alice"), ("b", "Bob"), ("c", "Charlie")] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "people".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(name.to_string())],
+                vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        // Create edge type
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Insert edges: a->b, b->c
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "a".into(),
+            to_id: "b".into(),
+            metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "b".into(),
+            to_id: "c".into(),
+            metadata: vec![],
+        })).await.unwrap();
+
+        // TRAVERSE MATCH from a, depth 1..2 — should get b (depth 1) and c (depth 2)
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+        let result = exec.execute(&Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "a".into(),
+            pattern: MatchPattern {
+                source_var: "a".into(),
+                edge: EdgePattern {
+                    variable: Some("e".into()),
+                    edge_type: Some("knows".into()),
+                    direction: EdgeDirection::Forward,
+                },
+                target_var: "b".into(),
+            },
+            min_depth: 1,
+            max_depth: 2,
+            confidence_threshold: None,
+            limit: None,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        // Both should have _edge.confidence and _depth
+        for row in &result.rows {
+            assert!(row.values.contains_key("_edge.confidence"));
+            assert!(row.values.contains_key("_depth"));
+        }
+    }
+
+    #[tokio::test]
+    async fn traverse_match_min_depth_filter() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Same setup: a -> b -> c
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        for (id, name) in &[("a", "Alice"), ("b", "Bob"), ("c", "Charlie")] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "people".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(name.to_string())],
+                vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+        })).await.unwrap();
+
+        // TRAVERSE MATCH from a, depth 2..3 — should only get c (depth 2), not b (depth 1)
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+        let result = exec.execute(&Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "a".into(),
+            pattern: MatchPattern {
+                source_var: "a".into(),
+                edge: EdgePattern {
+                    variable: Some("e".into()),
+                    edge_type: Some("knows".into()),
+                    direction: EdgeDirection::Forward,
+                },
+                target_var: "b".into(),
+            },
+            min_depth: 2,
+            max_depth: 3,
+            confidence_threshold: None,
+            limit: None,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Charlie".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn traverse_match_backward() {
+        let (exec, _dir) = setup_executor().await;
+
+        // a -> b -> c, traverse backward from c
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        for (id, name) in &[("a", "Alice"), ("b", "Bob"), ("c", "Charlie")] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "people".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(name.to_string())],
+                vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+        })).await.unwrap();
+
+        // Backward traversal from c — should find b (depth 1) and a (depth 2)
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+        let result = exec.execute(&Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "c".into(),
+            pattern: MatchPattern {
+                source_var: "a".into(),
+                edge: EdgePattern {
+                    variable: None,
+                    edge_type: Some("knows".into()),
+                    direction: EdgeDirection::Backward,
+                },
+                target_var: "b".into(),
+            },
+            min_depth: 1,
+            max_depth: 2,
+            confidence_threshold: None,
+            limit: None,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        // Verify we got Bob and Alice
+        let names: Vec<&Value> = result.rows.iter()
+            .filter_map(|r| r.values.get("name"))
+            .collect();
+        assert!(names.contains(&&Value::String("Bob".into())));
+        assert!(names.contains(&&Value::String("Alice".into())));
+    }
+
+    #[tokio::test]
+    async fn traverse_match_undirected() {
+        let (exec, _dir) = setup_executor().await;
+
+        // a -> b -> c, undirected from b — should find both a and c
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        for (id, name) in &[("a", "Alice"), ("b", "Bob"), ("c", "Charlie")] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "people".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(name.to_string())],
+                vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+        })).await.unwrap();
+
+        // Undirected traversal from b, depth 1 — should find a and c
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+        let result = exec.execute(&Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "b".into(),
+            pattern: MatchPattern {
+                source_var: "x".into(),
+                edge: EdgePattern {
+                    variable: None,
+                    edge_type: Some("knows".into()),
+                    direction: EdgeDirection::Undirected,
+                },
+                target_var: "y".into(),
+            },
+            min_depth: 1,
+            max_depth: 1,
+            confidence_threshold: None,
+            limit: None,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        let names: Vec<&Value> = result.rows.iter()
+            .filter_map(|r| r.values.get("name"))
+            .collect();
+        assert!(names.contains(&&Value::String("Alice".into())));
+        assert!(names.contains(&&Value::String("Charlie".into())));
+    }
+
+    #[tokio::test]
+    async fn traverse_match_cycle_detection() {
+        let (exec, _dir) = setup_executor().await;
+
+        // a -> b -> c -> a (cycle)
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        for (id, name) in &[("a", "Alice"), ("b", "Bob"), ("c", "Charlie")] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "people".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(name.to_string())],
+                vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "c".into(), to_id: "a".into(), metadata: vec![],
+        })).await.unwrap();
+
+        // Traverse with large depth — cycle detection should prevent infinite loop
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+        let result = exec.execute(&Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "a".into(),
+            pattern: MatchPattern {
+                source_var: "x".into(),
+                edge: EdgePattern {
+                    variable: None,
+                    edge_type: Some("knows".into()),
+                    direction: EdgeDirection::Forward,
+                },
+                target_var: "y".into(),
+            },
+            min_depth: 1,
+            max_depth: 10,
+            confidence_threshold: None,
+            limit: None,
+        })).await.unwrap();
+
+        // Should find exactly b and c (not revisit a or infinite loop)
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn traverse_match_limit() {
+        let (exec, _dir) = setup_executor().await;
+
+        // a -> b -> c
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        for (id, name) in &[("a", "Alice"), ("b", "Bob"), ("c", "Charlie")] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "people".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(name.to_string())],
+                vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+        })).await.unwrap();
+
+        // Limit to 1 result
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+        let result = exec.execute(&Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "a".into(),
+            pattern: MatchPattern {
+                source_var: "x".into(),
+                edge: EdgePattern {
+                    variable: None,
+                    edge_type: Some("knows".into()),
+                    direction: EdgeDirection::Forward,
+                },
+                target_var: "y".into(),
+            },
+            min_depth: 1,
+            max_depth: 5,
+            confidence_threshold: None,
+            limit: Some(1),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn traverse_match_no_edge_type_filter() {
+        let (exec, _dir) = setup_executor().await;
+
+        // a -> b via "knows", a -> c via "likes"
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        for (id, name) in &[("a", "Alice"), ("b", "Bob"), ("c", "Charlie")] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "people".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(name.to_string())],
+                vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "likes".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "likes".into(), from_id: "a".into(), to_id: "c".into(), metadata: vec![],
+        })).await.unwrap();
+
+        // No edge type filter — should traverse both types and find b + c
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+        let result = exec.execute(&Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "a".into(),
+            pattern: MatchPattern {
+                source_var: "x".into(),
+                edge: EdgePattern {
+                    variable: None,
+                    edge_type: None, // no filter
+                    direction: EdgeDirection::Forward,
+                },
+                target_var: "y".into(),
+            },
+            min_depth: 1,
+            max_depth: 1,
+            confidence_threshold: None,
+            limit: None,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        let names: Vec<&Value> = result.rows.iter()
+            .filter_map(|r| r.values.get("name"))
+            .collect();
+        assert!(names.contains(&&Value::String("Bob".into())));
+        assert!(names.contains(&&Value::String("Charlie".into())));
+    }
+
+    #[tokio::test]
+    async fn traverse_match_edge_type_metadata() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Verify _edge.confidence and _depth are correctly reported
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        for (id, name) in &[("a", "Alice"), ("b", "Bob")] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "people".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(name.to_string())],
+                vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+        })).await.unwrap();
+
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+        let result = exec.execute(&Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "a".into(),
+            pattern: MatchPattern {
+                source_var: "x".into(),
+                edge: EdgePattern {
+                    variable: Some("e".into()),
+                    edge_type: Some("knows".into()),
+                    direction: EdgeDirection::Forward,
+                },
+                target_var: "y".into(),
+            },
+            min_depth: 1,
+            max_depth: 1,
+            confidence_threshold: None,
+            limit: None,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        // Structural edges have confidence 1.0
+        assert_eq!(
+            result.rows[0].values.get("_edge.confidence"),
+            Some(&Value::Float(1.0))
+        );
+        assert_eq!(
+            result.rows[0].values.get("_depth"),
+            Some(&Value::Int(1))
+        );
+        assert_eq!(
+            result.rows[0].values.get("_edge.type"),
+            Some(&Value::String("knows".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn traverse_match_existing_traverse_unchanged() {
+        // Verify backward compat: the existing Plan::Traverse still works exactly as before
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "people".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        for (id, name) in &[("a", "Alice"), ("b", "Bob")] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "people".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(name.to_string())],
+                vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+                collocate_with: None,
+                affinity_group: None,
+            })).await.unwrap();
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+        })).await.unwrap();
+
+        // Use the old Plan::Traverse — should still work
+        let result = exec.execute(&Plan::Traverse(TraversePlan {
+            edge_type: "knows".into(),
+            from_id: "a".into(),
+            depth: 1,
+            limit: None,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Bob".into()))
+        );
     }
 }
