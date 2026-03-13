@@ -489,6 +489,11 @@ pub fn plan(
         Statement::DropEdgeType(s) => Ok(Plan::DropEdgeType(DropEdgeTypePlan {
             name: s.name.clone(),
         })),
+
+        // Phase 12b: JOIN execution — planner/executor implementation deferred to Chunk 3
+        Statement::FetchJoin(_) => Err(EngineError::InvalidQuery(
+            "JOIN queries are not yet supported by the executor".into(),
+        )),
     }
 }
 

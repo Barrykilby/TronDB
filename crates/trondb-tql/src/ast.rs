@@ -21,6 +21,7 @@ pub enum Statement {
     ExplainHistory(ExplainHistoryStmt),
     DropCollection(DropCollectionStmt),
     DropEdgeType(DropEdgeTypeStmt),
+    FetchJoin(FetchJoinStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -325,6 +326,56 @@ pub struct DropCollectionStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropEdgeTypeStmt {
     pub name: String,
+}
+
+// --- JOINs ---
+
+/// A qualified field reference: alias.field (e.g., `e.name`)
+#[derive(Debug, Clone, PartialEq)]
+pub struct QualifiedField {
+    pub alias: String,
+    pub field: String,
+}
+
+/// Join type
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// A single JOIN clause
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub collection: String,
+    pub alias: String,
+    pub on_left: QualifiedField,
+    pub on_right: QualifiedField,
+    /// If Some, this is a probabilistic join with a confidence threshold
+    pub confidence_threshold: Option<f64>,
+}
+
+/// FETCH ... FROM ... AS ... JOIN ... statement
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchJoinStmt {
+    pub fields: JoinFieldList,
+    pub from_collection: String,
+    pub from_alias: String,
+    pub joins: Vec<JoinClause>,
+    pub filter: Option<WhereClause>,
+    pub order_by: Vec<OrderByClause>,
+    pub limit: Option<usize>,
+    pub hints: Vec<QueryHint>,
+}
+
+/// Field list for JOINs — supports qualified (alias.field) and star
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinFieldList {
+    All,
+    Named(Vec<QualifiedField>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
