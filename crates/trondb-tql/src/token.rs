@@ -276,6 +276,24 @@ pub enum Token {
     #[token("DESC", priority = 10, ignore(ascii_case))]
     Desc,
 
+    #[token("JOIN", priority = 10, ignore(ascii_case))]
+    Join,
+
+    #[token("INNER", priority = 10, ignore(ascii_case))]
+    Inner,
+
+    #[token("LEFT", priority = 10, ignore(ascii_case))]
+    Left,
+
+    #[token("RIGHT", priority = 10, ignore(ascii_case))]
+    Right,
+
+    #[token("FULL", priority = 10, ignore(ascii_case))]
+    Full,
+
+    #[token("AS", priority = 10, ignore(ascii_case))]
+    As,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
@@ -334,6 +352,9 @@ pub enum Token {
 
     #[token(":")]
     Colon,
+
+    #[token(".")]
+    Dot,
 }
 
 #[cfg(test)]
@@ -667,5 +688,53 @@ mod tests {
         assert_eq!(tokens[0], Token::Fetch);
         assert_eq!(tokens[1], Token::Star);
         assert_eq!(tokens[2], Token::From);
+    }
+
+    #[test]
+    fn lex_join_keywords() {
+        assert_eq!(lex("JOIN"), vec![Token::Join]);
+        assert_eq!(lex("join"), vec![Token::Join]);
+        assert_eq!(lex("INNER"), vec![Token::Inner]);
+        assert_eq!(lex("LEFT"), vec![Token::Left]);
+        assert_eq!(lex("RIGHT"), vec![Token::Right]);
+        assert_eq!(lex("FULL"), vec![Token::Full]);
+        assert_eq!(lex("AS"), vec![Token::As]);
+    }
+
+    #[test]
+    fn lex_dot_token() {
+        let tokens = lex("e.name");
+        assert_eq!(tokens, vec![
+            Token::Ident("e".into()),
+            Token::Dot,
+            Token::Ident("name".into()),
+        ]);
+    }
+
+    #[test]
+    fn lex_structural_join() {
+        let tokens = lex("FETCH e.name, v.address FROM entities AS e INNER JOIN venues AS v ON e.venue_id = v.id WHERE e.type = 'event';");
+        assert_eq!(tokens[0], Token::Fetch);
+        assert_eq!(tokens[1], Token::Ident("e".into()));
+        assert_eq!(tokens[2], Token::Dot);
+        assert_eq!(tokens[3], Token::Ident("name".into()));
+        assert_eq!(tokens[4], Token::Comma);
+        assert_eq!(tokens[5], Token::Ident("v".into()));
+        assert_eq!(tokens[6], Token::Dot);
+        assert_eq!(tokens[7], Token::Ident("address".into()));
+        assert_eq!(tokens[8], Token::From);
+        assert_eq!(tokens[9], Token::Ident("entities".into()));
+        assert_eq!(tokens[10], Token::As);
+        assert_eq!(tokens[11], Token::Ident("e".into()));
+        assert_eq!(tokens[12], Token::Inner);
+        assert_eq!(tokens[13], Token::Join);
+    }
+
+    #[test]
+    fn lex_probabilistic_join() {
+        let tokens = lex("CONFIDENCE > 0.75");
+        assert_eq!(tokens[0], Token::Confidence);
+        assert_eq!(tokens[1], Token::Gt);
+        assert_eq!(tokens[2], Token::FloatLit(0.75));
     }
 }
