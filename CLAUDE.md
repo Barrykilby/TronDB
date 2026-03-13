@@ -167,3 +167,25 @@ Inference-first storage engine. Phase 12: Query Language Completions.
     - MAX_ACU(n): ACU budget (future use, Phase 13)
     - TIMEOUT(ms): query timeout (future use)
     - Hints shown in EXPLAIN output
+  - JOINs: structural and probabilistic joins across edge-linked collections
+    - Syntax: FETCH alias.field, ... FROM collection AS alias [INNER|LEFT|RIGHT|FULL] JOIN collection AS alias ON alias.field = alias.field [CONFIDENCE > threshold]
+    - Join types: INNER (default), LEFT, RIGHT, FULL
+    - Structural joins: field-value matching (e.g., venue_id = id)
+    - Probabilistic joins: edge-based with CONFIDENCE threshold, adds _edge.confidence to results
+    - Qualified field references: alias.field in SELECT, ON, WHERE clauses
+    - Row keys are alias-qualified: "e.name", "v.address", "_edge.confidence"
+    - WHERE filter applied to alias-qualified combined row
+    - New AST types: FetchJoinStmt, JoinClause, JoinFieldList, QualifiedField, JoinType
+    - New Plan type: Plan::Join(JoinPlan)
+    - New tokens: Join, Inner, Left, Right, Full, As, Dot
+  - TRAVERSE MATCH: Cypher-inspired pattern matching for graph traversal
+    - Syntax: TRAVERSE FROM 'id' MATCH (a)-[e:TYPE]->(b) DEPTH min..max [CONFIDENCE > threshold] [LIMIT n]
+    - Edge patterns: (a)-[e:TYPE]->(b) forward, (a)-[e:TYPE]-(b) undirected
+    - Optional edge variable binding and edge type filter
+    - Variable depth range: min..max (capped at 10)
+    - Confidence threshold filters low-confidence edges
+    - Results include _edge.confidence, _edge.type, _depth metadata
+    - Legacy TRAVERSE syntax still supported (no MATCH keyword)
+    - New AST types: TraverseMatchStmt, MatchPattern, EdgePattern, EdgeDirection
+    - New Plan type: Plan::TraverseMatch(TraverseMatchPlan)
+    - New tokens: Match, Arrow (->), DotDot (..), Dash (-)
