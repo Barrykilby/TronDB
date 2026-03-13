@@ -577,6 +577,7 @@ enum RecordTypeProto {
     RECORD_TYPE_CHECKPOINT = 19;
     RECORD_TYPE_SCHEMA_DROP_COLL = 20;
     RECORD_TYPE_SCHEMA_DROP_EDGE_TYPE = 21;
+    RECORD_TYPE_SCHEMA_ALTER = 22;
 }
 
 // ---------------------------------------------------------------------------
