@@ -8550,4 +8550,385 @@ mod tests {
             Some(&Value::String("Bob".into()))
         );
     }
+
+    // -----------------------------------------------------------------------
+    // End-to-End Integration Tests (TQL parse → plan → execute)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a collection with fields (using direct Plan execution).
+    async fn create_collection_with_fields(
+        exec: &Executor,
+        name: &str,
+        dims: usize,
+        fields: Vec<trondb_tql::FieldDecl>,
+    ) {
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: name.into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(dims),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields,
+            indexes: vec![],
+            vectoriser_config: None,
+        }))
+        .await
+        .unwrap();
+    }
+
+    /// Helper: insert an entity with metadata and optional vector.
+    async fn insert_entity_full(
+        exec: &Executor,
+        collection: &str,
+        id: &str,
+        metadata: Vec<(&str, Literal)>,
+    ) {
+        let mut fields = vec!["id".to_string()];
+        let mut values = vec![Literal::String(id.into())];
+        for (k, v) in metadata {
+            fields.push(k.into());
+            values.push(v);
+        }
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: collection.into(),
+            fields,
+            values,
+            vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
+        }))
+        .await
+        .unwrap();
+    }
+
+    /// Comprehensive end-to-end test: sets up two collections with edges,
+    /// then runs TQL strings through parse → plan → execute for JOIN and
+    /// TRAVERSE MATCH operations.
+    #[tokio::test]
+    async fn e2e_join_and_traverse_match() {
+        let (exec, _dir) = setup_executor().await;
+
+        // ---------------------------------------------------------------
+        // 1. Create two collections: "artists" and "venues"
+        // ---------------------------------------------------------------
+        create_collection_with_fields(
+            &exec,
+            "artists",
+            3,
+            vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+                trondb_tql::FieldDecl { name: "genre".into(), field_type: trondb_tql::FieldType::Text },
+                trondb_tql::FieldDecl { name: "venue_id".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+        ).await;
+
+        create_collection_with_fields(
+            &exec,
+            "venues",
+            3,
+            vec![
+                trondb_tql::FieldDecl { name: "address".into(), field_type: trondb_tql::FieldType::Text },
+                trondb_tql::FieldDecl { name: "capacity".into(), field_type: trondb_tql::FieldType::Int },
+            ],
+        ).await;
+
+        // ---------------------------------------------------------------
+        // 2. Insert entities in both collections
+        // ---------------------------------------------------------------
+        // Venues
+        insert_entity_full(&exec, "venues", "v1",
+            vec![("address", Literal::String("100 Main St".into())), ("capacity", Literal::Int(500))]).await;
+        insert_entity_full(&exec, "venues", "v2",
+            vec![("address", Literal::String("200 Oak Ave".into())), ("capacity", Literal::Int(1000))]).await;
+
+        // Artists: a1 and a2 have venue_ids, a3 has no venue
+        insert_entity_full(&exec, "artists", "a1",
+            vec![("name", Literal::String("Alice".into())), ("genre", Literal::String("jazz".into())), ("venue_id", Literal::String("v1".into()))]).await;
+        insert_entity_full(&exec, "artists", "a2",
+            vec![("name", Literal::String("Bob".into())), ("genre", Literal::String("rock".into())), ("venue_id", Literal::String("v2".into()))]).await;
+        insert_entity_full(&exec, "artists", "a3",
+            vec![("name", Literal::String("Charlie".into())), ("genre", Literal::String("blues".into())), ("venue_id", Literal::String("nonexistent".into()))]).await;
+
+        // ---------------------------------------------------------------
+        // 3. Create an edge type linking artists to venues
+        // ---------------------------------------------------------------
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "performs_at".into(),
+            from_collection: "artists".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // ---------------------------------------------------------------
+        // 4. Insert structural edges (a1 -> v1, a2 -> v2)
+        // ---------------------------------------------------------------
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "performs_at".into(), from_id: "a1".into(), to_id: "v1".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "performs_at".into(), from_id: "a2".into(), to_id: "v2".into(), metadata: vec![],
+        })).await.unwrap();
+
+        // ---------------------------------------------------------------
+        // 5. Test INNER JOIN across the edge (structural, field-based)
+        // ---------------------------------------------------------------
+        {
+            let stmt = trondb_tql::parse(
+                "FETCH a.name, v.address FROM artists AS a INNER JOIN venues AS v ON a.venue_id = v.id;"
+            ).unwrap();
+            let p = crate::planner::plan(&stmt, &exec.schemas).unwrap();
+            assert!(matches!(p, Plan::Join(_)));
+
+            let result = exec.execute(&p).await.unwrap();
+            // a1 matches v1, a2 matches v2; a3 has no match so excluded by INNER
+            assert_eq!(result.rows.len(), 2);
+
+            let names: Vec<&Value> = result.rows.iter()
+                .filter_map(|r| r.values.get("a.name"))
+                .collect();
+            assert!(names.contains(&&Value::String("Alice".into())));
+            assert!(names.contains(&&Value::String("Bob".into())));
+
+            // Verify venue addresses are present
+            let addresses: Vec<&Value> = result.rows.iter()
+                .filter_map(|r| r.values.get("v.address"))
+                .collect();
+            assert!(addresses.contains(&&Value::String("100 Main St".into())));
+            assert!(addresses.contains(&&Value::String("200 Oak Ave".into())));
+        }
+
+        // ---------------------------------------------------------------
+        // 6. Test LEFT JOIN (Charlie has no matching venue)
+        // ---------------------------------------------------------------
+        {
+            let stmt = trondb_tql::parse(
+                "FETCH a.name, v.address FROM artists AS a LEFT JOIN venues AS v ON a.venue_id = v.id;"
+            ).unwrap();
+            let p = crate::planner::plan(&stmt, &exec.schemas).unwrap();
+            assert!(matches!(p, Plan::Join(_)));
+
+            let result = exec.execute(&p).await.unwrap();
+            // All 3 artists should appear; a3 has NULL venue fields
+            assert_eq!(result.rows.len(), 3);
+
+            // Find Charlie's row
+            let charlie_row = result.rows.iter()
+                .find(|r| r.values.get("a.name") == Some(&Value::String("Charlie".into())))
+                .expect("Charlie should be in LEFT JOIN results");
+            // Venue address should be Null for unmatched
+            assert_eq!(charlie_row.values.get("v.address"), Some(&Value::Null));
+        }
+
+        // ---------------------------------------------------------------
+        // 7. Test TRAVERSE MATCH forward with depth range
+        // ---------------------------------------------------------------
+        // Create a self-referencing edge type for artist chain: a1 -> a2 -> a3
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "collaborates".into(),
+            from_collection: "artists".into(),
+            to_collection: "artists".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "collaborates".into(), from_id: "a1".into(), to_id: "a2".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "collaborates".into(), from_id: "a2".into(), to_id: "a3".into(), metadata: vec![],
+        })).await.unwrap();
+
+        {
+            let stmt = trondb_tql::parse(
+                "TRAVERSE FROM 'a1' MATCH (x)-[e:collaborates]->(y) DEPTH 1..2;"
+            ).unwrap();
+            let p = crate::planner::plan(&stmt, &exec.schemas).unwrap();
+            assert!(matches!(p, Plan::TraverseMatch(_)));
+
+            let result = exec.execute(&p).await.unwrap();
+            // Depth 1: a2, Depth 2: a3
+            assert_eq!(result.rows.len(), 2);
+
+            // Verify depth metadata is present
+            for row in &result.rows {
+                assert!(row.values.contains_key("_depth"));
+                assert!(row.values.contains_key("_edge.confidence"));
+                assert!(row.values.contains_key("_edge.type"));
+            }
+
+            // Verify names found
+            let names: Vec<&Value> = result.rows.iter()
+                .filter_map(|r| r.values.get("name"))
+                .collect();
+            assert!(names.contains(&&Value::String("Bob".into())));
+            assert!(names.contains(&&Value::String("Charlie".into())));
+        }
+
+        // ---------------------------------------------------------------
+        // 8. Test TRAVERSE MATCH with confidence threshold
+        //    Structural edges have confidence=1.0, so threshold of 0.5
+        //    should still return results, but threshold of 1.5 should not.
+        // ---------------------------------------------------------------
+        {
+            let stmt = trondb_tql::parse(
+                "TRAVERSE FROM 'a1' MATCH (x)-[e:collaborates]->(y) DEPTH 1..2 CONFIDENCE > 0.5;"
+            ).unwrap();
+            let p = crate::planner::plan(&stmt, &exec.schemas).unwrap();
+            let result = exec.execute(&p).await.unwrap();
+            // Structural edges have confidence 1.0 > 0.5, so should return both
+            assert_eq!(result.rows.len(), 2);
+        }
+        {
+            // High threshold: no edges pass
+            let stmt = trondb_tql::parse(
+                "TRAVERSE FROM 'a1' MATCH (x)-[e:collaborates]->(y) DEPTH 1..1 CONFIDENCE > 1.5;"
+            ).unwrap();
+            let p = crate::planner::plan(&stmt, &exec.schemas).unwrap();
+            let result = exec.execute(&p).await.unwrap();
+            assert_eq!(result.rows.len(), 0);
+        }
+
+        // ---------------------------------------------------------------
+        // 9. Verify backward compatibility of legacy TRAVERSE
+        // ---------------------------------------------------------------
+        {
+            let stmt = trondb_tql::parse(
+                "TRAVERSE collaborates FROM 'a1' DEPTH 2;"
+            ).unwrap();
+            let p = crate::planner::plan(&stmt, &exec.schemas).unwrap();
+            // Legacy TRAVERSE should produce Plan::Traverse (not TraverseMatch)
+            assert!(matches!(p, Plan::Traverse(_)));
+
+            let result = exec.execute(&p).await.unwrap();
+            // Legacy traverse from a1 depth 2: a2 (hop 1), a3 (hop 2)
+            assert_eq!(result.rows.len(), 2);
+            let names: Vec<&Value> = result.rows.iter()
+                .filter_map(|r| r.values.get("name"))
+                .collect();
+            assert!(names.contains(&&Value::String("Bob".into())));
+            assert!(names.contains(&&Value::String("Charlie".into())));
+        }
+    }
+
+    /// E2E test: INNER JOIN with WHERE filter on alias-qualified fields.
+    #[tokio::test]
+    async fn e2e_inner_join_with_where() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection_with_fields(&exec, "people", 3, vec![
+            trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            trondb_tql::FieldDecl { name: "venue_id".into(), field_type: trondb_tql::FieldType::Text },
+        ]).await;
+
+        create_collection_with_fields(&exec, "venues", 3, vec![
+            trondb_tql::FieldDecl { name: "address".into(), field_type: trondb_tql::FieldType::Text },
+        ]).await;
+
+        insert_entity_full(&exec, "venues", "v1",
+            vec![("address", Literal::String("123 Main St".into()))]).await;
+        insert_entity_full(&exec, "venues", "v2",
+            vec![("address", Literal::String("456 Oak Ave".into()))]).await;
+
+        insert_entity_full(&exec, "people", "p1",
+            vec![("name", Literal::String("Alice".into())), ("venue_id", Literal::String("v1".into()))]).await;
+        insert_entity_full(&exec, "people", "p2",
+            vec![("name", Literal::String("Bob".into())), ("venue_id", Literal::String("v2".into()))]).await;
+
+        // INNER JOIN with WHERE filtering to only Alice's row
+        let stmt = trondb_tql::parse(
+            "FETCH p.name, v.address FROM people AS p INNER JOIN venues AS v ON p.venue_id = v.id WHERE p.name = 'Alice';"
+        ).unwrap();
+        let p = crate::planner::plan(&stmt, &exec.schemas).unwrap();
+        let result = exec.execute(&p).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("p.name"),
+            Some(&Value::String("Alice".into()))
+        );
+        assert_eq!(
+            result.rows[0].values.get("v.address"),
+            Some(&Value::String("123 Main St".into()))
+        );
+    }
+
+    /// E2E test: TRAVERSE MATCH with LIMIT.
+    #[tokio::test]
+    async fn e2e_traverse_match_with_limit() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection_with_fields(&exec, "nodes", 3, vec![
+            trondb_tql::FieldDecl { name: "label".into(), field_type: trondb_tql::FieldType::Text },
+        ]).await;
+
+        for (id, label) in &[("n1", "Start"), ("n2", "Mid"), ("n3", "End")] {
+            insert_entity_full(&exec, "nodes", id,
+                vec![("label", Literal::String(label.to_string()))]).await;
+        }
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "links".into(),
+            from_collection: "nodes".into(),
+            to_collection: "nodes".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "links".into(), from_id: "n1".into(), to_id: "n2".into(), metadata: vec![],
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "links".into(), from_id: "n2".into(), to_id: "n3".into(), metadata: vec![],
+        })).await.unwrap();
+
+        // TRAVERSE MATCH with LIMIT 1
+        let stmt = trondb_tql::parse(
+            "TRAVERSE FROM 'n1' MATCH (x)-[e:links]->(y) DEPTH 1..2 LIMIT 1;"
+        ).unwrap();
+        let p = crate::planner::plan(&stmt, &exec.schemas).unwrap();
+        let result = exec.execute(&p).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    /// E2E test: wildcard SELECT in JOIN returns all fields from both sides.
+    #[tokio::test]
+    async fn e2e_join_wildcard_select() {
+        let (exec, _dir) = setup_executor().await;
+
+        create_collection_with_fields(&exec, "items", 3, vec![
+            trondb_tql::FieldDecl { name: "title".into(), field_type: trondb_tql::FieldType::Text },
+            trondb_tql::FieldDecl { name: "cat_id".into(), field_type: trondb_tql::FieldType::Text },
+        ]).await;
+
+        create_collection_with_fields(&exec, "categories", 3, vec![
+            trondb_tql::FieldDecl { name: "label".into(), field_type: trondb_tql::FieldType::Text },
+        ]).await;
+
+        insert_entity_full(&exec, "categories", "c1",
+            vec![("label", Literal::String("Books".into()))]).await;
+        insert_entity_full(&exec, "items", "i1",
+            vec![("title", Literal::String("Rust in Action".into())), ("cat_id", Literal::String("c1".into()))]).await;
+
+        // FETCH * => all fields from both collections
+        let stmt = trondb_tql::parse(
+            "FETCH * FROM items AS i INNER JOIN categories AS c ON i.cat_id = c.id;"
+        ).unwrap();
+        let p = crate::planner::plan(&stmt, &exec.schemas).unwrap();
+        let result = exec.execute(&p).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        let row = &result.rows[0];
+        // Should contain alias-qualified keys for both sides
+        assert_eq!(row.values.get("i.title"), Some(&Value::String("Rust in Action".into())));
+        assert_eq!(row.values.get("c.label"), Some(&Value::String("Books".into())));
+        // IDs should be present
+        assert!(row.values.contains_key("i.id"));
+        assert!(row.values.contains_key("c.id"));
+    }
 }
