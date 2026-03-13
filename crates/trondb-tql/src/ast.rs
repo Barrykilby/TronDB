@@ -178,6 +178,7 @@ pub struct SearchStmt {
     pub query_text: Option<String>,
     pub using_repr: Option<String>,
     pub hints: Vec<QueryHint>,
+    pub within: Option<Box<TraverseMatchStmt>>,
 }
 
 // --- Common types ---
