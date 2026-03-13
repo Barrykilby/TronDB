@@ -806,6 +806,9 @@ impl Parser {
             None
         };
 
+        // Optional temporal clause
+        let temporal = self.parse_temporal_clause()?;
+
         // Optional LIMIT
         let limit = if self.peek() == Some(&Token::Limit) {
             self.advance();
@@ -830,7 +833,7 @@ impl Parser {
             min_depth,
             max_depth,
             confidence_threshold,
-            temporal: None,
+            temporal,
             limit,
         }))
     }
@@ -2947,6 +2950,32 @@ mod tests {
                 assert!(f.filter.is_some());
             }
             _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_traverse_match_as_of() {
+        let stmt = parse(
+            "TRAVERSE FROM 'ent_abc123' MATCH (a)-[e:RELATED_TO]->(b) DEPTH 1..3 AS OF '2025-06-01T00:00:00Z';"
+        ).unwrap();
+        match stmt {
+            Statement::TraverseMatch(t) => {
+                assert_eq!(t.temporal, Some(TemporalClause::AsOf("2025-06-01T00:00:00Z".into())));
+            }
+            _ => panic!("expected TraverseMatch"),
+        }
+    }
+
+    #[test]
+    fn parse_traverse_match_no_temporal() {
+        let stmt = parse(
+            "TRAVERSE FROM 'ent_abc123' MATCH (a)-[e:RELATED_TO]->(b) DEPTH 1..3;"
+        ).unwrap();
+        match stmt {
+            Statement::TraverseMatch(t) => {
+                assert_eq!(t.temporal, None);
+            }
+            _ => panic!("expected TraverseMatch"),
         }
     }
 
