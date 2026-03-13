@@ -22,6 +22,7 @@ pub enum Statement {
     DropCollection(DropCollectionStmt),
     DropEdgeType(DropEdgeTypeStmt),
     FetchJoin(FetchJoinStmt),
+    TraverseMatch(TraverseMatchStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -382,5 +383,48 @@ pub enum JoinFieldList {
 pub struct InferenceConfigDecl {
     pub auto: bool,
     pub confidence_floor: Option<f32>,
+    pub limit: Option<usize>,
+}
+
+// --- TRAVERSE MATCH ---
+
+/// Direction of an edge pattern in a MATCH clause
+#[derive(Debug, Clone, PartialEq)]
+pub enum EdgeDirection {
+    /// `(a)-[e:TYPE]->(b)` — left to right
+    Forward,
+    /// `(a)<-[e:TYPE]-(b)` — right to left
+    Backward,
+    /// `(a)-[e:TYPE]-(b)` — either direction
+    Undirected,
+}
+
+/// An edge pattern: `-[variable:TYPE]->` or `-[variable:TYPE]-` etc.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgePattern {
+    /// Optional variable binding for the edge (e.g., `e` in `-[e:TYPE]->`)
+    pub variable: Option<String>,
+    /// Optional edge type filter (e.g., `RELATED_TO`)
+    pub edge_type: Option<String>,
+    /// Direction of the edge
+    pub direction: EdgeDirection,
+}
+
+/// A MATCH pattern: `(a)-[e:TYPE]->(b)`
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchPattern {
+    pub source_var: String,
+    pub edge: EdgePattern,
+    pub target_var: String,
+}
+
+/// TRAVERSE ... MATCH ... statement
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraverseMatchStmt {
+    pub from_id: String,
+    pub pattern: MatchPattern,
+    pub min_depth: usize,
+    pub max_depth: usize,
+    pub confidence_threshold: Option<f64>,
     pub limit: Option<usize>,
 }

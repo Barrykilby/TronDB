@@ -513,6 +513,9 @@ pub fn plan(
             limit: s.limit,
             hints: s.hints.clone(),
         })),
+
+        // TODO(phase-12b): Task 10 will add TraverseMatchPlan and planner logic
+        Statement::TraverseMatch(_) => todo!("TRAVERSE MATCH planner not yet implemented"),
     }
 }
 
