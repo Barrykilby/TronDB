@@ -23,6 +23,7 @@ pub enum Statement {
     DropEdgeType(DropEdgeTypeStmt),
     FetchJoin(FetchJoinStmt),
     TraverseMatch(TraverseMatchStmt),
+    Upsert(UpsertStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -293,6 +294,16 @@ pub struct UpdateStmt {
     pub entity_id: String,
     pub collection: String,
     pub assignments: Vec<(String, Literal)>,
+}
+
+// --- UPSERT (INSERT OR UPDATE) ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertStmt {
+    pub collection: String,
+    pub fields: Vec<String>,
+    pub values: Vec<Literal>,
+    pub vectors: Vec<(String, VectorLiteral)>,
 }
 
 // --- Inference ---

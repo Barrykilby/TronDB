@@ -494,6 +494,14 @@ impl Parser {
 
     fn parse_insert(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // INSERT
+
+        // Check for INSERT OR UPDATE
+        if self.peek() == Some(&Token::Or) {
+            self.advance(); // OR
+            self.expect(&Token::Update)?;
+            return self.parse_upsert_entity();
+        }
+
         match self.peek() {
             Some(Token::Into) => self.parse_insert_entity(),
             Some(Token::Edge) => self.parse_insert_edge(),
@@ -502,12 +510,72 @@ impl Parser {
                 let pos = self.tokens[self.pos].1.start;
                 Err(ParseError::UnexpectedToken {
                     pos,
-                    expected: "INTO or EDGE".to_string(),
+                    expected: "INTO, EDGE, or OR".to_string(),
                     got: tok_str,
                 })
             }
-            None => Err(ParseError::UnexpectedEof("expected INTO or EDGE".to_string())),
+            None => Err(ParseError::UnexpectedEof("expected INTO, EDGE, or OR".to_string())),
         }
+    }
+
+    fn parse_upsert_entity(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Into)?;
+        let collection = self.expect_ident()?;
+        self.expect(&Token::LParen)?;
+
+        let mut fields = vec![self.expect_ident()?];
+        while self.peek() == Some(&Token::Comma) {
+            self.advance();
+            fields.push(self.expect_ident()?);
+        }
+        self.expect(&Token::RParen)?;
+
+        self.expect(&Token::Values)?;
+        self.expect(&Token::LParen)?;
+
+        let mut values = vec![self.parse_literal()?];
+        while self.peek() == Some(&Token::Comma) {
+            self.advance();
+            values.push(self.parse_literal()?);
+        }
+        self.expect(&Token::RParen)?;
+
+        // Parse named representation vectors
+        let mut vectors = Vec::new();
+        while self.peek() == Some(&Token::Representation) {
+            self.advance(); // REPRESENTATION
+            let repr_name = self.expect_name()?;
+            match self.peek() {
+                Some(Token::Vector) => {
+                    self.advance();
+                    let vec = self.parse_float_list()?;
+                    vectors.push((repr_name, VectorLiteral::Dense(vec)));
+                }
+                Some(Token::Sparse) => {
+                    self.advance();
+                    let vec = self.parse_sparse_vector_list()?;
+                    vectors.push((repr_name, VectorLiteral::Sparse(vec)));
+                }
+                Some(tok) => {
+                    let tok_str = format!("{tok:?}");
+                    let pos = self.tokens[self.pos].1.start;
+                    return Err(ParseError::UnexpectedToken {
+                        pos,
+                        expected: "VECTOR or SPARSE".into(),
+                        got: tok_str,
+                    });
+                }
+                None => return Err(ParseError::UnexpectedEof("expected VECTOR or SPARSE".into())),
+            }
+        }
+
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::Upsert(UpsertStmt {
+            collection,
+            fields,
+            values,
+            vectors,
+        }))
     }
 
     fn parse_insert_entity(&mut self) -> Result<Statement, ParseError> {
@@ -2862,5 +2930,38 @@ mod tests {
             }
             _ => panic!("expected Traverse (legacy)"),
         }
+    }
+
+    #[test]
+    fn parse_upsert_basic() {
+        let stmt = parse("INSERT OR UPDATE INTO venues (id, name) VALUES ('v1', 'Updated Venue');").unwrap();
+        match stmt {
+            Statement::Upsert(u) => {
+                assert_eq!(u.collection, "venues");
+                assert_eq!(u.fields, vec!["id", "name"]);
+                assert_eq!(u.values.len(), 2);
+                assert!(u.vectors.is_empty());
+            }
+            other => panic!("expected Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_upsert_with_vector() {
+        let stmt = parse("INSERT OR UPDATE INTO venues (id, name) VALUES ('v1', 'X') REPRESENTATION default VECTOR [1.0, 2.0, 3.0];").unwrap();
+        match stmt {
+            Statement::Upsert(u) => {
+                assert_eq!(u.collection, "venues");
+                assert_eq!(u.vectors.len(), 1);
+                assert_eq!(u.vectors[0].0, "default");
+            }
+            other => panic!("expected Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_without_or_update_still_works() {
+        let stmt = parse("INSERT INTO venues (id, name) VALUES ('v1', 'Venue');").unwrap();
+        assert!(matches!(stmt, Statement::Insert(_)));
     }
 }

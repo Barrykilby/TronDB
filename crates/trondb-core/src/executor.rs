@@ -2426,6 +2426,22 @@ impl Executor {
                 })
             }
 
+            Plan::Upsert(p) => {
+                // UPSERT is semantically identical to INSERT —
+                // our INSERT already overwrites on duplicate ID.
+                // Delegate by constructing an equivalent InsertPlan.
+                let insert_plan = Plan::Insert(crate::planner::InsertPlan {
+                    collection: p.collection.clone(),
+                    fields: p.fields.clone(),
+                    values: p.values.clone(),
+                    vectors: p.vectors.clone(),
+                    collocate_with: None,
+                    affinity_group: None,
+                });
+                // Delegate to the INSERT handler via Box::pin to avoid infinite-size future
+                return Box::pin(self.execute(&insert_plan)).await;
+            }
+
             Plan::TraverseMatch(p) => {
                 let max_depth = p.max_depth.min(10); // cap at 10
                 let min_depth = p.min_depth;
@@ -3489,6 +3505,7 @@ fn plan_collection_name(plan: &Plan) -> Option<&str> {
         Plan::Promote(p) => Some(&p.collection),
         Plan::ExplainTiers(p) => Some(&p.collection),
         Plan::Join(p) => Some(&p.from_collection),
+        Plan::Upsert(p) => Some(&p.collection),
         _ => None,
     }
 }
@@ -3697,6 +3714,12 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             }
             props.push(("tier", "Ram".into()));
         }
+        Plan::Upsert(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "UPSERT".into()));
+            props.push(("collection", p.collection.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
     }
 
     props
@@ -3720,7 +3743,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraverseMatchPlan, TraversePlan};
+    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraverseMatchPlan, TraversePlan, UpsertPlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -9389,5 +9412,78 @@ mod tests {
         let result = exec.execute(&budget_plan).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), EngineError::AcuBudgetExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn execute_upsert_insert_when_not_exists() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // UPSERT when entity doesn't exist -> creates it
+        exec.execute(&Plan::Upsert(UpsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("Venue A".into())],
+            vectors: vec![],
+        }))
+        .await
+        .unwrap();
+
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::Eq("id".into(), Literal::String("v1".into()))),
+                order_by: vec![],
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+                hints: vec![],
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Venue A".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_upsert_update_when_exists() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // First insert
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("Old".into()))], None).await;
+
+        // UPSERT same ID -> updates
+        exec.execute(&Plan::Upsert(UpsertPlan {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("New".into())],
+            vectors: vec![],
+        }))
+        .await
+        .unwrap();
+
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::Eq("id".into(), Literal::String("v1".into()))),
+                order_by: vec![],
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+                hints: vec![],
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("New".into()))
+        );
     }
 }

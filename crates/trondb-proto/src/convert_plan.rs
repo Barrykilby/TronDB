@@ -719,6 +719,26 @@ impl From<&Plan> for pb::PlanRequest {
                         limit: p.limit.map(|l| l as u64),
                     })
                 }
+
+                // UPSERT is transported as INSERT over the wire —
+                // the executor treats them identically.
+                Plan::Upsert(p) => {
+                    PP::Insert(pb::InsertPlan {
+                        collection: p.collection.clone(),
+                        fields: p.fields.clone(),
+                        values: p.values.iter().map(literal_to_proto).collect(),
+                        vectors: p
+                            .vectors
+                            .iter()
+                            .map(|(name, vl)| pb::NamedVector {
+                                name: name.clone(),
+                                vector: Some(vector_literal_to_proto(vl)),
+                            })
+                            .collect(),
+                        collocate_with: vec![],
+                        affinity_group: None,
+                    })
+                }
             }),
         }
     }
