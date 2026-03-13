@@ -184,9 +184,13 @@ TronDB has a query language called TQL (TronDB Query Language). Current verbs:
 
 | Verb | What it does |
 |------|-------------|
-| `FETCH` | Get entities by ID or field value. Deterministic. Fast. |
+| `FETCH` | Get entities by ID or field value. Deterministic. Fast. Supports ORDER BY, advanced WHERE (IN, LIKE, IS NULL, NOT). |
 | `SEARCH` | Find entities by semantic similarity — explicit vector, sparse vector, or natural language text. Returns ranked results with similarity scores. |
-| `TRAVERSE` | Walk the graph. BFS multi-hop (depth cap 10) with cycle detection. Returns entities connected via a named edge type. |
+| `TRAVERSE` | Walk the graph. BFS multi-hop (depth cap 10) with cycle detection. MATCH pattern syntax for directed/undirected edges and depth ranges. |
+| `JOIN` | Cross-collection queries via structural (field match) or probabilistic (edge-based with CONFIDENCE threshold) joins. INNER/LEFT/RIGHT/FULL. |
+| `INFER` | Propose new edges from vector similarity. Returns ranked candidates with confidence scores. |
+| `CONFIRM` | Promote an inferred edge to confirmed status. |
+| `DROP` | Remove collections or edge types with cascading cleanup across all subsystems. |
 
 Natural language search encodes the query string through the collection's registered vectoriser:
 
@@ -311,15 +315,16 @@ The HNSW graph topology is never modified under memory pressure. When a hot-tier
 | 9 | Multi-node (gRPC, WAL streaming, write forwarding, scatter-gather, Docker) | Done |
 | 10 | Pluggable vectoriser (ONNX/Network/External), auto-vectorise INSERT, mutation cascade, natural language SEARCH | Done |
 | 11 | Inference pipeline (INFER verb, CONFIRM verb, EdgeSource classification, InferenceSweeper, DecaySweeper, audit buffer) | Done |
+| 12 | Query language completions (advanced WHERE, ORDER BY, DROP, query hints) | Done |
+| 12b | JOINs (structural + probabilistic) and TRAVERSE MATCH (Cypher-inspired pattern syntax) | Done |
+| 13 | Planner & cost model (ACU cost units, CostProvider, PlanWarning, 5 optimisation rules, two-pass strategy) | Done |
 
-### Planned (Phases 12-15)
+### Planned (Phases 14-15)
 
 | Phase | Deliverable |
 |-------|-------------|
-| 12 | Inference triggers + candidate generation strategies |
-| 13 | Advanced query features (JOINs, ORDER BY, advanced WHERE, query hints) |
-| 14 | ACU cost model + bi-temporal model |
-| 15 | Advanced compression (RaBitQ, MRL, Float16/BF16, PQ) |
+| 14 | Bi-temporal model (valid time, transaction time, vector time) |
+| 15 | Operational excellence, security, performance review, advanced compression |
 
 ---
 
@@ -366,10 +371,33 @@ CREATE EDGE TYPE 'performs_at' FROM acts TO venues;
 -- Insert an edge
 INSERT EDGE 'performs_at' FROM 'act1' TO 'v1';
 
--- Traverse
+-- Traverse (legacy)
 TRAVERSE 'act1' VIA 'performs_at' DEPTH 2;
 
--- Explain any query
+-- Traverse with pattern matching
+TRAVERSE FROM 'act1' MATCH (a)-[e:performs_at]->(b) DEPTH 1..3 CONFIDENCE > 0.5;
+
+-- Join across collections
+FETCH a.name, v.address FROM acts AS a
+    INNER JOIN venues AS v ON a.id = v.act_id;
+
+-- Probabilistic join (edge-based with confidence)
+FETCH a.name, v.name, _edge.confidence FROM acts AS a
+    INNER JOIN venues AS v ON a.id = v.id CONFIDENCE > 0.75;
+
+-- Advanced WHERE
+FETCH * FROM venues WHERE category IN ('music', 'comedy') ORDER BY name ASC LIMIT 20;
+FETCH * FROM venues WHERE name LIKE 'Jazz%' AND city IS NOT NULL;
+
+-- Query hints
+FETCH /*+ FORCE_FULL_SCAN */ * FROM venues WHERE city = 'London';
+SEARCH /*+ NO_PREFILTER */ venues NEAR 'jazz' LIMIT 10;
+
+-- Drop with cascading cleanup
+DROP COLLECTION venues;
+DROP EDGE TYPE 'performs_at';
+
+-- Explain any query (now includes ACU cost breakdown)
 EXPLAIN SEARCH venues NEAR VECTOR [0.1, 0.2, ...] LIMIT 10;
 ```
 
@@ -379,7 +407,7 @@ EXPLAIN SEARCH venues NEAR VECTOR [0.1, 0.2, ...] LIMIT 10;
 
 | Term | Meaning |
 |------|---------|
-| ACU | Abstract Cost Unit. Planner's measure of query cost. Baseline 1.0 = hot-tier FETCH by ID. (Planned) |
+| ACU | Abstract Cost Unit. Planner's measure of query cost. Baseline 1.0 = hot-tier FETCH by ID. Shown in EXPLAIN output. |
 | Adjacency index | DashMap keyed by (EntityId, EdgeType) for O(1) TRAVERSE lookups. RAM-resident. |
 | Confidence | Ordinal ranking signal 0.0-1.0 on every edge. Structural = 1.0. |
 | Control Fabric | RAM-resident layer: Location Table, HNSW topology, adjacency index. Never mixed with data bytes. |
