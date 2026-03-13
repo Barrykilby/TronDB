@@ -106,7 +106,13 @@ impl TronNodeService {
             Plan::Insert(_) | Plan::UpdateEntity(_) | Plan::DeleteEntity(_) |
             Plan::CreateCollection(_) | Plan::CreateEdgeType(_) | Plan::InsertEdge(_) |
             Plan::DeleteEdge(_) | Plan::CreateAffinityGroup(_) |
-            Plan::AlterEntityDropAffinity(_) | Plan::Demote(_) | Plan::Promote(_)
+            Plan::AlterEntityDropAffinity(_) | Plan::Demote(_) | Plan::Promote(_) |
+            // Admin/IO operations: must be forwarded to the primary so they are
+            // not executed on replicas or router nodes. These should eventually
+            // be gated behind an admin-only authentication check.
+            Plan::Backup(_) | Plan::Restore(_) | Plan::Import(_) | Plan::Checkpoint(_) |
+            Plan::AlterCollection(_) | Plan::Upsert(_) |
+            Plan::DropCollection(_) | Plan::DropEdgeType(_)
         )
     }
 

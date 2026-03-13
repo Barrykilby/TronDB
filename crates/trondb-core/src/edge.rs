@@ -170,25 +170,35 @@ impl AdjacencyIndex {
         valid_to: Option<i64>,
     ) {
         let key = (from_id.clone(), edge_type.to_string());
-        let entry = AdjEntry {
-            to_id: to_id.clone(),
-            confidence,
-            created_at,
-            source,
-            valid_from,
-            valid_to,
-        };
-        self.forward
+        let mut entries = self.forward
             .entry(key)
-            .or_default()
-            .push(entry);
+            .or_default();
+        if let Some(existing) = entries.iter_mut().find(|e| e.to_id == *to_id) {
+            existing.confidence = confidence;
+            existing.created_at = created_at;
+            existing.source = source;
+            existing.valid_from = valid_from;
+            existing.valid_to = valid_to;
+        } else {
+            entries.push(AdjEntry {
+                to_id: to_id.clone(),
+                confidence,
+                created_at,
+                source,
+                valid_from,
+                valid_to,
+            });
+        }
+        drop(entries);
 
-        // Maintain backward index: (to_id, edge_type) → from_id
+        // Maintain backward index: (to_id, edge_type) → from_id (deduplicated)
         let bkey = (to_id.clone(), edge_type.to_string());
-        self.backward
+        let mut back_entries = self.backward
             .entry(bkey)
-            .or_default()
-            .push(from_id.clone());
+            .or_default();
+        if !back_entries.contains(from_id) {
+            back_entries.push(from_id.clone());
+        }
     }
 
     pub fn remove(&self, from_id: &LogicalId, edge_type: &str, to_id: &LogicalId) {

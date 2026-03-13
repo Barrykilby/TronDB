@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +53,8 @@ pub struct Executor {
     engine_metrics: Arc<crate::metrics::EngineMetrics>,
     /// Slow query log
     slow_log: Arc<crate::slow_log::SlowQueryLog>,
+    /// Base directory for path validation (BACKUP/RESTORE/IMPORT)
+    data_dir: PathBuf,
 }
 
 impl Executor {
@@ -61,6 +64,17 @@ impl Executor {
         location: Arc<LocationTable>,
         vectoriser_registry: Arc<VectoriserRegistry>,
         inference_audit: Arc<InferenceAuditBuffer>,
+    ) -> Self {
+        Self::with_data_dir(store, wal, location, vectoriser_registry, inference_audit, PathBuf::from("."))
+    }
+
+    pub fn with_data_dir(
+        store: FjallStore,
+        wal: WalWriter,
+        location: Arc<LocationTable>,
+        vectoriser_registry: Arc<VectoriserRegistry>,
+        inference_audit: Arc<InferenceAuditBuffer>,
+        data_dir: PathBuf,
     ) -> Self {
         Self {
             store,
@@ -81,6 +95,7 @@ impl Executor {
             slow_log: Arc::new(crate::slow_log::SlowQueryLog::new(
                 crate::slow_log::SlowQueryConfig::default(),
             )),
+            data_dir,
         }
     }
 
@@ -271,6 +286,42 @@ impl Executor {
         Ok((replayed, unhandled))
     }
 
+    /// Validate that `path` resolves to a location under `data_dir`.
+    /// Prevents path-traversal attacks on BACKUP/RESTORE/IMPORT.
+    fn validate_io_path(&self, path: &str) -> Result<PathBuf, EngineError> {
+        let requested = PathBuf::from(path);
+        let resolved = if requested.is_absolute() {
+            requested
+        } else {
+            self.data_dir.join(&requested)
+        };
+        let canonical_base = self.data_dir.canonicalize()
+            .map_err(|e| EngineError::InvalidQuery(format!("data dir error: {e}")))?;
+
+        if resolved.exists() {
+            let canonical = resolved.canonicalize()
+                .map_err(|e| EngineError::InvalidQuery(format!("path error: {e}")))?;
+            if !canonical.starts_with(&canonical_base) {
+                return Err(EngineError::InvalidQuery("path outside data directory".into()));
+            }
+            Ok(canonical)
+        } else {
+            // For new paths (e.g. backup output), check parent
+            let parent = resolved.parent()
+                .ok_or_else(|| EngineError::InvalidQuery("invalid path".into()))?;
+            if parent.exists() {
+                let canonical_parent = parent.canonicalize()
+                    .map_err(|e| EngineError::InvalidQuery(format!("path error: {e}")))?;
+                if !canonical_parent.starts_with(&canonical_base) {
+                    return Err(EngineError::InvalidQuery("path outside data directory".into()));
+                }
+            } else if !resolved.starts_with(&canonical_base) {
+                return Err(EngineError::InvalidQuery("path outside data directory".into()));
+            }
+            Ok(resolved)
+        }
+    }
+
     /// Approximate collection size for cost estimation.
     /// Fast path: check HNSW index len (hot tier, O(1)).
     /// Slow path: Fjall scan count.
@@ -320,7 +371,14 @@ impl Executor {
             }
         };
 
+        // RAII guard for the inflight-queries gauge so it is always decremented,
+        // even when an early `return` or `?` exits the function.
+        struct InflightGuard<'a>(&'a crate::metrics::Gauge);
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) { self.0.dec(); }
+        }
         self.engine_metrics.inflight_queries.inc();
+        let _inflight = InflightGuard(&self.engine_metrics.inflight_queries);
 
         let result = match plan {
             Plan::CreateCollection(p) => {
@@ -1589,6 +1647,9 @@ impl Executor {
                 let _ = self.store.delete_from_tier(&p.collection, &entity_id, Tier::NVMe);
                 let _ = self.store.delete_from_tier(&p.collection, &entity_id, Tier::Archive);
 
+                // Step 10: Clean entity→collection reverse lookup
+                self.entity_collections.remove(&entity_id);
+
                 self.store.persist()?;
 
                 Ok(QueryResult {
@@ -2735,8 +2796,8 @@ impl Executor {
             }
 
             Plan::Backup(p) => {
-                let backup_path = std::path::Path::new(&p.path);
-                let count = self.store.snapshot_to(backup_path)?;
+                let backup_path = self.validate_io_path(&p.path)?;
+                let count = self.store.snapshot_to(&backup_path)?;
 
                 Ok(QueryResult {
                     columns: vec!["backed_up".into(), "path".into()],
@@ -2758,7 +2819,10 @@ impl Executor {
                 })
             }
 
-            Plan::Restore(_p) => {
+            Plan::Restore(p) => {
+                // Validate path even though restore is informational-only,
+                // to prevent information disclosure about file existence.
+                let _validated = self.validate_io_path(&p.path)?;
                 // Restore is a destructive operation -- return informational response.
                 // Full restore requires engine restart, so we return instructions.
                 Ok(QueryResult {
@@ -2782,6 +2846,15 @@ impl Executor {
                 })
             }
 
+            // SAFETY: TODO — AlterCollection is NOT crash-safe. The schema
+            // update and per-entity migrations are written in a single WAL
+            // transaction, but the schema metadata in Fjall (_meta partition)
+            // is updated separately via update_collection_schema() after the
+            // WAL commit.  A crash between the WAL commit and the meta update
+            // will leave the schema stale while entity data has already been
+            // migrated.  Fixing this properly requires a new WAL record type
+            // (e.g. SchemaAlter 0x54) so that WAL replay can re-apply the
+            // schema change atomically.
             Plan::AlterCollection(p) => {
                 let mut schema = self.store.get_collection_schema(&p.collection)?;
 
@@ -2863,19 +2936,28 @@ impl Executor {
                     .ok_or_else(|| EngineError::CollectionNotFound(p.collection.clone()))?
                     .clone();
 
-                // Read JSONL file line by line
-                let content = std::fs::read_to_string(&p.path)
-                    .map_err(|e| EngineError::Storage(format!("import read: {e}")))?;
+                // Validate path is under data_dir
+                let validated_path = self.validate_io_path(&p.path)?;
+
+                // Stream JSONL file line by line (avoids loading entire file into RAM)
+                use std::io::BufRead;
+                let file = std::fs::File::open(&validated_path)
+                    .map_err(|e| EngineError::InvalidQuery(format!("cannot open file: {e}")))?;
+                let reader = std::io::BufReader::new(file);
 
                 let mut imported = 0i64;
 
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
+                // Batch all rows into a single WAL transaction
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+
+                for line in reader.lines() {
+                    let line = line.map_err(|e| EngineError::InvalidQuery(format!("read error: {e}")))?;
+                    if line.trim().is_empty() {
                         continue;
                     }
 
-                    let obj: serde_json::Value = serde_json::from_str(line)
+                    let obj: serde_json::Value = serde_json::from_str(line.trim())
                         .map_err(|e| EngineError::Storage(format!("import parse: {e}")))?;
 
                     let map = obj.as_object()
@@ -2910,19 +2992,18 @@ impl Executor {
                         entity.metadata.insert(key.clone(), val);
                     }
 
-                    // WAL + Fjall insert
-                    let tx_id = self.wal.next_tx_id();
-                    self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+                    // Append entity to the single WAL transaction
                     let payload = rmp_serde::to_vec_named(&entity)
                         .map_err(|e| EngineError::Storage(e.to_string()))?;
                     self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
-                    self.wal.commit(tx_id).await?;
                     self.store.insert(&p.collection, entity)?;
 
                     self.entity_collections.insert(entity_id, p.collection.clone());
                     imported += 1;
                 }
 
+                // Commit the single WAL transaction for the entire import batch
+                self.wal.commit(tx_id).await?;
                 self.store.persist()?;
 
                 Ok(QueryResult {
@@ -2948,7 +3029,7 @@ impl Executor {
 
         // Instrumentation (runs for every query path)
         let elapsed = start.elapsed();
-        self.engine_metrics.inflight_queries.dec();
+        // inflight_queries is decremented by _inflight guard (RAII) on function exit
         self.engine_metrics.queries_total.inc();
         self.engine_metrics.query_duration_seconds.observe_duration(elapsed);
 
@@ -4306,7 +4387,7 @@ mod tests {
             ..Default::default()
         };
         let wal = WalWriter::open(wal_config).await.unwrap();
-        (Executor::new(store, wal, Arc::new(LocationTable::new()), Arc::new(VectoriserRegistry::new()), Arc::new(InferenceAuditBuffer::new(1000))), dir)
+        (Executor::with_data_dir(store, wal, Arc::new(LocationTable::new()), Arc::new(VectoriserRegistry::new()), Arc::new(InferenceAuditBuffer::new(1000)), dir.path().to_path_buf()), dir)
     }
 
     async fn create_collection(exec: &Executor, name: &str, dims: usize) {
@@ -10724,10 +10805,12 @@ mod tests {
 
     #[tokio::test]
     async fn execute_restore_returns_message() {
-        let (exec, _dir) = setup_executor().await;
+        let (exec, dir) = setup_executor().await;
 
+        // Use a path under the data dir so path validation passes
+        let restore_path = dir.path().join("nonexistent_backup");
         let result = exec.execute(&Plan::Restore(crate::planner::RestorePlan {
-            path: "/tmp/nonexistent".into(),
+            path: restore_path.to_string_lossy().to_string(),
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 1);
