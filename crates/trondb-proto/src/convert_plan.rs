@@ -941,6 +941,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     using_repr: sp.using_repr,
                     hints: sp.hints.iter().filter_map(|s| proto_to_hint(s)).collect(),
                     two_pass: sp.two_pass.as_ref().map(proto_to_two_pass_config),
+                    within: None, // TODO Task 5: wire WITHIN through proto
                 }))
             }
 
@@ -1257,6 +1258,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1570,6 +1572,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1888,6 +1891,7 @@ mod tests {
             using_repr: None,
             hints: vec![QueryHint::NoPrefilter, QueryHint::Timeout(5000)],
             two_pass: None,
+            within: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -2012,6 +2016,7 @@ mod tests {
                 first_pass_k: 300,
                 use_binary_first_pass: true,
             }),
+            within: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -2149,6 +2154,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
         let restored = round_trip(plan);
         match restored {

@@ -264,6 +264,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = apply_rules(plan, &default_config(), &cost, 10_000);
@@ -292,6 +293,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = apply_rules(plan, &default_config(), &cost, 10_000);
@@ -317,6 +319,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = apply_rules(plan, &default_config(), &cost, 100);
@@ -388,6 +391,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = apply_rules(plan, &default_config(), &cost, 100);
@@ -418,6 +422,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = apply_rules(plan, &config, &cost, 10_000);
