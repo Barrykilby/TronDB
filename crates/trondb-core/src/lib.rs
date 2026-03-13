@@ -17,6 +17,7 @@ pub mod vectoriser;
 pub mod cost;
 pub mod warning;
 pub mod optimise;
+pub mod metrics;
 
 use std::path::PathBuf;
 use std::sync::Arc;
