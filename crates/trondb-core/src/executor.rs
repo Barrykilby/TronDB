@@ -285,6 +285,7 @@ impl Executor {
     }
 
     pub async fn execute(&self, plan: &Plan) -> Result<QueryResult, EngineError> {
+        tracing::debug!(plan = ?std::mem::discriminant(plan), "executing plan");
         let start = Instant::now();
 
         // Cost estimation + budget check (skip for EXPLAIN -- it reports cost, doesn't enforce)
@@ -425,6 +426,7 @@ impl Executor {
             }
 
             Plan::Insert(p) => {
+                tracing::debug!(collection = %p.collection, "executing INSERT");
                 // Look up schema and validate collection exists
                 let schema = self.schemas.get(&p.collection)
                     .ok_or_else(|| EngineError::CollectionNotFound(p.collection.clone()))?
@@ -695,6 +697,7 @@ impl Executor {
             }
 
             Plan::Fetch(p) => {
+                tracing::debug!(collection = %p.collection, strategy = ?p.strategy, "executing FETCH");
                 match &p.strategy {
                     FetchStrategy::FieldIndexLookup(index_name) => {
                         // Look up via FieldIndex
@@ -826,6 +829,7 @@ impl Executor {
             }
 
             Plan::Search(p) => {
+                tracing::debug!(collection = %p.collection, k = p.k, strategy = ?p.strategy, "executing SEARCH");
                 // Validate collection exists
                 if !self.store.has_collection(&p.collection) {
                     return Err(EngineError::CollectionNotFound(p.collection.clone()));
@@ -2466,6 +2470,7 @@ impl Executor {
             }
 
             Plan::Upsert(p) => {
+                tracing::debug!(collection = %p.collection, "executing UPSERT");
                 // UPSERT is semantically identical to INSERT —
                 // our INSERT already overwrites on duplicate ID.
                 // Delegate by constructing an equivalent InsertPlan.
