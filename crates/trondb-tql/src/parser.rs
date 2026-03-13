@@ -588,6 +588,22 @@ impl Parser {
             affinity_group = Some(name);
         }
 
+        // Optional temporal: VALID FROM 'timestamp' [TO 'timestamp']
+        let (valid_from, valid_to) = if self.peek() == Some(&Token::Valid) {
+            self.advance(); // VALID
+            self.expect(&Token::From)?;
+            let from = self.expect_string_lit()?;
+            let to = if self.peek() == Some(&Token::To) {
+                self.advance();
+                Some(self.expect_string_lit()?)
+            } else {
+                None
+            };
+            (Some(from), to)
+        } else {
+            (None, None)
+        };
+
         self.expect(&Token::Semicolon)?;
         Ok(Statement::Insert(InsertStmt {
             collection,
@@ -596,8 +612,8 @@ impl Parser {
             vectors,
             collocate_with,
             affinity_group,
-            valid_from: None,
-            valid_to: None,
+            valid_from,
+            valid_to,
         }))
     }
 
@@ -2987,6 +3003,48 @@ mod tests {
                 assert_eq!(f.temporal, None);
             }
             _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_valid_from_to() {
+        let stmt = parse(
+            "INSERT INTO events (id, name) VALUES ('evt1', 'Concert') VALID FROM '2025-01-01T00:00:00Z' TO '2025-06-30T00:00:00Z';"
+        ).unwrap();
+        match stmt {
+            Statement::Insert(i) => {
+                assert_eq!(i.valid_from, Some("2025-01-01T00:00:00Z".into()));
+                assert_eq!(i.valid_to, Some("2025-06-30T00:00:00Z".into()));
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_valid_from_only() {
+        let stmt = parse(
+            "INSERT INTO events (id, name) VALUES ('evt1', 'Concert') VALID FROM '2025-01-01T00:00:00Z';"
+        ).unwrap();
+        match stmt {
+            Statement::Insert(i) => {
+                assert_eq!(i.valid_from, Some("2025-01-01T00:00:00Z".into()));
+                assert_eq!(i.valid_to, None);
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_no_temporal() {
+        let stmt = parse(
+            "INSERT INTO events (id, name) VALUES ('evt1', 'Concert');"
+        ).unwrap();
+        match stmt {
+            Statement::Insert(i) => {
+                assert_eq!(i.valid_from, None);
+                assert_eq!(i.valid_to, None);
+            }
+            _ => panic!("expected Insert"),
         }
     }
 }
