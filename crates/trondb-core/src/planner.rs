@@ -78,6 +78,8 @@ pub struct InsertPlan {
     pub vectors: Vec<(String, VectorLiteral)>,
     pub collocate_with: Option<Vec<String>>,
     pub affinity_group: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +87,7 @@ pub struct FetchPlan {
     pub collection: String,
     pub fields: FieldList,
     pub filter: Option<WhereClause>,
+    pub temporal: Option<trondb_tql::TemporalClause>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<usize>,
     pub strategy: FetchStrategy,
@@ -136,6 +139,8 @@ pub struct InsertEdgePlan {
     pub from_id: String,
     pub to_id: String,
     pub metadata: Vec<(String, trondb_tql::Literal)>,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +238,7 @@ pub struct TraverseMatchPlan {
     pub min_depth: usize,
     pub max_depth: usize,
     pub confidence_threshold: Option<f64>,
+    pub temporal: Option<trondb_tql::TemporalClause>,
     pub limit: Option<usize>,
 }
 
@@ -369,6 +375,8 @@ pub fn plan(
             vectors: s.vectors.clone(),
             collocate_with: s.collocate_with.clone(),
             affinity_group: s.affinity_group.clone(),
+            valid_from: s.valid_from.clone(),
+            valid_to: s.valid_to.clone(),
         })),
 
         Statement::Fetch(s) => {
@@ -383,6 +391,7 @@ pub fn plan(
                 collection: s.collection.clone(),
                 fields: s.fields.clone(),
                 filter: s.filter.clone(),
+                temporal: s.temporal.clone(),
                 order_by: s.order_by.clone(),
                 limit: s.limit,
                 strategy,
@@ -462,6 +471,8 @@ pub fn plan(
             from_id: s.from_id.clone(),
             to_id: s.to_id.clone(),
             metadata: s.metadata.clone(),
+            valid_from: s.valid_from.clone(),
+            valid_to: s.valid_to.clone(),
         })),
 
         Statement::Delete(s) => Ok(Plan::DeleteEntity(DeleteEntityPlan {
@@ -556,6 +567,7 @@ pub fn plan(
             min_depth: s.min_depth,
             max_depth: s.max_depth,
             confidence_threshold: s.confidence_threshold,
+            temporal: s.temporal.clone(),
             limit: s.limit,
         })),
     }
@@ -1317,6 +1329,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -1334,6 +1347,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
@@ -1414,6 +1428,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -1438,6 +1453,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
@@ -1458,6 +1474,8 @@ mod tests {
             vectors: vec![],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         });
         let est = estimate_plan_cost(&plan, &provider, 0);
         assert!((est.total_acu - 5.0).abs() < f64::EPSILON);
@@ -1535,5 +1553,54 @@ mod tests {
         let est = estimate_plan_cost(&plan, &provider, 1000);
         // HNSW: 50 + two_pass_rescore: 15 + fetch k: 100*1.0 = 165 ACU
         assert!((est.total_acu - 165.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Temporal plan extension tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_fetch_with_as_of() {
+        let schemas = empty_schemas();
+        let stmt = trondb_tql::parse(
+            "FETCH * FROM venues AS OF '2025-01-01T00:00:00Z' WHERE id = 'v1';"
+        ).unwrap();
+        let p = plan(&stmt, &schemas).unwrap();
+        match p {
+            Plan::Fetch(f) => {
+                assert_eq!(f.temporal, Some(trondb_tql::TemporalClause::AsOf("2025-01-01T00:00:00Z".into())));
+            }
+            _ => panic!("expected Fetch plan"),
+        }
+    }
+
+    #[test]
+    fn plan_fetch_with_valid_during() {
+        let schemas = empty_schemas();
+        let stmt = trondb_tql::parse(
+            "FETCH * FROM venues VALID DURING '2025-01-01'..'2025-06-30';"
+        ).unwrap();
+        let p = plan(&stmt, &schemas).unwrap();
+        match p {
+            Plan::Fetch(f) => {
+                assert_eq!(f.temporal, Some(trondb_tql::TemporalClause::ValidDuring("2025-01-01".into(), "2025-06-30".into())));
+            }
+            _ => panic!("expected Fetch plan"),
+        }
+    }
+
+    #[test]
+    fn plan_fetch_with_as_of_transaction() {
+        let schemas = empty_schemas();
+        let stmt = trondb_tql::parse(
+            "FETCH * FROM venues AS OF TRANSACTION 42891;"
+        ).unwrap();
+        let p = plan(&stmt, &schemas).unwrap();
+        match p {
+            Plan::Fetch(f) => {
+                assert_eq!(f.temporal, Some(trondb_tql::TemporalClause::AsOfTransaction(42891)));
+            }
+            _ => panic!("expected Fetch plan"),
+        }
     }
 }

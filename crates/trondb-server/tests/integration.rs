@@ -108,6 +108,8 @@ async fn loopback_create_insert_fetch() {
         )],
         collocate_with: None,
         affinity_group: None,
+        valid_from: None,
+        valid_to: None,
     });
     let insert_result = remote.execute(&insert_plan).await.unwrap();
     assert!(
@@ -120,6 +122,7 @@ async fn loopback_create_insert_fetch() {
         collection: "loopback_coll".into(),
         fields: FieldList::All,
         filter: None,
+        temporal: None,
         order_by: vec![],
         limit: Some(10),
         strategy: FetchStrategy::FullScan,

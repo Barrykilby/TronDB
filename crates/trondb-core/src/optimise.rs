@@ -359,6 +359,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
