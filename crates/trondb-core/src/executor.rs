@@ -12,6 +12,7 @@ use crate::inference::{InferenceAuditBuffer, InferenceAuditEntry, InferenceCandi
 use crate::location::{
     Encoding, LocState, LocationDescriptor, LocationTable, NodeAddress, ReprKey, Tier,
 };
+use crate::cost::{ConstantCostProvider, CostProvider};
 use crate::planner::{FetchStrategy, Plan, SearchStrategy};
 use crate::result::{QueryMode, QueryResult, QueryStats, Row};
 use crate::sparse_index::SparseIndex;
@@ -45,6 +46,8 @@ pub struct Executor {
     inference_audit: Arc<InferenceAuditBuffer>,
     /// RAM-only work queue of entity IDs pending background inference
     inference_queue: Arc<DashSet<LogicalId>>,
+    /// Cost provider for ACU estimation
+    cost_provider: Arc<dyn CostProvider>,
 }
 
 impl Executor {
@@ -69,6 +72,7 @@ impl Executor {
             entity_collections: DashMap::new(),
             inference_audit,
             inference_queue: Arc::new(DashSet::new()),
+            cost_provider: Arc::new(ConstantCostProvider),
         }
     }
 
@@ -259,8 +263,35 @@ impl Executor {
         Ok((replayed, unhandled))
     }
 
+    /// Approximate collection size for cost estimation.
+    /// Fast path: check HNSW index len (hot tier, O(1)).
+    /// Slow path: Fjall scan count.
+    fn collection_size(&self, collection: &str) -> usize {
+        let prefix = format!("{collection}:");
+        for entry in self.indexes.iter() {
+            if entry.key().starts_with(&prefix) {
+                return entry.value().len();
+            }
+        }
+        self.store.scan(collection).map(|v| v.len()).unwrap_or(0)
+    }
+
     pub async fn execute(&self, plan: &Plan) -> Result<QueryResult, EngineError> {
         let start = Instant::now();
+
+        // Cost estimation + budget check (skip for EXPLAIN -- it reports cost, doesn't enforce)
+        let cost_estimate = match plan {
+            Plan::Explain(_) => None,
+            _ => {
+                let collection_name = plan_collection_name(plan);
+                let size = collection_name
+                    .map(|c| self.collection_size(c))
+                    .unwrap_or(0);
+                let est = crate::planner::estimate_plan_cost(plan, self.cost_provider.as_ref(), size);
+                crate::planner::check_acu_budget(plan, &est)?;
+                Some(est)
+            }
+        };
 
         match plan {
             Plan::CreateCollection(p) => {
@@ -359,7 +390,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -629,7 +660,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -673,7 +704,7 @@ impl Executor {
                                 entities_scanned: entity_ids.len(),
                                 mode: QueryMode::Deterministic,
                                 tier: "FieldIndex".into(),
-                                cost: None,
+                                cost: cost_estimate.clone(),
                                 warnings: vec![],
                             },
                         })
@@ -720,7 +751,7 @@ impl Executor {
                                 entities_scanned: entity_ids.len(),
                                 mode: QueryMode::Deterministic,
                                 tier: "FieldIndex".into(),
-                                cost: None,
+                                cost: cost_estimate.clone(),
                                 warnings: vec![],
                             },
                         })
@@ -758,7 +789,7 @@ impl Executor {
                                 entities_scanned: scanned,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
-                                cost: None,
+                                cost: cost_estimate.clone(),
                                 warnings: vec![],
                             },
                         })
@@ -991,14 +1022,41 @@ impl Executor {
                         entities_scanned: final_results.len(),
                         mode: QueryMode::Probabilistic,
                         tier: "Ram".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
             }
 
             Plan::Explain(inner) => {
-                let rows = explain_plan(inner);
+                let collection_name = plan_collection_name(inner);
+                let size = collection_name
+                    .map(|c| self.collection_size(c))
+                    .unwrap_or(0);
+                let est = crate::planner::estimate_plan_cost(inner, self.cost_provider.as_ref(), size);
+
+                let mut rows = explain_plan(inner);
+
+                // Add cost breakdown rows
+                rows.push(Row {
+                    values: HashMap::from([
+                        ("property".into(), Value::String("estimated_acu".into())),
+                        ("value".into(), Value::String(format!("{:.1}", est.total_acu))),
+                    ]),
+                    score: None,
+                });
+                let breakdown_str = est.items.iter()
+                    .map(|item| format!("{}x {} @ {:.1} = {:.1}", item.count, item.operation, item.unit_cost, item.total))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                rows.push(Row {
+                    values: HashMap::from([
+                        ("property".into(), Value::String("cost_breakdown".into())),
+                        ("value".into(), Value::String(breakdown_str)),
+                    ]),
+                    score: None,
+                });
+
                 Ok(QueryResult {
                     columns: vec!["property".into(), "value".into()],
                     rows,
@@ -1007,7 +1065,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: Some(est),
                         warnings: vec![],
                     },
                 })
@@ -1075,7 +1133,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1144,7 +1202,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1196,7 +1254,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1282,7 +1340,7 @@ impl Executor {
                         entities_scanned: scanned,
                         mode: QueryMode::Deterministic,
                         tier: "Ram".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1304,7 +1362,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Routing".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1324,7 +1382,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Routing".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1421,7 +1479,7 @@ impl Executor {
                         entities_scanned: 1,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1452,7 +1510,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1526,7 +1584,7 @@ impl Executor {
                             entities_scanned: 0,
                             mode: QueryMode::Probabilistic,
                             tier: "Ram".into(),
-                            cost: None,
+                            cost: cost_estimate.clone(),
                             warnings: vec![],
                         },
                     });
@@ -1640,7 +1698,7 @@ impl Executor {
                         entities_scanned: all_candidates.len(),
                         mode: QueryMode::Probabilistic,
                         tier: "Ram".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1716,7 +1774,7 @@ impl Executor {
                                 entities_scanned: 0,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
-                                cost: None,
+                                cost: cost_estimate.clone(),
                                 warnings: vec![],
                             },
                         })
@@ -1767,7 +1825,7 @@ impl Executor {
                                 entities_scanned: 0,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
-                                cost: None,
+                                cost: cost_estimate.clone(),
                                 warnings: vec![],
                             },
                         })
@@ -1824,7 +1882,7 @@ impl Executor {
                                 entities_scanned: 0,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
-                                cost: None,
+                                cost: cost_estimate.clone(),
                                 warnings: vec![],
                             },
                         })
@@ -1858,7 +1916,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Ram".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1918,7 +1976,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -1961,7 +2019,7 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -2084,7 +2142,7 @@ impl Executor {
                         entities_scanned: 1,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: None,
+                        cost: cost_estimate.clone(),
                         warnings: vec![],
                     },
                 })
@@ -2872,6 +2930,21 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
         (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
         (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
         _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Extract the primary collection name from a plan (for cost estimation).
+fn plan_collection_name(plan: &Plan) -> Option<&str> {
+    match plan {
+        Plan::Fetch(p) => Some(&p.collection),
+        Plan::Search(p) => Some(&p.collection),
+        Plan::Insert(p) => Some(&p.collection),
+        Plan::DeleteEntity(p) => Some(&p.collection),
+        Plan::UpdateEntity(p) => Some(&p.collection),
+        Plan::Demote(p) => Some(&p.collection),
+        Plan::Promote(p) => Some(&p.collection),
+        Plan::ExplainTiers(p) => Some(&p.collection),
+        _ => None,
     }
 }
 
@@ -7166,5 +7239,105 @@ mod tests {
             }))
             .await;
         assert!(err.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4 tests: Executor cost threading + EXPLAIN enhancement
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn explain_shows_cost_breakdown() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert a few entities so we have a non-zero collection size
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("The Fleece".into()))], Some(vec![1.0, 0.0, 0.0])).await;
+        insert_entity(&exec, "venues", "v2", vec![("name", Literal::String("The Exchange".into()))], Some(vec![0.0, 1.0, 0.0])).await;
+
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(search_plan)))
+            .await
+            .unwrap();
+
+        // Should have cost-related rows in the EXPLAIN output
+        let has_cost_row = result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("estimated_acu".to_string())
+        });
+        assert!(has_cost_row, "EXPLAIN should include estimated_acu");
+
+        let has_breakdown = result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("cost_breakdown".to_string())
+        });
+        assert!(has_breakdown, "EXPLAIN should include cost_breakdown");
+    }
+
+    #[tokio::test]
+    async fn max_acu_rejects_expensive_query() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert enough entities that a full scan is expensive
+        for i in 0..50 {
+            insert_entity(
+                &exec,
+                "venues",
+                &format!("v{i}"),
+                vec![("name", Literal::String(format!("Venue {i}")))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![trondb_tql::QueryHint::MaxAcu(5.0)], // budget of 5 ACU, but scan will cost 50*0.5=25 ACU
+        });
+        let result = exec.execute(&plan).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::AcuBudgetExceeded { .. } => {}
+            other => panic!("expected AcuBudgetExceeded, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_result_includes_cost() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("The Fleece".into()))], Some(vec![1.0, 0.0, 0.0])).await;
+
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        });
+        let result = exec.execute(&plan).await.unwrap();
+        assert!(result.stats.cost.is_some(), "QueryStats should include cost estimate");
+        let cost = result.stats.cost.unwrap();
+        assert!(cost.total_acu > 0.0, "Cost should be non-zero for a scan");
     }
 }
