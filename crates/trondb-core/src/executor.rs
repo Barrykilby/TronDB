@@ -2656,200 +2656,7 @@ impl Executor {
             }
 
             Plan::TraverseMatch(p) => {
-                let max_depth = p.max_depth.min(10); // cap at 10
-                let min_depth = p.min_depth;
-                let confidence_threshold = p.confidence_threshold.unwrap_or(0.0) as f32;
-
-                let from_id = LogicalId::from_string(&p.from_id);
-                let mut visited: HashSet<LogicalId> = HashSet::new();
-                visited.insert(from_id.clone());
-
-                let mut frontier = vec![from_id];
-                let mut rows = Vec::new();
-                let limit = p.limit.unwrap_or(usize::MAX);
-
-                // Optional edge type filter from pattern
-                let edge_type_filter: Option<String> = p.pattern.edge.edge_type.clone();
-
-                for hop in 0..max_depth {
-                    if frontier.is_empty() || rows.len() >= limit {
-                        break;
-                    }
-
-                    let mut next_frontier = Vec::new();
-                    let include_at_depth = hop + 1 >= min_depth;
-
-                    for node_id in &frontier {
-                        // Collect neighbor entries based on direction
-                        // (to_id, confidence, collection)
-                        let mut neighbors: Vec<(LogicalId, f32, String)> = Vec::new();
-
-                        // Get edge types to check: filtered or all
-                        let edge_types_to_check: Vec<EdgeType> = if let Some(ref et_name) = edge_type_filter {
-                            match self.store.get_edge_type(et_name) {
-                                Ok(et) => vec![et],
-                                Err(_) => vec![],
-                            }
-                        } else {
-                            self.edge_types.iter().map(|e| e.value().clone()).collect()
-                        };
-
-                        for et in &edge_types_to_check {
-                            match p.pattern.edge.direction {
-                                trondb_tql::EdgeDirection::Forward => {
-                                    let entries = self.adjacency.get(node_id, &et.name);
-                                    for entry in &entries {
-                                        // Apply temporal filter if present
-                                        if let Some(ref tc) = p.temporal {
-                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
-                                                continue;
-                                            }
-                                        }
-                                        let effective_conf = if entry.created_at > 0 {
-                                            let now_ms = SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_millis() as u64;
-                                            let elapsed = now_ms.saturating_sub(entry.created_at);
-                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
-                                        } else {
-                                            entry.confidence
-                                        };
-                                        if effective_conf >= confidence_threshold {
-                                            neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
-                                        }
-                                    }
-                                }
-                                trondb_tql::EdgeDirection::Backward => {
-                                    let source_ids = self.adjacency.get_backward(node_id, &et.name);
-                                    for source_id in &source_ids {
-                                        let entries = self.adjacency.get(source_id, &et.name);
-                                        for entry in &entries {
-                                            if entry.to_id == *node_id {
-                                                // Apply temporal filter if present
-                                                if let Some(ref tc) = p.temporal {
-                                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
-                                                        continue;
-                                                    }
-                                                }
-                                                let effective_conf = if entry.created_at > 0 {
-                                                    let now_ms = SystemTime::now()
-                                                        .duration_since(UNIX_EPOCH)
-                                                        .unwrap()
-                                                        .as_millis() as u64;
-                                                    let elapsed = now_ms.saturating_sub(entry.created_at);
-                                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
-                                                } else {
-                                                    entry.confidence
-                                                };
-                                                if effective_conf >= confidence_threshold {
-                                                    neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                trondb_tql::EdgeDirection::Undirected => {
-                                    // Forward direction
-                                    let entries = self.adjacency.get(node_id, &et.name);
-                                    for entry in &entries {
-                                        // Apply temporal filter if present
-                                        if let Some(ref tc) = p.temporal {
-                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
-                                                continue;
-                                            }
-                                        }
-                                        let effective_conf = if entry.created_at > 0 {
-                                            let now_ms = SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_millis() as u64;
-                                            let elapsed = now_ms.saturating_sub(entry.created_at);
-                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
-                                        } else {
-                                            entry.confidence
-                                        };
-                                        if effective_conf >= confidence_threshold {
-                                            neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
-                                        }
-                                    }
-                                    // Backward direction
-                                    let source_ids = self.adjacency.get_backward(node_id, &et.name);
-                                    for source_id in &source_ids {
-                                        let entries = self.adjacency.get(source_id, &et.name);
-                                        for entry in &entries {
-                                            if entry.to_id == *node_id {
-                                                // Apply temporal filter if present
-                                                if let Some(ref tc) = p.temporal {
-                                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
-                                                        continue;
-                                                    }
-                                                }
-                                                let effective_conf = if entry.created_at > 0 {
-                                                    let now_ms = SystemTime::now()
-                                                        .duration_since(UNIX_EPOCH)
-                                                        .unwrap()
-                                                        .as_millis() as u64;
-                                                    let elapsed = now_ms.saturating_sub(entry.created_at);
-                                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
-                                                } else {
-                                                    entry.confidence
-                                                };
-                                                if effective_conf >= confidence_threshold {
-                                                    neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        for (neighbor_id, confidence, collection) in &neighbors {
-                            if visited.contains(neighbor_id) {
-                                continue;
-                            }
-                            visited.insert(neighbor_id.clone());
-
-                            if include_at_depth {
-                                if let Ok(entity) = self.store.get(collection, neighbor_id) {
-                                    let mut row = entity_to_row(&entity, &FieldList::All);
-                                    // Add _edge.confidence and _depth metadata
-                                    row.values.insert("_edge.confidence".into(), Value::Float(*confidence as f64));
-                                    if let Some(ref et_name) = edge_type_filter {
-                                        row.values.insert("_edge.type".into(), Value::String(et_name.clone()));
-                                    }
-                                    row.values.insert("_depth".into(), Value::Int((hop + 1) as i64));
-                                    rows.push(row);
-                                    if rows.len() >= limit {
-                                        break;
-                                    }
-                                }
-                            }
-                            next_frontier.push(neighbor_id.clone());
-                        }
-                        if rows.len() >= limit {
-                            break;
-                        }
-                    }
-
-                    frontier = next_frontier;
-                }
-
-                let scanned = rows.len();
-
-                Ok(QueryResult {
-                    columns: build_columns(&rows, &FieldList::All),
-                    rows,
-                    stats: QueryStats {
-                        elapsed: start.elapsed(),
-                        entities_scanned: scanned,
-                        mode: QueryMode::Deterministic,
-                        tier: "Ram".into(),
-                        cost: cost_estimate.clone(),
-                        warnings: opt_warnings.clone(),
-                    },
-                })
+                self.execute_traverse_match_plan(p).await
             }
 
             Plan::Backup(p) => {
@@ -3529,6 +3336,212 @@ impl Executor {
         }
 
         Ok(recomputed)
+    }
+
+    /// Execute a TraverseMatch sub-plan and return the result.
+    /// Used by both standalone TRAVERSE MATCH and SEARCH ... WITHIN.
+    pub async fn execute_traverse_match_plan(
+        &self,
+        p: &crate::planner::TraverseMatchPlan,
+    ) -> Result<QueryResult, EngineError> {
+        let start = std::time::Instant::now();
+        let cost_estimate: Option<crate::cost::AcuEstimate> = None;
+        let opt_warnings: Vec<crate::warning::PlanWarning> = Vec::new();
+
+        let max_depth = p.max_depth.min(10); // cap at 10
+        let min_depth = p.min_depth;
+        let confidence_threshold = p.confidence_threshold.unwrap_or(0.0) as f32;
+
+        let from_id = LogicalId::from_string(&p.from_id);
+        let mut visited: HashSet<LogicalId> = HashSet::new();
+        visited.insert(from_id.clone());
+
+        let mut frontier = vec![from_id];
+        let mut rows = Vec::new();
+        let limit = p.limit.unwrap_or(usize::MAX);
+
+        // Optional edge type filter from pattern
+        let edge_type_filter: Option<String> = p.pattern.edge.edge_type.clone();
+
+        for hop in 0..max_depth {
+            if frontier.is_empty() || rows.len() >= limit {
+                break;
+            }
+
+            let mut next_frontier = Vec::new();
+            let include_at_depth = hop + 1 >= min_depth;
+
+            for node_id in &frontier {
+                // Collect neighbor entries based on direction
+                // (to_id, confidence, collection)
+                let mut neighbors: Vec<(LogicalId, f32, String)> = Vec::new();
+
+                // Get edge types to check: filtered or all
+                let edge_types_to_check: Vec<EdgeType> = if let Some(ref et_name) = edge_type_filter {
+                    match self.store.get_edge_type(et_name) {
+                        Ok(et) => vec![et],
+                        Err(_) => vec![],
+                    }
+                } else {
+                    self.edge_types.iter().map(|e| e.value().clone()).collect()
+                };
+
+                for et in &edge_types_to_check {
+                    match p.pattern.edge.direction {
+                        trondb_tql::EdgeDirection::Forward => {
+                            let entries = self.adjacency.get(node_id, &et.name);
+                            for entry in &entries {
+                                // Apply temporal filter if present
+                                if let Some(ref tc) = p.temporal {
+                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                        continue;
+                                    }
+                                }
+                                let effective_conf = if entry.created_at > 0 {
+                                    let now_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64;
+                                    let elapsed = now_ms.saturating_sub(entry.created_at);
+                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                } else {
+                                    entry.confidence
+                                };
+                                if effective_conf >= confidence_threshold {
+                                    neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
+                                }
+                            }
+                        }
+                        trondb_tql::EdgeDirection::Backward => {
+                            let source_ids = self.adjacency.get_backward(node_id, &et.name);
+                            for source_id in &source_ids {
+                                let entries = self.adjacency.get(source_id, &et.name);
+                                for entry in &entries {
+                                    if entry.to_id == *node_id {
+                                        // Apply temporal filter if present
+                                        if let Some(ref tc) = p.temporal {
+                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                                continue;
+                                            }
+                                        }
+                                        let effective_conf = if entry.created_at > 0 {
+                                            let now_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_millis() as u64;
+                                            let elapsed = now_ms.saturating_sub(entry.created_at);
+                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                        } else {
+                                            entry.confidence
+                                        };
+                                        if effective_conf >= confidence_threshold {
+                                            neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        trondb_tql::EdgeDirection::Undirected => {
+                            // Forward direction
+                            let entries = self.adjacency.get(node_id, &et.name);
+                            for entry in &entries {
+                                // Apply temporal filter if present
+                                if let Some(ref tc) = p.temporal {
+                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                        continue;
+                                    }
+                                }
+                                let effective_conf = if entry.created_at > 0 {
+                                    let now_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64;
+                                    let elapsed = now_ms.saturating_sub(entry.created_at);
+                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                } else {
+                                    entry.confidence
+                                };
+                                if effective_conf >= confidence_threshold {
+                                    neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
+                                }
+                            }
+                            // Backward direction
+                            let source_ids = self.adjacency.get_backward(node_id, &et.name);
+                            for source_id in &source_ids {
+                                let entries = self.adjacency.get(source_id, &et.name);
+                                for entry in &entries {
+                                    if entry.to_id == *node_id {
+                                        // Apply temporal filter if present
+                                        if let Some(ref tc) = p.temporal {
+                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                                continue;
+                                            }
+                                        }
+                                        let effective_conf = if entry.created_at > 0 {
+                                            let now_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_millis() as u64;
+                                            let elapsed = now_ms.saturating_sub(entry.created_at);
+                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                        } else {
+                                            entry.confidence
+                                        };
+                                        if effective_conf >= confidence_threshold {
+                                            neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (neighbor_id, confidence, collection) in &neighbors {
+                    if visited.contains(neighbor_id) {
+                        continue;
+                    }
+                    visited.insert(neighbor_id.clone());
+
+                    if include_at_depth {
+                        if let Ok(entity) = self.store.get(collection, neighbor_id) {
+                            let mut row = entity_to_row(&entity, &FieldList::All);
+                            // Add _edge.confidence and _depth metadata
+                            row.values.insert("_edge.confidence".into(), Value::Float(*confidence as f64));
+                            if let Some(ref et_name) = edge_type_filter {
+                                row.values.insert("_edge.type".into(), Value::String(et_name.clone()));
+                            }
+                            row.values.insert("_depth".into(), Value::Int((hop + 1) as i64));
+                            rows.push(row);
+                            if rows.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    next_frontier.push(neighbor_id.clone());
+                }
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+
+            frontier = next_frontier;
+        }
+
+        let scanned = rows.len();
+
+        Ok(QueryResult {
+            columns: build_columns(&rows, &FieldList::All),
+            rows,
+            stats: QueryStats {
+                elapsed: start.elapsed(),
+                entities_scanned: scanned,
+                mode: QueryMode::Deterministic,
+                tier: "Ram".into(),
+                cost: cost_estimate,
+                warnings: opt_warnings,
+            },
+        })
     }
 }
 
