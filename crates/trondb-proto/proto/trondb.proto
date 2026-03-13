@@ -53,7 +53,52 @@ message PlanRequest {
         DropEdgeTypePlanProto drop_edge_type = 21;
         JoinPlanProto join = 22;
         TraverseMatchPlanProto traverse_match = 23;
+        UpsertPlanProto upsert = 24;
+        CheckpointPlanProto checkpoint = 25;
+        BackupPlanProto backup = 26;
+        RestorePlanProto restore = 27;
+        AlterCollectionPlanProto alter_collection = 28;
+        ImportPlanProto import_plan = 29;
     }
+}
+
+message UpsertPlanProto {
+    string collection = 1;
+    repeated string fields = 2;
+    repeated LiteralValue values = 3;
+    repeated NamedVector vectors = 4;
+}
+
+message CheckpointPlanProto {}
+
+message BackupPlanProto {
+    string path = 1;
+}
+
+message RestorePlanProto {
+    string path = 1;
+}
+
+message AlterCollectionPlanProto {
+    string collection = 1;
+    oneof operation {
+        RenameFieldOp rename_field = 2;
+        DropFieldOp drop_field = 3;
+    }
+}
+
+message RenameFieldOp {
+    string old_name = 1;
+    string new_name = 2;
+}
+
+message DropFieldOp {
+    string field_name = 1;
+}
+
+message ImportPlanProto {
+    string collection = 1;
+    string path = 2;
 }
 
 message CreateCollectionPlan {
