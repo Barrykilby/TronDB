@@ -755,6 +755,13 @@ impl Parser {
             None
         };
 
+        let order_by = if self.peek() == Some(&Token::Order) {
+            self.advance();
+            self.parse_order_by()?
+        } else {
+            vec![]
+        };
+
         let limit = if self.peek() == Some(&Token::Limit) {
             self.advance();
             Some(self.expect_int()? as usize)
@@ -767,9 +774,29 @@ impl Parser {
             collection,
             fields,
             filter,
-            order_by: vec![],
+            order_by,
             limit,
         }))
+    }
+
+    fn parse_order_by(&mut self) -> Result<Vec<OrderByClause>, ParseError> {
+        let mut clauses = Vec::new();
+        self.expect(&Token::By)?;
+        loop {
+            let field = self.expect_ident()?;
+            let direction = match self.peek() {
+                Some(Token::Asc) => { self.advance(); SortDirection::Asc }
+                Some(Token::Desc) => { self.advance(); SortDirection::Desc }
+                _ => SortDirection::Asc, // default
+            };
+            clauses.push(OrderByClause { field, direction });
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(clauses)
     }
 
     fn parse_search(&mut self) -> Result<Statement, ParseError> {
@@ -2059,6 +2086,71 @@ mod tests {
         match stmt {
             Statement::Fetch(f) => {
                 assert_eq!(f.filter, Some(WhereClause::Neq("status".into(), Literal::String("archived".into()))));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_order_by_asc() {
+        let stmt = parse("FETCH * FROM venues ORDER BY name ASC;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.order_by.len(), 1);
+                assert_eq!(f.order_by[0].field, "name");
+                assert_eq!(f.order_by[0].direction, SortDirection::Asc);
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_order_by_desc() {
+        let stmt = parse("FETCH * FROM venues ORDER BY created_at DESC LIMIT 20;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.order_by.len(), 1);
+                assert_eq!(f.order_by[0].field, "created_at");
+                assert_eq!(f.order_by[0].direction, SortDirection::Desc);
+                assert_eq!(f.limit, Some(20));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_order_by_default_asc() {
+        let stmt = parse("FETCH * FROM venues ORDER BY name;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.order_by[0].direction, SortDirection::Asc);
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_order_by_multiple() {
+        let stmt = parse("FETCH * FROM venues ORDER BY city ASC, name DESC;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.order_by.len(), 2);
+                assert_eq!(f.order_by[0].field, "city");
+                assert_eq!(f.order_by[1].field, "name");
+                assert_eq!(f.order_by[1].direction, SortDirection::Desc);
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_where_order_by() {
+        let stmt = parse("FETCH * FROM venues WHERE city = 'London' ORDER BY name LIMIT 5;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert!(f.filter.is_some());
+                assert_eq!(f.order_by.len(), 1);
+                assert_eq!(f.limit, Some(5));
             }
             _ => panic!("expected Fetch"),
         }
