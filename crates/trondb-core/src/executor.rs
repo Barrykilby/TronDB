@@ -7493,4 +7493,84 @@ mod tests {
         });
         assert!(has_warnings, "EXPLAIN should show warnings for deep TRAVERSE");
     }
+
+    // -----------------------------------------------------------------------
+    // Task 9 tests: End-to-end integration test for the cost model
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn end_to_end_cost_model_flow() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert entities
+        for i in 0..20 {
+            insert_entity(
+                &exec,
+                "venues",
+                &format!("v{i}"),
+                vec![("name", Literal::String(format!("Venue {i}")))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        // 1. FETCH with full scan -- should have cost
+        let fetch_plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        });
+        let result = exec.execute(&fetch_plan).await.unwrap();
+        assert!(result.stats.cost.is_some());
+        let cost = result.stats.cost.as_ref().unwrap();
+        assert!(cost.total_acu > 0.0);
+
+        // 2. SEARCH -- should have cost
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 5,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+            two_pass: None,
+        });
+        let result = exec.execute(&search_plan).await.unwrap();
+        assert!(result.stats.cost.is_some());
+
+        // 3. EXPLAIN shows cost breakdown
+        let explain_result = exec
+            .execute(&Plan::Explain(Box::new(search_plan.clone())))
+            .await
+            .unwrap();
+        let has_acu = explain_result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("estimated_acu".into())
+        });
+        assert!(has_acu);
+
+        // 4. MAX_ACU enforcement
+        let budget_plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![trondb_tql::QueryHint::MaxAcu(1.0)], // 1 ACU budget vs 20 * 0.5 = 10 ACU
+        });
+        let result = exec.execute(&budget_plan).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), EngineError::AcuBudgetExceeded { .. }));
+    }
 }
