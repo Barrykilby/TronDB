@@ -5477,6 +5477,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 2);
@@ -5560,6 +5561,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         })).await.unwrap();
 
         // Both entities should appear, d1 should rank higher (matches both dense and sparse)
@@ -5647,6 +5649,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         })).await.unwrap();
 
         // Only London entities should be returned
@@ -5674,6 +5677,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = exec
@@ -5755,6 +5759,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = exec
@@ -6369,6 +6374,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6398,6 +6404,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6583,6 +6590,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6612,6 +6620,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6647,6 +6656,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6774,6 +6784,7 @@ mod tests {
                 using_repr: Some("semantic".into()),
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6802,6 +6813,7 @@ mod tests {
                 using_repr: Some("semantic".into()),
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6878,6 +6890,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -10126,6 +10139,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = exec
@@ -10226,6 +10240,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = exec
@@ -10321,6 +10336,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
         let result = exec.execute(&search_plan).await.unwrap();
         assert!(result.stats.cost.is_some());

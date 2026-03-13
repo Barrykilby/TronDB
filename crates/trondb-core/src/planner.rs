@@ -128,6 +128,7 @@ pub struct SearchPlan {
     pub using_repr: Option<String>,
     pub hints: Vec<QueryHint>,
     pub two_pass: Option<TwoPassConfig>,
+    pub within: Option<Box<TraverseMatchPlan>>,
 }
 
 #[derive(Debug, Clone)]
@@ -485,6 +486,17 @@ pub fn plan(
                 using_repr: s.using_repr.clone(),
                 hints: s.hints.clone(),
                 two_pass,
+                within: s.within.as_ref().map(|w| {
+                    Box::new(TraverseMatchPlan {
+                        from_id: w.from_id.clone(),
+                        pattern: w.pattern.clone(),
+                        min_depth: w.min_depth,
+                        max_depth: w.max_depth,
+                        confidence_threshold: w.confidence_threshold,
+                        temporal: w.temporal.clone(),
+                        limit: w.limit,
+                    })
+                }),
             }))
         }
 
@@ -808,6 +820,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            within: None,
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -859,6 +872,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            within: None,
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -882,6 +896,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            within: None,
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -932,6 +947,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            within: None,
         });
         let p = plan(&stmt, &schemas).unwrap();
         match p {
@@ -976,6 +992,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            within: None,
         });
         let result = plan(&stmt, &schemas);
         assert!(result.is_err());
@@ -1113,6 +1130,7 @@ mod tests {
             query_text: Some("live jazz in Bristol".into()),
             using_repr: Some("semantic".into()),
             hints: vec![],
+            within: None,
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -1261,6 +1279,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![trondb_tql::QueryHint::NoPrefilter],
+            within: None,
         });
         let p = plan(&stmt, &schemas).unwrap();
         match p {
@@ -1306,6 +1325,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![trondb_tql::QueryHint::NoPrefilter],
+            within: None,
         });
         let p = plan(&stmt, &schemas).unwrap();
         match p {
@@ -1439,6 +1459,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
         let est = estimate_plan_cost(&plan, &provider, 1000);
         // HNSW search: 50.0 + fetch k results: 10 * 1.0 = 60.0 ACU
@@ -1465,6 +1486,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
         let est = estimate_plan_cost(&plan, &provider, 1000);
         // HNSW: 50 + pre_filter: 5 + fetch k: 10*1 = 65 ACU
@@ -1558,6 +1580,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            within: None,
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -1583,6 +1606,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            within: None,
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -1613,6 +1637,7 @@ mod tests {
                 first_pass_k: 300,
                 use_binary_first_pass: false,
             }),
+            within: None,
         });
         let est = estimate_plan_cost(&plan, &provider, 1000);
         // HNSW: 50 + two_pass_rescore: 15 + fetch k: 100*1.0 = 165 ACU
