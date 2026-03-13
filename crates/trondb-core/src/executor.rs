@@ -2470,6 +2470,12 @@ fn entity_matches(entity: &Entity, clause: &WhereClause) -> bool {
         }
         WhereClause::And(a, b) => entity_matches(entity, a) && entity_matches(entity, b),
         WhereClause::Or(a, b) => entity_matches(entity, a) || entity_matches(entity, b),
+        WhereClause::Neq(_, _) => false, // TODO: Task 3
+        WhereClause::Not(_) => false, // TODO: Task 3
+        WhereClause::IsNull(_) => false, // TODO: Task 3
+        WhereClause::IsNotNull(_) => false, // TODO: Task 3
+        WhereClause::In(_, _) => false, // TODO: Task 3
+        WhereClause::Like(_, _) => false, // TODO: Task 3
     }
 }
 

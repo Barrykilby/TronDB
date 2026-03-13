@@ -247,6 +247,15 @@ pub enum Token {
     #[token("ALL", priority = 10, ignore(ascii_case))]
     All,
 
+    #[token("NOT", priority = 10, ignore(ascii_case))]
+    Not,
+
+    #[token("IS", priority = 10, ignore(ascii_case))]
+    Is,
+
+    #[token("LIKE", priority = 10, ignore(ascii_case))]
+    Like,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
@@ -545,6 +554,46 @@ mod tests {
                 Token::Via,
             ]
         );
+    }
+
+    #[test]
+    fn lex_not_keyword() {
+        let tokens = lex("NOT");
+        assert_eq!(tokens, vec![Token::Not]);
+    }
+
+    #[test]
+    fn lex_is_keyword() {
+        let tokens = lex("IS");
+        assert_eq!(tokens, vec![Token::Is]);
+    }
+
+    #[test]
+    fn lex_like_keyword() {
+        let tokens = lex("LIKE");
+        assert_eq!(tokens, vec![Token::Like]);
+    }
+
+    #[test]
+    fn lex_advanced_where_full() {
+        let tokens = lex("WHERE NOT name IS NULL AND category IN ('a', 'b') OR name LIKE 'Jazz%'");
+        assert_eq!(tokens[0], Token::Where);
+        assert_eq!(tokens[1], Token::Not);
+        assert_eq!(tokens[2], Token::Ident("name".into()));
+        assert_eq!(tokens[3], Token::Is);
+        assert_eq!(tokens[4], Token::Null);
+        assert_eq!(tokens[5], Token::And);
+        assert_eq!(tokens[6], Token::Ident("category".into()));
+        assert_eq!(tokens[7], Token::In);
+        assert_eq!(tokens[8], Token::LParen);
+        assert_eq!(tokens[9], Token::StringLit("a".into()));
+        assert_eq!(tokens[10], Token::Comma);
+        assert_eq!(tokens[11], Token::StringLit("b".into()));
+        assert_eq!(tokens[12], Token::RParen);
+        assert_eq!(tokens[13], Token::Or);
+        assert_eq!(tokens[14], Token::Ident("name".into()));
+        assert_eq!(tokens[15], Token::Like);
+        assert_eq!(tokens[16], Token::StringLit("Jazz%".into()));
     }
 
     #[test]

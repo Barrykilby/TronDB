@@ -283,6 +283,12 @@ fn first_field_in_clause(clause: &WhereClause) -> String {
         WhereClause::Lte(field, _) => field.clone(),
         WhereClause::And(left, _) => first_field_in_clause(left),
         WhereClause::Or(left, _) => first_field_in_clause(left),
+        WhereClause::Neq(field, _) => field.clone(),
+        WhereClause::Not(inner) => first_field_in_clause(inner),
+        WhereClause::IsNull(field) => field.clone(),
+        WhereClause::IsNotNull(field) => field.clone(),
+        WhereClause::In(field, _) => field.clone(),
+        WhereClause::Like(field, _) => field.clone(),
     }
 }
 

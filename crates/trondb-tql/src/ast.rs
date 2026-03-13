@@ -137,12 +137,18 @@ pub enum FieldList {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WhereClause {
     Eq(String, Literal),
+    Neq(String, Literal),
     Gt(String, Literal),
     Lt(String, Literal),
     Gte(String, Literal),
     Lte(String, Literal),
     And(Box<WhereClause>, Box<WhereClause>),
     Or(Box<WhereClause>, Box<WhereClause>),
+    Not(Box<WhereClause>),
+    IsNull(String),
+    IsNotNull(String),
+    In(String, Vec<Literal>),
+    Like(String, String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

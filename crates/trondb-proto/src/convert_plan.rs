@@ -61,6 +61,15 @@ fn where_clause_to_proto(clause: &WhereClause) -> pb::WhereClauseProto {
             WhereClause::Lte(f, v) => Clause::Lte(make_cmp(f, v)),
             WhereClause::And(l, r) => Clause::And(Box::new(make_bin(l, r))),
             WhereClause::Or(l, r) => Clause::Or(Box::new(make_bin(l, r))),
+            // TODO: Task 13 — add proto definitions for these variants
+            WhereClause::Neq(f, v) => Clause::Eq(make_cmp(f, v)), // placeholder
+            WhereClause::Not(_)
+            | WhereClause::IsNull(_)
+            | WhereClause::IsNotNull(_)
+            | WhereClause::In(_, _)
+            | WhereClause::Like(_, _) => {
+                unimplemented!("proto serialisation for advanced WHERE clauses (Task 13)")
+            }
         }),
     }
 }
