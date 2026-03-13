@@ -2862,6 +2862,13 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             if let Some(limit) = p.limit {
                 props.push(("limit", limit.to_string()));
             }
+            if !p.hints.is_empty() {
+                let hints_str = p.hints.iter()
+                    .map(|h| format!("{:?}", h))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                props.push(("hints", hints_str));
+            }
         }
         Plan::Search(p) => {
             props.push(("mode", "Probabilistic".into()));
@@ -2879,6 +2886,13 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("confidence_threshold", p.confidence_threshold.to_string()));
             if let Some(pf) = &p.pre_filter {
                 props.push(("pre_filter", format!("ScalarPreFilter ({})", pf.index_name)));
+            }
+            if !p.hints.is_empty() {
+                let hints_str = p.hints.iter()
+                    .map(|h| format!("{:?}", h))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                props.push(("hints", hints_str));
             }
         }
         Plan::Insert(p) => {
@@ -3104,6 +3118,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -3150,6 +3165,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -3172,6 +3188,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         });
 
         let result = exec
@@ -3524,6 +3541,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 1);
@@ -3583,6 +3601,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 3); // scores 30, 40, 50
@@ -3650,6 +3669,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 2); // scores 40, 50 only
@@ -3717,6 +3737,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 3); // scores 20, 30, 40
@@ -3780,6 +3801,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 2); // scores 10, 20 only
@@ -3843,6 +3865,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 3); // scores 10, 20, 30
@@ -3902,6 +3925,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 3); // scores 30, 40, 50
@@ -3967,6 +3991,7 @@ mod tests {
             strategy: SearchStrategy::Sparse,
             query_text: None,
             using_repr: None,
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 2);
@@ -4044,6 +4069,7 @@ mod tests {
             strategy: SearchStrategy::Hybrid,
             query_text: None,
             using_repr: None,
+            hints: vec![],
         })).await.unwrap();
 
         // Both entities should appear, d1 should rank higher (matches both dense and sparse)
@@ -4123,6 +4149,7 @@ mod tests {
             strategy: SearchStrategy::Hnsw,
             query_text: None,
             using_repr: None,
+            hints: vec![],
         })).await.unwrap();
 
         // Only London entities should be returned
@@ -4148,6 +4175,7 @@ mod tests {
             strategy: SearchStrategy::Hnsw,
             query_text: None,
             using_repr: None,
+            hints: vec![],
         });
 
         let result = exec
@@ -4185,6 +4213,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+            hints: vec![],
         });
 
         let result = exec
@@ -4225,6 +4254,7 @@ mod tests {
             strategy: SearchStrategy::Hnsw,
             query_text: None,
             using_repr: None,
+            hints: vec![],
         });
 
         let result = exec
@@ -4238,6 +4268,44 @@ mod tests {
         assert_eq!(
             pf_row.values.get("value"),
             Some(&Value::String("ScalarPreFilter (idx_city)".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_shows_force_full_scan_hint() {
+        let (exec, _dir) = setup_executor().await;
+
+        let fetch_plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![trondb_tql::QueryHint::ForceFullScan],
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(fetch_plan)))
+            .await
+            .unwrap();
+
+        // Verify strategy is FullScan (forced by hint)
+        let strategy_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("strategy".into())))
+            .expect("should have 'strategy' property");
+        assert_eq!(
+            strategy_row.values.get("value"),
+            Some(&Value::String("FullScan".into()))
+        );
+
+        // Verify hints appear in EXPLAIN output
+        let hints_row = result.rows.iter()
+            .find(|r| r.values.get("property") == Some(&Value::String("hints".into())))
+            .expect("should have 'hints' property");
+        assert_eq!(
+            hints_row.values.get("value"),
+            Some(&Value::String("ForceFullScan".into()))
         );
     }
 
@@ -4632,6 +4700,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -4660,6 +4729,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -4780,6 +4850,7 @@ mod tests {
                 strategy: SearchStrategy::Hnsw,
                 query_text: None,
                 using_repr: None,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -4807,6 +4878,7 @@ mod tests {
                 strategy: SearchStrategy::Hnsw,
                 query_text: None,
                 using_repr: None,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -4869,6 +4941,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -4894,6 +4967,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -4978,6 +5052,7 @@ mod tests {
                 strategy: SearchStrategy::Hnsw,
                 query_text: None,
                 using_repr: None,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -5005,6 +5080,7 @@ mod tests {
                 strategy: SearchStrategy::Hnsw,
                 query_text: None,
                 using_repr: None,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -5038,6 +5114,7 @@ mod tests {
                 strategy: SearchStrategy::Hnsw,
                 query_text: None,
                 using_repr: None,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -5159,6 +5236,7 @@ mod tests {
                 strategy: SearchStrategy::NaturalLanguage,
                 query_text: Some("jazz".into()),
                 using_repr: Some("semantic".into()),
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -5185,6 +5263,7 @@ mod tests {
                 strategy: SearchStrategy::NaturalLanguage,
                 query_text: Some("rock".into()),
                 using_repr: Some("semantic".into()),
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -5257,6 +5336,7 @@ mod tests {
                 strategy: SearchStrategy::NaturalLanguage,
                 query_text: Some("jazz".into()),
                 using_repr: None,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -6552,6 +6632,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         })).await.unwrap();
         assert_eq!(result.rows.len(), 2);
     }
@@ -6570,6 +6651,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         })).await.unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values.get("id").unwrap(), &Value::String("v2".into()));
@@ -6589,6 +6671,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         })).await.unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values.get("id").unwrap(), &Value::String("v1".into()));
@@ -6612,6 +6695,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         })).await.unwrap();
         assert_eq!(result.rows.len(), 2);
     }
@@ -6631,6 +6715,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         })).await.unwrap();
         assert_eq!(result.rows.len(), 2);
     }
@@ -6651,6 +6736,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         })).await.unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values.get("id").unwrap(), &Value::String("v2".into()));
@@ -6674,6 +6760,7 @@ mod tests {
             }],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 3);
@@ -6700,6 +6787,7 @@ mod tests {
             }],
             limit: Some(2),
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 2);
@@ -6739,6 +6827,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
+                hints: vec![],
             }))
             .await
             .unwrap();
@@ -6767,6 +6856,7 @@ mod tests {
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
+                hints: vec![],
             }))
             .await;
         assert!(err.is_err());

@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use crate::edge::InferenceConfig;
 use crate::error::EngineError;
 use crate::types::CollectionSchema;
-use trondb_tql::{FieldList, Literal, OrderByClause, Statement, VectorLiteral, WhereClause};
+use trondb_tql::{FieldList, Literal, OrderByClause, QueryHint, Statement, VectorLiteral, WhereClause};
 
 // ---------------------------------------------------------------------------
 // Strategy enums
@@ -86,6 +86,7 @@ pub struct FetchPlan {
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<usize>,
     pub strategy: FetchStrategy,
+    pub hints: Vec<QueryHint>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,7 @@ pub struct SearchPlan {
     pub strategy: SearchStrategy,
     pub query_text: Option<String>,
     pub using_repr: Option<String>,
+    pub hints: Vec<QueryHint>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,7 +335,11 @@ pub fn plan(
 
         Statement::Fetch(s) => {
             let schema = schemas.get(&s.collection).map(|r| r.clone());
-            let strategy = select_fetch_strategy(&s.filter, schema.as_ref());
+            let strategy = if s.hints.contains(&QueryHint::ForceFullScan) {
+                FetchStrategy::FullScan
+            } else {
+                select_fetch_strategy(&s.filter, schema.as_ref())
+            };
 
             Ok(Plan::Fetch(FetchPlan {
                 collection: s.collection.clone(),
@@ -342,6 +348,7 @@ pub fn plan(
                 order_by: s.order_by.clone(),
                 limit: s.limit,
                 strategy,
+                hints: s.hints.clone(),
             }))
         }
 
@@ -362,7 +369,11 @@ pub fn plan(
             }
 
             let schema = schemas.get(&s.collection).map(|r| r.clone());
-            let pre_filter = select_pre_filter(&s.filter, schema.as_ref())?;
+            let pre_filter = if s.hints.contains(&QueryHint::NoPrefilter) {
+                None
+            } else {
+                select_pre_filter(&s.filter, schema.as_ref())?
+            };
 
             Ok(Plan::Search(SearchPlan {
                 collection: s.collection.clone(),
@@ -376,6 +387,7 @@ pub fn plan(
                 strategy,
                 query_text: s.query_text.clone(),
                 using_repr: s.using_repr.clone(),
+                hints: s.hints.clone(),
             }))
         }
 
@@ -877,6 +889,142 @@ mod tests {
                 assert_eq!(fp.strategy, FetchStrategy::FieldIndexRange("idx_score".into()));
             }
             _ => panic!("expected FetchPlan"),
+        }
+    }
+
+    #[test]
+    fn plan_fetch_force_full_scan_overrides_index() {
+        use crate::types::{Metric, StoredField, StoredIndex, StoredRepresentation, FieldType};
+
+        let schemas = DashMap::new();
+        schemas.insert("venues".into(), CollectionSchema {
+            name: "venues".into(),
+            representations: vec![StoredRepresentation {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: Metric::Cosine,
+                sparse: false,
+            fields: vec![],
+            }],
+            fields: vec![StoredField {
+                name: "city".into(),
+                field_type: FieldType::Text,
+            }],
+            indexes: vec![StoredIndex {
+                name: "idx_city".into(),
+                fields: vec!["city".into()],
+                partial_condition: None,
+            }],
+            vectoriser_config: None,
+        });
+
+        let stmt = Statement::Fetch(FetchStmt {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            order_by: vec![],
+            limit: None,
+            hints: vec![trondb_tql::QueryHint::ForceFullScan],
+        });
+        let p = plan(&stmt, &schemas).unwrap();
+        match p {
+            Plan::Fetch(fp) => {
+                assert_eq!(fp.strategy, FetchStrategy::FullScan);
+                assert_eq!(fp.hints, vec![trondb_tql::QueryHint::ForceFullScan]);
+            }
+            _ => panic!("expected FetchPlan"),
+        }
+    }
+
+    #[test]
+    fn plan_search_no_prefilter_suppresses_prefilter() {
+        use crate::types::{Metric, StoredField, StoredIndex, StoredRepresentation, FieldType};
+
+        let schemas = DashMap::new();
+        schemas.insert("venues".into(), CollectionSchema {
+            name: "venues".into(),
+            representations: vec![StoredRepresentation {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: Metric::Cosine,
+                sparse: false,
+            fields: vec![],
+            }],
+            fields: vec![StoredField {
+                name: "city".into(),
+                field_type: FieldType::Text,
+            }],
+            indexes: vec![StoredIndex {
+                name: "idx_city".into(),
+                fields: vec!["city".into()],
+                partial_condition: None,
+            }],
+            vectoriser_config: None,
+        });
+
+        let stmt = Statement::Search(SearchStmt {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            confidence: None,
+            limit: Some(10),
+            query_text: None,
+            using_repr: None,
+            hints: vec![trondb_tql::QueryHint::NoPrefilter],
+        });
+        let p = plan(&stmt, &schemas).unwrap();
+        match p {
+            Plan::Search(sp) => {
+                assert!(sp.pre_filter.is_none(), "NO_PREFILTER hint should suppress pre-filter");
+                assert_eq!(sp.hints, vec![trondb_tql::QueryHint::NoPrefilter]);
+            }
+            _ => panic!("expected SearchPlan"),
+        }
+    }
+
+    #[test]
+    fn plan_search_unindexed_with_no_prefilter_succeeds() {
+        use crate::types::{Metric, StoredRepresentation};
+
+        let schemas = DashMap::new();
+        schemas.insert("venues".into(), CollectionSchema {
+            name: "venues".into(),
+            representations: vec![StoredRepresentation {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: Metric::Cosine,
+                sparse: false,
+            fields: vec![],
+            }],
+            fields: vec![],
+            indexes: vec![],
+            vectoriser_config: None,
+        });
+
+        // Without the hint, this would fail with FieldNotIndexed
+        let stmt = Statement::Search(SearchStmt {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            confidence: None,
+            limit: Some(10),
+            query_text: None,
+            using_repr: None,
+            hints: vec![trondb_tql::QueryHint::NoPrefilter],
+        });
+        let p = plan(&stmt, &schemas).unwrap();
+        match p {
+            Plan::Search(sp) => {
+                assert!(sp.pre_filter.is_none());
+            }
+            _ => panic!("expected SearchPlan"),
         }
     }
 }

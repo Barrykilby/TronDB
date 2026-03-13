@@ -626,6 +626,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                 order_by: vec![],
                 limit: fp.limit.map(|l| l as usize),
                 strategy: proto_to_fetch_strategy(fp.strategy, &fp.strategy_index_name),
+                hints: vec![],
             })),
 
             PP::Search(sp) => {
@@ -660,6 +661,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     strategy: proto_to_search_strategy(sp.strategy),
                     query_text: sp.query_text,
                     using_repr: sp.using_repr,
+                    hints: vec![],
                 }))
             }
 
@@ -809,6 +811,7 @@ mod tests {
             order_by: vec![],
             limit: Some(10),
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         });
         let restored = round_trip(plan);
         match restored {
@@ -841,6 +844,7 @@ mod tests {
             strategy: SearchStrategy::Hybrid,
             query_text: None,
             using_repr: None,
+            hints: vec![],
         });
         let restored = round_trip(plan);
         match restored {
@@ -890,6 +894,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         });
         let plan = Plan::Explain(Box::new(inner));
         let restored = round_trip(plan);
@@ -934,6 +939,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+            hints: vec![],
         });
         let restored = round_trip(plan);
         match restored {
@@ -1144,6 +1150,7 @@ mod tests {
             strategy: SearchStrategy::Hnsw,
             query_text: None,
             using_repr: None,
+            hints: vec![],
         });
         let restored = round_trip(plan);
         match restored {
@@ -1188,6 +1195,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
+            hints: vec![],
         });
         let restored = round_trip(plan);
         match restored {

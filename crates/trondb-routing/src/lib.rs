@@ -103,6 +103,7 @@ mod tests {
             order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
+            hints: vec![],
         });
 
         // This should fail with an engine error (routed correctly, but collection doesn't exist)
@@ -140,6 +141,7 @@ mod tests {
             order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
+            hints: vec![],
         });
         let plan = trondb_core::planner::Plan::Explain(Box::new(inner));
 
@@ -189,6 +191,7 @@ mod tests {
             order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
+            hints: vec![],
         });
 
         // Execute to get a routing decision (will fail at engine level — that's fine)
@@ -235,6 +238,7 @@ mod tests {
             order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
+            hints: vec![],
         });
 
         let _ = router.route_and_execute(&plan).await;
@@ -280,6 +284,7 @@ mod tests {
             order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
+            hints: vec![],
         });
 
         let result = router.route_and_execute(&plan).await;

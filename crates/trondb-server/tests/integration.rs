@@ -123,6 +123,7 @@ async fn loopback_create_insert_fetch() {
         order_by: vec![],
         limit: Some(10),
         strategy: FetchStrategy::FullScan,
+        hints: vec![],
     });
     let fetch_result = remote.execute(&fetch_plan).await.unwrap();
     assert!(
