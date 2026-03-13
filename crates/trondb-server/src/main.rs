@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.apply_env_overrides();
 
     tracing::info!(node_id = %config.node_id, role = ?config.role, "starting trondb-server");
+    tracing::info!("OpenTelemetry tracing available via OTEL_EXPORTER_OTLP_ENDPOINT env");
 
     match config.role {
         config::NodeRoleConfig::Primary => start_primary(config).await?,
