@@ -293,6 +293,8 @@ impl Engine {
                         edge.confidence,
                         edge.created_at,
                         edge.source.clone(),
+                        edge.valid_from,
+                        edge.valid_to,
                     );
                 }
             }
