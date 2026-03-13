@@ -425,6 +425,15 @@ fn proto_to_hint(s: &str) -> Option<QueryHint> {
     }
 }
 
+fn proto_to_join_type(val: i32) -> trondb_tql::JoinType {
+    match val {
+        x if x == pb::JoinTypeProto::JoinTypeLeft as i32 => trondb_tql::JoinType::Left,
+        x if x == pb::JoinTypeProto::JoinTypeRight as i32 => trondb_tql::JoinType::Right,
+        x if x == pb::JoinTypeProto::JoinTypeFull as i32 => trondb_tql::JoinType::Full,
+        _ => trondb_tql::JoinType::Inner,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plan -> Proto
 // ---------------------------------------------------------------------------
@@ -611,6 +620,53 @@ impl From<&Plan> for pb::PlanRequest {
                 Plan::DropEdgeType(p) => PP::DropEdgeType(pb::DropEdgeTypePlanProto {
                     name: p.name.clone(),
                 }),
+
+                Plan::Join(p) => {
+                    let join_fields = match &p.fields {
+                        trondb_tql::JoinFieldList::All => pb::JoinFieldListProto {
+                            all: true,
+                            names: vec![],
+                        },
+                        trondb_tql::JoinFieldList::Named(qfs) => pb::JoinFieldListProto {
+                            all: false,
+                            names: qfs.iter().map(|qf| pb::QualifiedFieldProto {
+                                alias: qf.alias.clone(),
+                                field: qf.field.clone(),
+                            }).collect(),
+                        },
+                    };
+
+                    let joins = p.joins.iter().map(|j| pb::JoinClauseProto {
+                        join_type: match j.join_type {
+                            trondb_tql::JoinType::Inner => pb::JoinTypeProto::JoinTypeInner.into(),
+                            trondb_tql::JoinType::Left => pb::JoinTypeProto::JoinTypeLeft.into(),
+                            trondb_tql::JoinType::Right => pb::JoinTypeProto::JoinTypeRight.into(),
+                            trondb_tql::JoinType::Full => pb::JoinTypeProto::JoinTypeFull.into(),
+                        },
+                        collection: j.collection.clone(),
+                        alias: j.alias.clone(),
+                        on_left: Some(pb::QualifiedFieldProto {
+                            alias: j.on_left.alias.clone(),
+                            field: j.on_left.field.clone(),
+                        }),
+                        on_right: Some(pb::QualifiedFieldProto {
+                            alias: j.on_right.alias.clone(),
+                            field: j.on_right.field.clone(),
+                        }),
+                        confidence_threshold: j.confidence_threshold,
+                    }).collect();
+
+                    PP::Join(pb::JoinPlanProto {
+                        fields: Some(join_fields),
+                        from_collection: p.from_collection.clone(),
+                        from_alias: p.from_alias.clone(),
+                        joins,
+                        filter: p.filter.as_ref().map(where_clause_to_proto),
+                        order_by: p.order_by.iter().map(order_by_to_proto).collect(),
+                        limit: p.limit.map(|l| l as u64),
+                        hints: p.hints.iter().map(hint_to_proto).collect(),
+                    })
+                }
             }),
         }
     }
@@ -838,6 +894,50 @@ impl TryFrom<pb::PlanRequest> for Plan {
             PP::DropEdgeType(p) => Ok(Plan::DropEdgeType(DropEdgeTypePlan {
                 name: p.name,
             })),
+
+            PP::Join(p) => {
+                let fields_proto = p.fields.ok_or("missing join fields")?;
+                let fields = if fields_proto.all {
+                    trondb_tql::JoinFieldList::All
+                } else {
+                    trondb_tql::JoinFieldList::Named(
+                        fields_proto.names.iter().map(|qf| trondb_tql::QualifiedField {
+                            alias: qf.alias.clone(),
+                            field: qf.field.clone(),
+                        }).collect()
+                    )
+                };
+
+                let joins = p.joins.iter().map(|j| {
+                    let on_left = j.on_left.as_ref().ok_or("missing on_left")?;
+                    let on_right = j.on_right.as_ref().ok_or("missing on_right")?;
+                    Ok(trondb_tql::JoinClause {
+                        join_type: proto_to_join_type(j.join_type),
+                        collection: j.collection.clone(),
+                        alias: j.alias.clone(),
+                        on_left: trondb_tql::QualifiedField {
+                            alias: on_left.alias.clone(),
+                            field: on_left.field.clone(),
+                        },
+                        on_right: trondb_tql::QualifiedField {
+                            alias: on_right.alias.clone(),
+                            field: on_right.field.clone(),
+                        },
+                        confidence_threshold: j.confidence_threshold,
+                    })
+                }).collect::<Result<Vec<_>, String>>()?;
+
+                Ok(Plan::Join(JoinPlan {
+                    fields,
+                    from_collection: p.from_collection,
+                    from_alias: p.from_alias,
+                    joins,
+                    filter: p.filter.as_ref().map(proto_to_where_clause).transpose()?,
+                    order_by: p.order_by.iter().map(proto_to_order_by).collect(),
+                    limit: p.limit.map(|l| l as usize),
+                    hints: p.hints.iter().filter_map(|s| proto_to_hint(s)).collect(),
+                }))
+            }
         }
     }
 }
@@ -1526,6 +1626,99 @@ mod tests {
                 assert!(sp.hints.contains(&QueryHint::Timeout(5000)));
             }
             _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn round_trip_join() {
+        use trondb_tql::{JoinClause, JoinFieldList, JoinType, QualifiedField};
+
+        let plan = Plan::Join(JoinPlan {
+            fields: JoinFieldList::Named(vec![
+                QualifiedField { alias: "p".into(), field: "name".into() },
+                QualifiedField { alias: "v".into(), field: "address".into() },
+            ]),
+            from_collection: "people".into(),
+            from_alias: "p".into(),
+            joins: vec![JoinClause {
+                join_type: JoinType::Inner,
+                collection: "venues".into(),
+                alias: "v".into(),
+                on_left: QualifiedField { alias: "p".into(), field: "venue_id".into() },
+                on_right: QualifiedField { alias: "v".into(), field: "id".into() },
+                confidence_threshold: None,
+            }],
+            filter: Some(WhereClause::Eq("p.type".into(), Literal::String("event".into()))),
+            order_by: vec![OrderByClause {
+                field: "p.name".into(),
+                direction: SortDirection::Asc,
+            }],
+            limit: Some(10),
+            hints: vec![],
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Join(jp) => {
+                assert_eq!(jp.from_collection, "people");
+                assert_eq!(jp.from_alias, "p");
+                assert_eq!(jp.joins.len(), 1);
+                assert_eq!(jp.joins[0].join_type, JoinType::Inner);
+                assert_eq!(jp.joins[0].collection, "venues");
+                assert_eq!(jp.joins[0].alias, "v");
+                assert_eq!(jp.joins[0].on_left.alias, "p");
+                assert_eq!(jp.joins[0].on_left.field, "venue_id");
+                assert_eq!(jp.joins[0].on_right.alias, "v");
+                assert_eq!(jp.joins[0].on_right.field, "id");
+                assert!(jp.joins[0].confidence_threshold.is_none());
+                assert!(jp.filter.is_some());
+                assert_eq!(jp.order_by.len(), 1);
+                assert_eq!(jp.limit, Some(10));
+                match &jp.fields {
+                    JoinFieldList::Named(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].alias, "p");
+                        assert_eq!(fields[0].field, "name");
+                        assert_eq!(fields[1].alias, "v");
+                        assert_eq!(fields[1].field, "address");
+                    }
+                    _ => panic!("expected Named fields"),
+                }
+            }
+            _ => panic!("expected Join"),
+        }
+    }
+
+    #[test]
+    fn round_trip_join_all_fields() {
+        use trondb_tql::{JoinClause, JoinFieldList, JoinType, QualifiedField};
+
+        let plan = Plan::Join(JoinPlan {
+            fields: JoinFieldList::All,
+            from_collection: "entities".into(),
+            from_alias: "e".into(),
+            joins: vec![JoinClause {
+                join_type: JoinType::Left,
+                collection: "venues".into(),
+                alias: "v".into(),
+                on_left: QualifiedField { alias: "e".into(), field: "venue_id".into() },
+                on_right: QualifiedField { alias: "v".into(), field: "id".into() },
+                confidence_threshold: Some(0.75),
+            }],
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            hints: vec![],
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Join(jp) => {
+                assert_eq!(jp.fields, JoinFieldList::All);
+                assert_eq!(jp.joins[0].join_type, JoinType::Left);
+                assert_eq!(jp.joins[0].confidence_threshold, Some(0.75));
+                assert!(jp.filter.is_none());
+                assert!(jp.limit.is_none());
+            }
+            _ => panic!("expected Join"),
         }
     }
 }

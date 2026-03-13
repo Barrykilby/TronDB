@@ -51,6 +51,7 @@ message PlanRequest {
         ExplainHistoryPlanProto explain_history = 19;
         DropCollectionPlanProto drop_collection = 20;
         DropEdgeTypePlanProto drop_edge_type = 21;
+        JoinPlanProto join = 22;
     }
 }
 
@@ -188,6 +189,43 @@ message DropCollectionPlanProto {
 
 message DropEdgeTypePlanProto {
     string name = 1;
+}
+
+message QualifiedFieldProto {
+    string alias = 1;
+    string field = 2;
+}
+
+message JoinClauseProto {
+    JoinTypeProto join_type = 1;
+    string collection = 2;
+    string alias = 3;
+    QualifiedFieldProto on_left = 4;
+    QualifiedFieldProto on_right = 5;
+    optional double confidence_threshold = 6;
+}
+
+enum JoinTypeProto {
+    JOIN_TYPE_INNER = 0;
+    JOIN_TYPE_LEFT = 1;
+    JOIN_TYPE_RIGHT = 2;
+    JOIN_TYPE_FULL = 3;
+}
+
+message JoinFieldListProto {
+    bool all = 1;
+    repeated QualifiedFieldProto names = 2;
+}
+
+message JoinPlanProto {
+    JoinFieldListProto fields = 1;
+    string from_collection = 2;
+    string from_alias = 3;
+    repeated JoinClauseProto joins = 4;
+    optional WhereClauseProto filter = 5;
+    repeated OrderByClauseProto order_by = 6;
+    optional uint64 limit = 7;
+    repeated string hints = 8;
 }
 
 // ---------------------------------------------------------------------------
