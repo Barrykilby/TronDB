@@ -318,13 +318,8 @@ The HNSW graph topology is never modified under memory pressure. When a hot-tier
 | 12 | Query language completions (advanced WHERE, ORDER BY, DROP, query hints) | Done |
 | 12b | JOINs (structural + probabilistic) and TRAVERSE MATCH (Cypher-inspired pattern syntax) | Done |
 | 13 | Planner & cost model (ACU cost units, CostProvider, PlanWarning, 5 optimisation rules, two-pass strategy) | Done |
-
-### Planned (Phases 14-15)
-
-| Phase | Deliverable |
-|-------|-------------|
-| 14 | Bi-temporal model (valid time, transaction time, vector time) |
-| 15 | Operational excellence, security, performance review, advanced compression |
+| 14 | Bi-temporal model (valid time, transaction time, vector time, temporal queries) | Done |
+| 15 | Operational excellence (UPSERT, CHECKPOINT, metrics, slow query log, backup/restore, schema migration, bulk import, benchmarks) | Done |
 
 ---
 
@@ -396,6 +391,23 @@ SEARCH /*+ NO_PREFILTER */ venues NEAR 'jazz' LIMIT 10;
 -- Drop with cascading cleanup
 DROP COLLECTION venues;
 DROP EDGE TYPE 'performs_at';
+
+-- Temporal queries (Phase 14)
+INSERT INTO venues (id, name) VALUES ('v2', 'Jazz Cafe')
+    VALID FROM '2025-01-01T00:00:00Z' TO '2025-12-31T00:00:00Z';
+FETCH * FROM venues AS OF '2025-06-01T00:00:00Z' WHERE city = 'London';
+FETCH * FROM venues VALID DURING '2025-01-01'..'2025-06-30';
+FETCH * FROM venues AS OF TRANSACTION 42891;
+TRAVERSE FROM 'act1' MATCH (a)-[e:performs_at]->(b) DEPTH 1..3
+    AS OF '2025-06-01T00:00:00Z';
+
+-- Operational commands (Phase 15)
+INSERT OR UPDATE INTO venues (id, name) VALUES ('v1', 'Updated Name');
+CHECKPOINT;
+BACKUP TO '/backups/2025-06-01';
+ALTER COLLECTION venues RENAME FIELD city TO location;
+ALTER COLLECTION venues DROP FIELD old_field;
+IMPORT INTO venues FROM '/data/venues.jsonl';
 
 -- Explain any query (now includes ACU cost breakdown)
 EXPLAIN SEARCH venues NEAR VECTOR [0.1, 0.2, ...] LIMIT 10;
