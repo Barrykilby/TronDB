@@ -499,6 +499,63 @@ fn proto_to_two_pass_config(proto: &pb::TwoPassConfigProto) -> TwoPassConfig {
     }
 }
 
+fn traverse_match_plan_to_proto(p: &TraverseMatchPlan) -> pb::TraverseMatchPlanProto {
+    let direction = match p.pattern.edge.direction {
+        trondb_tql::EdgeDirection::Forward => pb::EdgeDirectionProto::EdgeDirectionForward,
+        trondb_tql::EdgeDirection::Backward => pb::EdgeDirectionProto::EdgeDirectionBackward,
+        trondb_tql::EdgeDirection::Undirected => pb::EdgeDirectionProto::EdgeDirectionUndirected,
+    };
+
+    let edge_pattern = pb::EdgePatternProto {
+        variable: p.pattern.edge.variable.clone(),
+        edge_type: p.pattern.edge.edge_type.clone(),
+        direction: direction.into(),
+    };
+
+    let pattern = pb::MatchPatternProto {
+        source_var: p.pattern.source_var.clone(),
+        edge: Some(edge_pattern),
+        target_var: p.pattern.target_var.clone(),
+    };
+
+    pb::TraverseMatchPlanProto {
+        from_id: p.from_id.clone(),
+        pattern: Some(pattern),
+        min_depth: p.min_depth as u64,
+        max_depth: p.max_depth as u64,
+        confidence_threshold: p.confidence_threshold,
+        limit: p.limit.map(|l| l as u64),
+        temporal: p.temporal.as_ref().map(temporal_clause_to_proto),
+    }
+}
+
+fn proto_to_traverse_match_plan(p: &pb::TraverseMatchPlanProto) -> Result<TraverseMatchPlan, String> {
+    let pattern_proto = p.pattern.as_ref().ok_or("missing pattern")?;
+    let edge_proto = pattern_proto.edge.as_ref().ok_or("missing edge pattern")?;
+
+    let direction = proto_to_edge_direction(edge_proto.direction);
+
+    let pattern = trondb_tql::MatchPattern {
+        source_var: pattern_proto.source_var.clone(),
+        edge: trondb_tql::EdgePattern {
+            variable: edge_proto.variable.clone(),
+            edge_type: edge_proto.edge_type.clone(),
+            direction,
+        },
+        target_var: pattern_proto.target_var.clone(),
+    };
+
+    Ok(TraverseMatchPlan {
+        from_id: p.from_id.clone(),
+        pattern,
+        min_depth: p.min_depth as usize,
+        max_depth: p.max_depth as usize,
+        confidence_threshold: p.confidence_threshold,
+        temporal: p.temporal.as_ref().map(proto_to_temporal_clause).transpose()?,
+        limit: p.limit.map(|l| l as usize),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Plan -> Proto
 // ---------------------------------------------------------------------------
@@ -578,6 +635,7 @@ impl From<&Plan> for pb::PlanRequest {
                     using_repr: sp.using_repr.clone(),
                     hints: sp.hints.iter().map(hint_to_proto).collect(),
                     two_pass: sp.two_pass.as_ref().map(two_pass_config_to_proto),
+                    within: sp.within.as_deref().map(traverse_match_plan_to_proto),
                 }),
 
                 Plan::Explain(inner) => PP::Explain(Box::new(pb::ExplainPlan {
@@ -740,33 +798,7 @@ impl From<&Plan> for pb::PlanRequest {
                 }
 
                 Plan::TraverseMatch(p) => {
-                    let direction = match p.pattern.edge.direction {
-                        trondb_tql::EdgeDirection::Forward => pb::EdgeDirectionProto::EdgeDirectionForward,
-                        trondb_tql::EdgeDirection::Backward => pb::EdgeDirectionProto::EdgeDirectionBackward,
-                        trondb_tql::EdgeDirection::Undirected => pb::EdgeDirectionProto::EdgeDirectionUndirected,
-                    };
-
-                    let edge_pattern = pb::EdgePatternProto {
-                        variable: p.pattern.edge.variable.clone(),
-                        edge_type: p.pattern.edge.edge_type.clone(),
-                        direction: direction.into(),
-                    };
-
-                    let pattern = pb::MatchPatternProto {
-                        source_var: p.pattern.source_var.clone(),
-                        edge: Some(edge_pattern),
-                        target_var: p.pattern.target_var.clone(),
-                    };
-
-                    PP::TraverseMatch(pb::TraverseMatchPlanProto {
-                        from_id: p.from_id.clone(),
-                        pattern: Some(pattern),
-                        min_depth: p.min_depth as u64,
-                        max_depth: p.max_depth as u64,
-                        confidence_threshold: p.confidence_threshold,
-                        limit: p.limit.map(|l| l as u64),
-                        temporal: p.temporal.as_ref().map(temporal_clause_to_proto),
-                    })
+                    PP::TraverseMatch(traverse_match_plan_to_proto(p))
                 }
 
                 Plan::Checkpoint(_) => {
@@ -941,7 +973,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     using_repr: sp.using_repr,
                     hints: sp.hints.iter().filter_map(|s| proto_to_hint(s)).collect(),
                     two_pass: sp.two_pass.as_ref().map(proto_to_two_pass_config),
-                    within: None, // TODO Task 5: wire WITHIN through proto
+                    within: sp.within.as_ref().map(proto_to_traverse_match_plan).transpose()?.map(Box::new),
                 }))
             }
 
@@ -1112,30 +1144,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
             }
 
             PP::TraverseMatch(p) => {
-                let pattern_proto = p.pattern.as_ref().ok_or("missing pattern")?;
-                let edge_proto = pattern_proto.edge.as_ref().ok_or("missing edge pattern")?;
-
-                let direction = proto_to_edge_direction(edge_proto.direction);
-
-                let pattern = trondb_tql::MatchPattern {
-                    source_var: pattern_proto.source_var.clone(),
-                    edge: trondb_tql::EdgePattern {
-                        variable: edge_proto.variable.clone(),
-                        edge_type: edge_proto.edge_type.clone(),
-                        direction,
-                    },
-                    target_var: pattern_proto.target_var.clone(),
-                };
-
-                Ok(Plan::TraverseMatch(TraverseMatchPlan {
-                    from_id: p.from_id.clone(),
-                    pattern,
-                    min_depth: p.min_depth as usize,
-                    max_depth: p.max_depth as usize,
-                    confidence_threshold: p.confidence_threshold,
-                    temporal: p.temporal.as_ref().map(proto_to_temporal_clause).transpose()?,
-                    limit: p.limit.map(|l| l as usize),
-                }))
+                Ok(Plan::TraverseMatch(proto_to_traverse_match_plan(&p)?))
             }
 
             PP::Checkpoint(_) => Ok(Plan::Checkpoint(CheckpointPlan)),
