@@ -71,7 +71,10 @@ async fn start_primary(config: config::ClusterConfig) -> Result<(), Box<dyn std:
     trondb_routing::startup::process_pending_wal_records(&engine, &pending_records, &affinity).await?;
 
     // Background task handles — add spawned tasks here as they are introduced.
-    let background_handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut background_handles: Vec<JoinHandle<()>> = Vec::new();
+
+    // Spawn Prometheus metrics endpoint on port 9401
+    background_handles.push(start_metrics_server(engine.clone(), 9401));
 
     let service = service::TronNodeService::new(engine.clone(), config.role);
     let addr = config.bind_addr.parse()?;
@@ -266,6 +269,36 @@ async fn start_router(config: config::ClusterConfig) -> Result<(), Box<dyn std::
         .await?;
 
     Ok(())
+}
+
+/// Spawn a lightweight TCP server that serves Prometheus metrics on the given port.
+///
+/// Responds to any TCP connection with an HTTP/1.1 200 response containing the
+/// Prometheus text exposition format from `EngineMetrics::render()`.
+fn start_metrics_server(engine: Arc<trondb_core::Engine>, port: u16) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let addr = format!("0.0.0.0:{port}");
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(port, %e, "failed to bind metrics server");
+                return;
+            }
+        };
+        tracing::info!(port, "metrics server listening");
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let metrics_body = engine.metrics().render();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    metrics_body.len(),
+                    metrics_body,
+                );
+                // Best-effort write — ignore errors from disconnected clients
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+            }
+        }
+    })
 }
 
 /// Register vectorisers for all existing collections that have a `VectoriserConfig`.
