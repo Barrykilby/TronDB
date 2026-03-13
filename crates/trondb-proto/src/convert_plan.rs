@@ -716,6 +716,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     query_text: sp.query_text,
                     using_repr: sp.using_repr,
                     hints: sp.hints.iter().filter_map(|s| proto_to_hint(s)).collect(),
+                    two_pass: None,
                 }))
             }
 
@@ -901,6 +902,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1207,6 +1209,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1517,6 +1520,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![QueryHint::NoPrefilter, QueryHint::Timeout(5000)],
+            two_pass: None,
         });
         let restored = round_trip(plan);
         match restored {

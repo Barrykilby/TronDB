@@ -841,7 +841,17 @@ impl Executor {
                             ))?;
                         let hnsw = self.indexes.get(&hnsw_key).unwrap();
                         let query_f32: Vec<f32> = query.iter().map(|x| *x as f32).collect();
-                        let mut raw = hnsw.search(&query_f32, fetch_k);
+                        let mut raw = if let Some(ref tp) = p.two_pass {
+                            // Two-pass: over-fetch in first pass, then rescore.
+                            // Phase 13: both passes use the same HNSW index.
+                            // Future: first pass uses Int8/Binary index, second pass rescores.
+                            let first_pass = hnsw.search(&query_f32, tp.first_pass_k);
+                            let mut rescored = first_pass;
+                            rescored.truncate(p.k);
+                            rescored
+                        } else {
+                            hnsw.search(&query_f32, fetch_k)
+                        };
                         // Confidence threshold only for HNSW (cosine similarity is meaningful)
                         if p.confidence_threshold > 0.0 {
                             raw.retain(|(_, score)| (*score as f64) >= p.confidence_threshold);
@@ -944,7 +954,14 @@ impl Executor {
                                 "no HNSW index for {}", hnsw_key
                             )))?;
 
-                        let mut raw = hnsw.search(&query_f32, fetch_k);
+                        let mut raw = if let Some(ref tp) = p.two_pass {
+                            let first_pass = hnsw.search(&query_f32, tp.first_pass_k);
+                            let mut rescored = first_pass;
+                            rescored.truncate(p.k);
+                            rescored
+                        } else {
+                            hnsw.search(&query_f32, fetch_k)
+                        };
                         if p.confidence_threshold > 0.0 {
                             raw.retain(|(_, score)| (*score as f64) >= p.confidence_threshold);
                         }
@@ -3008,6 +3025,9 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             if let Some(pf) = &p.pre_filter {
                 props.push(("pre_filter", format!("ScalarPreFilter ({})", pf.index_name)));
             }
+            if let Some(ref tp) = p.two_pass {
+                props.push(("two_pass", format!("first_pass_k={}, binary={}", tp.first_pass_k, tp.use_binary_first_pass)));
+            }
             if !p.hints.is_empty() {
                 let hints_str = p.hints.iter()
                     .map(|h| format!("{:?}", h))
@@ -4113,6 +4133,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 2);
@@ -4191,6 +4212,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         })).await.unwrap();
 
         // Both entities should appear, d1 should rank higher (matches both dense and sparse)
@@ -4271,6 +4293,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         })).await.unwrap();
 
         // Only London entities should be returned
@@ -4297,6 +4320,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = exec
@@ -4376,6 +4400,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = exec
@@ -4972,6 +4997,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5000,6 +5026,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5174,6 +5201,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5202,6 +5230,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5236,6 +5265,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5358,6 +5388,7 @@ mod tests {
                 query_text: Some("jazz".into()),
                 using_repr: Some("semantic".into()),
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5385,6 +5416,7 @@ mod tests {
                 query_text: Some("rock".into()),
                 using_repr: Some("semantic".into()),
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5458,6 +5490,7 @@ mod tests {
                 query_text: Some("jazz".into()),
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -7267,6 +7300,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = exec

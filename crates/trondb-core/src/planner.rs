@@ -89,6 +89,19 @@ pub struct FetchPlan {
     pub hints: Vec<QueryHint>,
 }
 
+/// Configuration for two-pass search strategy.
+/// First pass: fast shortlisting with quantised vectors.
+/// Second pass: rescore survivors with full-precision vectors.
+#[derive(Debug, Clone)]
+pub struct TwoPassConfig {
+    /// Number of candidates to shortlist in the first pass.
+    /// Typically 3-5x the final k.
+    pub first_pass_k: usize,
+    /// Whether to use binary quantised vectors for the first pass.
+    /// false = Int8 quantised, true = binary quantised.
+    pub use_binary_first_pass: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchPlan {
     pub collection: String,
@@ -103,6 +116,7 @@ pub struct SearchPlan {
     pub query_text: Option<String>,
     pub using_repr: Option<String>,
     pub hints: Vec<QueryHint>,
+    pub two_pass: Option<TwoPassConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +389,16 @@ pub fn plan(
                 select_pre_filter(&s.filter, schema.as_ref())?
             };
 
+            let k = s.limit.unwrap_or(10);
+            let two_pass = if k >= 50 {
+                Some(TwoPassConfig {
+                    first_pass_k: k * 3,
+                    use_binary_first_pass: false, // Int8 by default
+                })
+            } else {
+                None
+            };
+
             Ok(Plan::Search(SearchPlan {
                 collection: s.collection.clone(),
                 fields: s.fields.clone(),
@@ -382,12 +406,13 @@ pub fn plan(
                 sparse_vector: s.sparse_vector.clone(),
                 filter: s.filter.clone(),
                 pre_filter,
-                k: s.limit.unwrap_or(10),
+                k,
                 confidence_threshold: s.confidence.unwrap_or(0.0),
                 strategy,
                 query_text: s.query_text.clone(),
                 using_repr: s.using_repr.clone(),
                 hints: s.hints.clone(),
+                two_pass,
             }))
         }
 
@@ -539,6 +564,9 @@ pub fn estimate_plan_cost(
             }
             if p.pre_filter.is_some() {
                 est.add("pre_filter", 1, cost.pre_filter_acu());
+            }
+            if p.two_pass.is_some() {
+                est.add("two_pass_rescore", 1, cost.two_pass_rescore_acu());
             }
             // Post-search: fetching k result entities from hot tier
             est.add("fetch_hot", p.k, cost.fetch_hot_acu());
@@ -1182,6 +1210,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
         let est = estimate_plan_cost(&plan, &provider, 1000);
         // HNSW search: 50.0 + fetch k results: 10 * 1.0 = 60.0 ACU
@@ -1207,6 +1236,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
         let est = estimate_plan_cost(&plan, &provider, 1000);
         // HNSW: 50 + pre_filter: 5 + fetch k: 10*1 = 65 ACU
@@ -1281,5 +1311,79 @@ mod tests {
         });
         let est = estimate_plan_cost(&plan, &provider, 0);
         assert!((est.total_acu - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn two_pass_selected_for_large_k() {
+        let stmt = Statement::Search(SearchStmt {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            confidence: None,
+            limit: Some(100),
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+        });
+        let p = plan(&stmt, &empty_schemas()).unwrap();
+        match p {
+            Plan::Search(sp) => {
+                assert!(sp.two_pass.is_some(), "two-pass should be selected for k=100");
+                let tp = sp.two_pass.unwrap();
+                assert_eq!(tp.first_pass_k, 300);
+            }
+            _ => panic!("expected SearchPlan"),
+        }
+    }
+
+    #[test]
+    fn two_pass_not_selected_for_small_k() {
+        let stmt = Statement::Search(SearchStmt {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            confidence: None,
+            limit: Some(10),
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+        });
+        let p = plan(&stmt, &empty_schemas()).unwrap();
+        match p {
+            Plan::Search(sp) => {
+                assert!(sp.two_pass.is_none(), "two-pass should NOT be selected for k=10");
+            }
+            _ => panic!("expected SearchPlan"),
+        }
+    }
+
+    #[test]
+    fn two_pass_adds_rescore_cost() {
+        let provider = ConstantCostProvider;
+        let plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 100,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+            two_pass: Some(TwoPassConfig {
+                first_pass_k: 300,
+                use_binary_first_pass: false,
+            }),
+        });
+        let est = estimate_plan_cost(&plan, &provider, 1000);
+        // HNSW: 50 + two_pass_rescore: 15 + fetch k: 100*1.0 = 165 ACU
+        assert!((est.total_acu - 165.0).abs() < f64::EPSILON);
     }
 }

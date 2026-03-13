@@ -7,7 +7,7 @@
 // plus any PlanWarnings generated.
 
 use crate::cost::CostProvider;
-use crate::planner::{Plan, SearchPlan, SearchStrategy, FetchPlan, FetchStrategy, TraversePlan};
+use crate::planner::Plan;
 use crate::warning::PlanWarning;
 use trondb_tql::QueryHint;
 
@@ -230,7 +230,7 @@ fn apply_batched_fetch_after_search(
 mod tests {
     use super::*;
     use crate::cost::ConstantCostProvider;
-    use crate::planner::PreFilter;
+    use crate::planner::{FetchPlan, FetchStrategy, PreFilter, SearchPlan, SearchStrategy, TraversePlan};
     use trondb_tql::{FieldList, Literal, WhereClause};
 
     fn default_config() -> OptimiserConfig {
@@ -263,6 +263,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = apply_rules(plan, &default_config(), &cost, 10_000);
@@ -290,6 +291,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = apply_rules(plan, &default_config(), &cost, 10_000);
@@ -314,6 +316,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = apply_rules(plan, &default_config(), &cost, 100);
@@ -383,6 +386,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = apply_rules(plan, &default_config(), &cost, 100);
@@ -412,6 +416,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = apply_rules(plan, &config, &cost, 10_000);
