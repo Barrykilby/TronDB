@@ -478,6 +478,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: Some(5),
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
@@ -525,6 +526,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: None,
         })));
         let p = plan(&stmt, &empty_schemas()).unwrap();
@@ -702,6 +704,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            order_by: vec![],
             limit: Some(10),
         });
         let p = plan(&stmt, &schemas).unwrap();
@@ -745,6 +748,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Gt("score".into(), Literal::Int(50))),
+            order_by: vec![],
             limit: None,
         });
         let p = plan(&stmt, &schemas).unwrap();
@@ -832,6 +836,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Gte("score".into(), Literal::Int(80))),
+            order_by: vec![],
             limit: None,
         });
         let p = plan(&stmt, &schemas).unwrap();

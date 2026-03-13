@@ -101,13 +101,28 @@ pub enum VectorLiteral {
     Sparse(Vec<(u32, f32)>),
 }
 
-// --- FETCH (unchanged) ---
+// --- ORDER BY ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderByClause {
+    pub field: String,
+    pub direction: SortDirection,
+}
+
+// --- FETCH ---
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchStmt {
     pub collection: String,
     pub fields: FieldList,
     pub filter: Option<WhereClause>,
+    pub order_by: Vec<OrderByClause>,
     pub limit: Option<usize>,
 }
 

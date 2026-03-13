@@ -256,6 +256,18 @@ pub enum Token {
     #[token("LIKE", priority = 10, ignore(ascii_case))]
     Like,
 
+    #[token("ORDER", priority = 10, ignore(ascii_case))]
+    Order,
+
+    #[token("BY", priority = 10, ignore(ascii_case))]
+    By,
+
+    #[token("ASC", priority = 10, ignore(ascii_case))]
+    Asc,
+
+    #[token("DESC", priority = 10, ignore(ascii_case))]
+    Desc,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
@@ -608,5 +620,22 @@ mod tests {
         assert_eq!(lex("via"), vec![Token::Via]);
         assert_eq!(lex("TYPE"), vec![Token::Type]);
         assert_eq!(lex("All"), vec![Token::All]);
+    }
+
+    #[test]
+    fn lex_order_by_keywords() {
+        let tokens = lex("ORDER BY name ASC LIMIT 10");
+        assert_eq!(tokens[0], Token::Order);
+        assert_eq!(tokens[1], Token::By);
+        assert_eq!(tokens[2], Token::Ident("name".into()));
+        assert_eq!(tokens[3], Token::Asc);
+        assert_eq!(tokens[4], Token::Limit);
+        assert_eq!(tokens[5], Token::IntLit(10));
+    }
+
+    #[test]
+    fn lex_desc_keyword() {
+        let tokens = lex("DESC");
+        assert_eq!(tokens, vec![Token::Desc]);
     }
 }
