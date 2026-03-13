@@ -874,7 +874,14 @@ impl Executor {
                     }
                     FetchStrategy::FullScan => {
                         // Read directly from Fjall — no WAL involvement
-                        let entities = self.store.scan(&p.collection)?;
+                        // Optimisation: when there is no filter, no temporal clause,
+                        // and no ORDER BY, we can stop scanning early if a LIMIT
+                        // is present, avoiding loading the entire collection.
+                        let entities = if p.filter.is_none() && p.temporal.is_none() && p.order_by.is_empty() && p.limit.is_some() {
+                            self.store.scan_with_limit(&p.collection, p.limit)?
+                        } else {
+                            self.store.scan(&p.collection)?
+                        };
                         let scanned = entities.len();
 
                         let filtered: Vec<&Entity> = entities
@@ -2349,6 +2356,27 @@ impl Executor {
                     alias_to_collection.insert(join.alias.clone(), join.collection.clone());
                 }
 
+                // Pre-scan right collections ONCE and build lookup tables
+                // keyed on the join field value for O(1) lookups per left entity.
+                let mut right_lookup_tables: HashMap<String, HashMap<String, Vec<Entity>>> = HashMap::new();
+                for join in &p.joins {
+                    if join.confidence_threshold.is_none() && join.on_right.field != "id" {
+                        let right_entities = self.store.scan(&join.collection)?;
+                        let mut lookup: HashMap<String, Vec<Entity>> = HashMap::new();
+                        for ent in right_entities {
+                            let key_val = ent.metadata.get(&join.on_right.field)
+                                .and_then(|v| match v {
+                                    Value::String(s) => Some(s.clone()),
+                                    _ => None,
+                                });
+                            if let Some(k) = key_val {
+                                lookup.entry(k).or_default().push(ent);
+                            }
+                        }
+                        right_lookup_tables.insert(join.alias.clone(), lookup);
+                    }
+                }
+
                 // Fetch all entities from the left (FROM) collection
                 let left_entities: Vec<Entity> = self.store
                     .scan(&p.from_collection)?;
@@ -2412,22 +2440,11 @@ impl Executor {
                                         self.store.get(&join.collection, &LogicalId::from_string(id_str))
                                             .ok().map(|e| (e, 1.0f32))
                                     } else {
-                                        // Need to scan right collection for matching field value
-                                        let mut found = None;
-                                        if let Ok(right_entities) = self.store.scan(&join.collection) {
-                                            for right_ent in right_entities {
-                                                let right_val = if join.on_right.field == "id" {
-                                                    Some(Value::String(right_ent.id.to_string()))
-                                                } else {
-                                                    right_ent.metadata.get(&join.on_right.field).cloned()
-                                                };
-                                                if right_val.as_ref() == left_field_val.as_ref() {
-                                                    found = Some((right_ent, 1.0f32));
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        found
+                                        // Use pre-built lookup table for O(1) field-value matching
+                                        right_lookup_tables.get(&join.alias)
+                                            .and_then(|lookup| lookup.get(id_str))
+                                            .and_then(|matches| matches.first())
+                                            .map(|ent| (ent.clone(), 1.0f32))
                                     }
                                 }
                             }
@@ -3766,6 +3783,11 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 fn parse_temporal_timestamp(s: &str) -> Result<i64, EngineError> {
     // Try parsing as integer millis first
     if let Ok(ms) = s.parse::<i64>() {
+        if ms < -62167219200000 || ms > 253402300799999 {
+            return Err(EngineError::InvalidQuery(format!(
+                "temporal timestamp out of range (years 0-9999): '{}'", s
+            )));
+        }
         return Ok(ms);
     }
 
@@ -3780,7 +3802,13 @@ fn parse_temporal_timestamp(s: &str) -> Result<i64, EngineError> {
             ) {
                 let days = days_from_civil(y, m, d);
                 let secs = days * 86400 + (hh as i64) * 3600 + (mm as i64) * 60 + (ss as i64);
-                return Ok(secs * 1000);
+                let millis_val = secs * 1000;
+                if millis_val < -62167219200000 || millis_val > 253402300799999 {
+                    return Err(EngineError::InvalidQuery(format!(
+                        "temporal timestamp out of range (years 0-9999): '{}'", s
+                    )));
+                }
+                return Ok(millis_val);
             }
         }
     }
@@ -3793,7 +3821,13 @@ fn parse_temporal_timestamp(s: &str) -> Result<i64, EngineError> {
                 parts[0].parse::<i64>(), parts[1].parse::<u32>(), parts[2].parse::<u32>(),
             ) {
                 let days = days_from_civil(y, m, d);
-                return Ok(days * 86400 * 1000);
+                let millis_val = days * 86400 * 1000;
+                if millis_val < -62167219200000 || millis_val > 253402300799999 {
+                    return Err(EngineError::InvalidQuery(format!(
+                        "temporal timestamp out of range (years 0-9999): '{}'", s
+                    )));
+                }
+                return Ok(millis_val);
             }
         }
     }
@@ -10275,6 +10309,11 @@ mod tests {
     fn test_parse_temporal_millis_string() {
         let ms = parse_temporal_timestamp("1735689600000").unwrap();
         assert_eq!(ms, 1735689600000);
+    }
+
+    #[test]
+    fn parse_temporal_timestamp_rejects_extreme_year() {
+        assert!(parse_temporal_timestamp("99999-01-01").is_err());
     }
 
     #[test]

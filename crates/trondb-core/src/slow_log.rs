@@ -101,6 +101,9 @@ impl SlowQueryLog {
     }
 
     /// Return all entries currently in the log.
+    ///
+    /// **Note:** This clones the entire ring buffer under the mutex.
+    /// Suitable for infrequent admin/diagnostic calls; avoid on hot paths.
     pub fn entries(&self) -> Vec<SlowQueryEntry> {
         self.entries.lock().unwrap().iter().cloned().collect()
     }
