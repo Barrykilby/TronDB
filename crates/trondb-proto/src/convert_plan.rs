@@ -720,6 +720,14 @@ impl From<&Plan> for pb::PlanRequest {
                     })
                 }
 
+                // CHECKPOINT is a no-op over the wire — it only makes sense locally.
+                // Transport as a dummy explain (the receiver should reject or ignore).
+                Plan::Checkpoint(_) => {
+                    PP::Explain(Box::new(pb::ExplainPlan {
+                        inner: None,
+                    }))
+                }
+
                 // UPSERT is transported as INSERT over the wire —
                 // the executor treats them identically.
                 Plan::Upsert(p) => {
