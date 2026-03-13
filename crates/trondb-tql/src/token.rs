@@ -49,6 +49,9 @@ pub enum Token {
     #[token("WITH", priority = 10, ignore(ascii_case))]
     With,
 
+    #[token("WITHIN", priority = 10, ignore(ascii_case))]
+    Within,
+
     #[token("DIMENSIONS", priority = 10, ignore(ascii_case))]
     Dimensions,
 
