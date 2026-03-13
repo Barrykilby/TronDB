@@ -27,6 +27,62 @@ TronDB is more like a brain that has read every file in the cabinet and formed o
 
 Both are first-class. You can query either, filter by confidence threshold, and ask TronDB to show its working. The probabilistic layer only activates when you ask for it.
 
+## What TronDB Is (Today)
+
+TronDB is an inference-first storage engine: vector + graph + confidence/decay + explainable planning.
+
+It is not trying to be a general-purpose relational OLTP database or an OLAP analytics engine. The boundaries below are intentional scope choices, not permanent limitations.
+
+> **The gap TronDB occupies:** Existing vector databases treat vectors as the retrieval primitive. Existing graph databases treat edges as the retrieval primitive. TronDB treats inferred relationships — probabilistic, durable, decaying, explainable — as the retrieval primitive. No production system currently combines all of: typed durable edges, confidence lifecycle (decay/reinforcement/promotion), vector-native planning, and explicit inference provenance in a single engine.
+
+---
+
+### System Comparison
+
+| System | What it's great at | Where TronDB overlaps | What TronDB (currently) does not try to be |
+|--------|-------------------|----------------------|---------------------------------------------|
+| **TronDB** | Entity storage + semantic search (dense + sparse + hybrid), typed edges, confidence/decay lifecycle, tiered storage, explainable inference plans | N/A | Not a full SQL RDBMS; not an OLAP engine; not a pure vector index; not a managed cloud service |
+| **Postgres + pgvector** | OLTP system-of-record: transactions, constraints, joins, full SQL ecosystem, mature tooling | Structured field storage + filtered retrieval; vector similarity as an add-on via pgvector | TronDB is not targeting the full relational feature set (joins, constraints, schemas-as-truth) as its core value. pgvector is bolted on; TronDB's vector layer is foundational. |
+| **DuckDB** | Fast local analytics (OLAP): columnar scans, aggregations, Parquet/Arrow workflows, SQL-everything | Some query planner concepts | TronDB is not optimised for large analytical scans or aggregations. It is retrieval and inference oriented, not scan oriented. |
+| **Elasticsearch / OpenSearch** | Search-engine workloads: inverted index ranking, hybrid lexical + semantic retrieval, distributed search ops, document indexing at scale | Hybrid retrieval (dense + sparse) and explainability concepts | TronDB is not a document search engine. Its primary abstraction is typed entities and durable edges with WAL replication — not document indexing and relevance ranking. |
+| **Pinecone** | Managed vector similarity search at scale with metadata filtering, minimal operational overhead | Approximate nearest-neighbour semantic retrieval | TronDB is not API-only managed vector infrastructure. It targets native inference and graph semantics inside the storage engine, not vector retrieval as the product. |
+| **Qdrant / Milvus** | Self-hosted vector DBs for high-throughput ANN search with payload filtering and collections | Vector search + field filtering | TronDB does not focus solely on vector retrieval. It treats edges, confidence lifecycle, and inference as first-class concerns — not payload attributes on a vector record. |
+| **Weaviate** | App-facing vector DB with schema, optional built-in vectorisation modules, and GraphQL interface | Schema + vectors; some representation overlap | The meaningful distinction: Weaviate's inference is query-time only. TronDB persists inferred relationships as durable first-class edges with their own lifecycle — decay, reinforcement, promotion, pruning. That architectural difference is fundamental. |
+| **Neo4j** | Property-graph DB: deep traversals, graph algorithms, Cypher query ecosystem, graph analytics | Typed edges + traversal | TronDB is not primarily a graph analytics platform. It does not have Cypher, graph algorithm libraries, or analytical graph processing. Its graph layer exists in service of probabilistic inference, not as the product itself. |
+| **TigerGraph** | High-performance graph analytics: multi-hop traversal at scale, GSQL pattern matching, graph ML pipelines, complex connected-data reasoning | Multi-hop traversal concepts; inference over connected data | TigerGraph is the most direct comparison on the reasoning side. The difference: TigerGraph's edges are deterministic facts. TronDB's inferred edges are probabilistic, durable, and have a confidence lifecycle. TigerGraph scales graph algorithms; TronDB scales inferred relationship management. |
+| **Vespa** | Combined vector + structured + ranking in one engine: ANN + BM25 + learning-to-rank + real-time updates at scale | Hybrid retrieval (dense + lexical); field filtering before vector search; real-time indexing | Vespa is the closest existing system in retrieval architecture. The gap: Vespa has no graph layer, no typed edges, no confidence/decay lifecycle, and no inference provenance. It is a retrieval engine; TronDB is a storage engine with inference semantics. |
+| **TerminusDB / Stardog** | Knowledge graph + semantic reasoning: RDF/OWL ontologies, SPARQL, formal logical inference, schema-level constraints | Knowledge graph concepts; typed relationships; reasoning over connected data | TronDB does not do formal logical inference (OWL, description logic, SPARQL). Its inference is probabilistic and vector-driven, not rule-driven ontological reasoning. Different philosophical model. |
+| **LanceDB** | Embedded vector DB with columnar storage (Lance format), tiered storage concepts, serverless-friendly design | Tiered storage architecture; vector + field indexing | LanceDB is an embedded library oriented around ANN retrieval. TronDB is a server-side storage engine with WAL replication, typed edges, and an inference lifecycle. Different deployment model and abstraction level. |
+| **FAISS** | In-process ANN search library: maximum control over indexing strategy, GPU acceleration, research-grade ANN algorithms | ANN indexing concepts | TronDB is a database with durability, WAL, replication, and a query planner — not a library you embed and build everything around. Different abstraction level entirely. |
+| **Redis + vector search** | Low-latency cache with simple secondary indexes and basic vector search via RediSearch/Redis Stack | Fast retrieval patterns; field filtering | TronDB is not primarily a cache. It is durable storage with tiering, replication semantics, and inference lifecycle — not ephemeral hot data in front of a real database. |
+
+---
+
+### What Makes TronDB Architecturally Distinct
+
+Across all comparisons, four properties distinguish TronDB from every system above. Individually some are present elsewhere — no production system combines all four:
+
+- **Durable inferred edges** — inferred relationships are not query-time computations. They are first-class durable objects stored in Fjall, WAL-logged, and replicated. They persist across restarts.
+- **Confidence lifecycle** — every inferred edge has a confidence score with configurable decay, reinforcement, promotion thresholds, and pruning. The engine manages this lifecycle automatically.
+- **Candidate admission gate** — inference generates candidates, not edges. Candidates pass through a four-check admission gate before becoming durable. This prevents edge explosion without sacrificing recall.
+- **Explainable inference provenance** — `EXPLAIN` on any `INFER` query returns the full reasoning chain: signals consulted, families combined, routing decisions, confidence at each step. Not a black box.
+
+---
+
+### Quick Decision Model
+
+| If you need... | Reach for... |
+|----------------|-------------|
+| Relational correctness, joins, constraints, transactions | Postgres |
+| Analytics on large tables or files | DuckDB |
+| Search-engine ranking and document retrieval | Elasticsearch / OpenSearch |
+| Pure vector retrieval as a managed product | Pinecone / Qdrant / Milvus |
+| Hybrid retrieval at scale (dense + structured + ranking) | Vespa |
+| Deep graph traversal and graph algorithms | Neo4j / TigerGraph |
+| Formal ontological reasoning (OWL, SPARQL) | Stardog / TerminusDB |
+| Semantic retrieval + graph traversal + confidence/decay/inference lifecycle | **TronDB** |
+
+> **Where TronDB fits in a real stack:** TronDB is not a replacement for Postgres or Redis — it sits alongside them. Postgres remains the system-of-record for operational data. Redis remains the cache layer. TronDB is the reasoning layer: it answers questions that require semantic similarity, graph traversal, and probabilistic inference together, with full explainability.
 ### Storage tiers
 
 | Tier | Medium | Role |
