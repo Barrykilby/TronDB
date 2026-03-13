@@ -18,6 +18,7 @@ pub mod cost;
 pub mod warning;
 pub mod optimise;
 pub mod metrics;
+pub mod slow_log;
 
 use std::path::PathBuf;
 use std::sync::Arc;
