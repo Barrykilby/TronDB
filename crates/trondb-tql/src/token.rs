@@ -294,6 +294,9 @@ pub enum Token {
     #[token("AS", priority = 10, ignore(ascii_case))]
     As,
 
+    #[token("MATCH", priority = 10, ignore(ascii_case))]
+    Match,
+
     // Identifiers
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
@@ -319,6 +322,15 @@ pub enum Token {
 
     #[token("!=")]
     Neq,
+
+    #[token("->")]
+    Arrow,
+
+    #[token("..")]
+    DotDot,
+
+    #[token("-")]
+    Dash,
 
     #[token("*")]
     Star,
@@ -736,5 +748,61 @@ mod tests {
         assert_eq!(tokens[0], Token::Confidence);
         assert_eq!(tokens[1], Token::Gt);
         assert_eq!(tokens[2], Token::FloatLit(0.75));
+    }
+
+    #[test]
+    fn lex_match_keyword() {
+        assert_eq!(lex("MATCH"), vec![Token::Match]);
+        assert_eq!(lex("match"), vec![Token::Match]);
+    }
+
+    #[test]
+    fn lex_arrow_tokens() {
+        let tokens = lex("-[e:RELATED_TO]->");
+        assert_eq!(tokens[0], Token::Dash);
+        assert_eq!(tokens[1], Token::LBracket);
+        assert_eq!(tokens[2], Token::Ident("e".into()));
+        assert_eq!(tokens[3], Token::Colon);
+        assert_eq!(tokens[4], Token::Ident("RELATED_TO".into()));
+        assert_eq!(tokens[5], Token::RBracket);
+        assert_eq!(tokens[6], Token::Arrow);
+    }
+
+    #[test]
+    fn lex_dotdot_token() {
+        let tokens = lex("1..3");
+        assert_eq!(tokens[0], Token::IntLit(1));
+        assert_eq!(tokens[1], Token::DotDot);
+        assert_eq!(tokens[2], Token::IntLit(3));
+    }
+
+    #[test]
+    fn lex_traverse_match_full() {
+        let tokens = lex("TRAVERSE FROM 'ent_abc123' MATCH (a)-[e:RELATED_TO]->(b) DEPTH 1..3 CONFIDENCE > 0.70;");
+        assert_eq!(tokens[0], Token::Traverse);
+        assert_eq!(tokens[1], Token::From);
+        assert_eq!(tokens[2], Token::StringLit("ent_abc123".into()));
+        assert_eq!(tokens[3], Token::Match);
+        assert_eq!(tokens[4], Token::LParen);
+        assert_eq!(tokens[5], Token::Ident("a".into()));
+        assert_eq!(tokens[6], Token::RParen);
+        assert_eq!(tokens[7], Token::Dash);
+        assert_eq!(tokens[8], Token::LBracket);
+        assert_eq!(tokens[9], Token::Ident("e".into()));
+        assert_eq!(tokens[10], Token::Colon);
+        assert_eq!(tokens[11], Token::Ident("RELATED_TO".into()));
+        assert_eq!(tokens[12], Token::RBracket);
+        assert_eq!(tokens[13], Token::Arrow);
+        assert_eq!(tokens[14], Token::LParen);
+        assert_eq!(tokens[15], Token::Ident("b".into()));
+        assert_eq!(tokens[16], Token::RParen);
+        assert_eq!(tokens[17], Token::Depth);
+        assert_eq!(tokens[18], Token::IntLit(1));
+        assert_eq!(tokens[19], Token::DotDot);
+        assert_eq!(tokens[20], Token::IntLit(3));
+        assert_eq!(tokens[21], Token::Confidence);
+        assert_eq!(tokens[22], Token::Gt);
+        assert_eq!(tokens[23], Token::FloatLit(0.70));
+        assert_eq!(tokens[24], Token::Semicolon);
     }
 }
