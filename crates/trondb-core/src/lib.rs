@@ -78,7 +78,7 @@ impl Engine {
         let location = Arc::new(location);
         let vectoriser_registry = Arc::new(VectoriserRegistry::new());
         let inference_audit = Arc::new(InferenceAuditBuffer::new(1000));
-        let executor = Executor::new(store, wal, Arc::clone(&location), Arc::clone(&vectoriser_registry), Arc::clone(&inference_audit));
+        let executor = Executor::with_data_dir(store, wal, Arc::clone(&location), Arc::clone(&vectoriser_registry), Arc::clone(&inference_audit), config.data_dir.clone());
 
         // Filter records to only replay those after snapshot LSN
         let records_to_replay: Vec<_> = recovery

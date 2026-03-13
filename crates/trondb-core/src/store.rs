@@ -402,13 +402,17 @@ impl FjallStore {
 
         let mut total = 0usize;
 
-        // Export schemas
+        // Export schemas (with credentials redacted)
         let schemas = self.list_collection_schemas();
         let schema_path = backup_dir.join("schemas.jsonl");
         let mut schema_file = std::fs::File::create(&schema_path)
             .map_err(|e| EngineError::Storage(format!("backup schemas: {e}")))?;
         for schema in &schemas {
-            let line = serde_json::to_string(schema)
+            let mut schema_for_export = schema.clone();
+            if let Some(ref mut vc) = schema_for_export.vectoriser_config {
+                vc.auth = None;
+            }
+            let line = serde_json::to_string(&schema_for_export)
                 .map_err(|e| EngineError::Storage(e.to_string()))?;
             use std::io::Write;
             writeln!(schema_file, "{}", line)

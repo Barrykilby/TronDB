@@ -277,7 +277,7 @@ async fn start_router(config: config::ClusterConfig) -> Result<(), Box<dyn std::
 /// Prometheus text exposition format from `EngineMetrics::render()`.
 fn start_metrics_server(engine: Arc<trondb_core::Engine>, port: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let addr = format!("0.0.0.0:{port}");
+        let addr = format!("127.0.0.1:{port}");
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {

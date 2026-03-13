@@ -62,15 +62,27 @@ fn where_clause_to_proto(clause: &WhereClause) -> pb::WhereClauseProto {
             WhereClause::Lte(f, v) => Clause::Lte(make_cmp(f, v)),
             WhereClause::And(l, r) => Clause::And(Box::new(make_bin(l, r))),
             WhereClause::Or(l, r) => Clause::Or(Box::new(make_bin(l, r))),
-            // TODO: Task 13 — add proto definitions for these variants
-            WhereClause::Neq(f, v) => Clause::Eq(make_cmp(f, v)), // placeholder
-            WhereClause::Not(_)
-            | WhereClause::IsNull(_)
-            | WhereClause::IsNotNull(_)
-            | WhereClause::In(_, _)
-            | WhereClause::Like(_, _) => {
-                unimplemented!("proto serialisation for advanced WHERE clauses (Task 13)")
-            }
+            // These WHERE variants are not yet supported over gRPC transport.
+            // Queries using them on multi-node deployments will fail rather than
+            // silently producing wrong results (Neq was previously mapped to Eq).
+            WhereClause::Neq(f, _) => panic!(
+                "WHERE != on field '{}' is not yet supported over gRPC transport", f
+            ),
+            WhereClause::Not(_) => panic!(
+                "WHERE NOT is not yet supported over gRPC transport"
+            ),
+            WhereClause::IsNull(f) => panic!(
+                "WHERE IS NULL on field '{}' is not yet supported over gRPC transport", f
+            ),
+            WhereClause::IsNotNull(f) => panic!(
+                "WHERE IS NOT NULL on field '{}' is not yet supported over gRPC transport", f
+            ),
+            WhereClause::In(f, _) => panic!(
+                "WHERE IN on field '{}' is not yet supported over gRPC transport", f
+            ),
+            WhereClause::Like(f, _) => panic!(
+                "WHERE LIKE on field '{}' is not yet supported over gRPC transport", f
+            ),
         }),
     }
 }
