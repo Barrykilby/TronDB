@@ -35,6 +35,7 @@ fn record_type_to_proto(rt: RecordType) -> pb::RecordTypeProto {
         RecordType::Checkpoint => pb::RecordTypeProto::RecordTypeCheckpoint,
         RecordType::SchemaDropColl => pb::RecordTypeProto::RecordTypeSchemaDropColl,
         RecordType::SchemaDropEdgeType => pb::RecordTypeProto::RecordTypeSchemaDropEdgeType,
+        RecordType::SchemaAlter => pb::RecordTypeProto::RecordTypeSchemaAlter,
     }
 }
 
@@ -74,6 +75,7 @@ fn proto_to_record_type(proto: i32) -> Result<RecordType, String> {
         Ok(pb::RecordTypeProto::RecordTypeSchemaDropEdgeType) => {
             Ok(RecordType::SchemaDropEdgeType)
         }
+        Ok(pb::RecordTypeProto::RecordTypeSchemaAlter) => Ok(RecordType::SchemaAlter),
         Err(_) => Err(format!("unknown RecordTypeProto value: {proto}")),
     }
 }
@@ -186,6 +188,7 @@ mod tests {
             RecordType::Checkpoint,
             RecordType::SchemaDropColl,
             RecordType::SchemaDropEdgeType,
+            RecordType::SchemaAlter,
         ];
         for rt in &variants {
             let record = WalRecord {

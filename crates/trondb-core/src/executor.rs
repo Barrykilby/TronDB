@@ -27,6 +27,22 @@ use trondb_tql::{FieldList, JoinFieldList, JoinType, Literal, VectorLiteral, Whe
 use trondb_wal::{RecordType, WalRecord, WalWriter};
 
 // ---------------------------------------------------------------------------
+// WAL payload for SchemaAlter (0x54) — crash-safe schema migration
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SchemaAlterPayload {
+    collection: String,
+    op: SchemaAlterOp,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum SchemaAlterOp {
+    RenameField { old_name: String, new_name: String },
+    DropField { field_name: String },
+}
+
+// ---------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------
 
@@ -268,6 +284,30 @@ impl Executor {
                             } else if loc.state == LocState::Recomputing {
                                 // Recomputing → Clean
                                 let _ = self.location.transition(&loc_key, LocState::Clean);
+                            }
+                        }
+                    }
+                    replayed += 1;
+                }
+                RecordType::SchemaAlter => {
+                    let payload: SchemaAlterPayload = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+                    if let Ok(mut schema) = self.store.get_collection_schema(&payload.collection) {
+                        match &payload.op {
+                            SchemaAlterOp::RenameField { old_name, new_name } => {
+                                if let Some(field) = schema.fields.iter_mut().find(|f| f.name == *old_name) {
+                                    field.name = new_name.clone();
+                                    self.store.update_collection_schema(&schema)?;
+                                    self.schemas.insert(payload.collection.clone(), schema);
+                                }
+                            }
+                            SchemaAlterOp::DropField { field_name } => {
+                                if schema.fields.iter().any(|f| f.name == *field_name) {
+                                    schema.fields.retain(|f| f.name != *field_name);
+                                    self.store.update_collection_schema(&schema)?;
+                                    self.schemas.insert(payload.collection.clone(), schema);
+                                }
                             }
                         }
                     }
@@ -2863,70 +2903,92 @@ impl Executor {
                 })
             }
 
-            // SAFETY: TODO — AlterCollection is NOT crash-safe. The schema
-            // update and per-entity migrations are written in a single WAL
-            // transaction, but the schema metadata in Fjall (_meta partition)
-            // is updated separately via update_collection_schema() after the
-            // WAL commit.  A crash between the WAL commit and the meta update
-            // will leave the schema stale while entity data has already been
-            // migrated.  Fixing this properly requires a new WAL record type
-            // (e.g. SchemaAlter 0x54) so that WAL replay can re-apply the
-            // schema change atomically.
+            // AlterCollection: crash-safe via SchemaAlter WAL record (0x54).
+            // WAL-log everything first (schema alter + entity writes), commit,
+            // THEN apply to Fjall.  On crash, WAL replay re-applies atomically.
             Plan::AlterCollection(p) => {
                 let mut schema = self.store.get_collection_schema(&p.collection)?;
+                let entities = self.store.scan(&p.collection)?;
 
+                // Validate the operation up-front before WAL logging
                 match &p.operation {
-                    trondb_tql::AlterCollectionOp::RenameField { old_name, new_name } => {
-                        // Find and rename the field in the schema
-                        let field = schema.fields.iter_mut()
-                            .find(|f| f.name == *old_name)
-                            .ok_or_else(|| EngineError::InvalidQuery(
+                    trondb_tql::AlterCollectionOp::RenameField { old_name, .. } => {
+                        if !schema.fields.iter().any(|f| f.name == *old_name) {
+                            return Err(EngineError::InvalidQuery(
                                 format!("field '{}' not found in collection '{}'", old_name, p.collection)
-                            ))?;
-                        field.name = new_name.clone();
-
-                        // Rename field in all entities
-                        let entities = self.store.scan(&p.collection)?;
-                        let tx_id = self.wal.next_tx_id();
-                        self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
-
-                        for mut entity in entities {
-                            if let Some(value) = entity.metadata.remove(old_name) {
-                                entity.metadata.insert(new_name.clone(), value);
-                                let payload = rmp_serde::to_vec_named(&entity)
-                                    .map_err(|e| EngineError::Storage(e.to_string()))?;
-                                self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
-                                self.store.insert(&p.collection, entity)?;
-                            }
+                            ));
                         }
-
-                        self.wal.commit(tx_id).await?;
                     }
-                    trondb_tql::AlterCollectionOp::DropField { field_name } => {
-                        // Remove field from schema
-                        schema.fields.retain(|f| f.name != *field_name);
+                    trondb_tql::AlterCollectionOp::DropField { .. } => {}
+                }
 
-                        // Remove field value from all entities
-                        let entities = self.store.scan(&p.collection)?;
-                        let tx_id = self.wal.next_tx_id();
-                        self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
 
-                        for mut entity in entities {
-                            if entity.metadata.remove(field_name).is_some() {
-                                let payload = rmp_serde::to_vec_named(&entity)
-                                    .map_err(|e| EngineError::Storage(e.to_string()))?;
-                                self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
-                                self.store.insert(&p.collection, entity)?;
+                // 1. WAL-log the schema alter operation
+                let alter_payload = SchemaAlterPayload {
+                    collection: p.collection.clone(),
+                    op: match &p.operation {
+                        trondb_tql::AlterCollectionOp::RenameField { old_name, new_name } => {
+                            SchemaAlterOp::RenameField { old_name: old_name.clone(), new_name: new_name.clone() }
+                        }
+                        trondb_tql::AlterCollectionOp::DropField { field_name } => {
+                            SchemaAlterOp::DropField { field_name: field_name.clone() }
+                        }
+                    },
+                };
+                let alter_bytes = rmp_serde::to_vec_named(&alter_payload)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::SchemaAlter, &p.collection, tx_id, 1, alter_bytes);
+
+                // 2. WAL-log all entity mutations
+                let mut mutated_entities = Vec::new();
+                for mut entity in entities {
+                    let changed = match &p.operation {
+                        trondb_tql::AlterCollectionOp::RenameField { old_name, new_name } => {
+                            if let Some(value) = entity.metadata.remove(old_name.as_str()) {
+                                entity.metadata.insert(new_name.clone(), value);
+                                true
+                            } else {
+                                false
                             }
                         }
-
-                        self.wal.commit(tx_id).await?;
+                        trondb_tql::AlterCollectionOp::DropField { field_name } => {
+                            entity.metadata.remove(field_name.as_str()).is_some()
+                        }
+                    };
+                    if changed {
+                        let payload = rmp_serde::to_vec_named(&entity)
+                            .map_err(|e| EngineError::Storage(e.to_string()))?;
+                        self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
+                        mutated_entities.push(entity);
                     }
                 }
 
-                // Update schema in store and cache
+                // 3. Commit WAL (all-or-nothing durability barrier)
+                self.wal.commit(tx_id).await?;
+
+                // 4. Apply to Fjall (idempotent — safe to re-apply on WAL replay)
+                // Update schema
+                match &p.operation {
+                    trondb_tql::AlterCollectionOp::RenameField { old_name, new_name } => {
+                        let field = schema.fields.iter_mut().find(|f| f.name == *old_name)
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                format!("field '{}' not found", old_name)
+                            ))?;
+                        field.name = new_name.clone();
+                    }
+                    trondb_tql::AlterCollectionOp::DropField { field_name } => {
+                        schema.fields.retain(|f| f.name != *field_name);
+                    }
+                }
                 self.store.update_collection_schema(&schema)?;
                 self.schemas.insert(p.collection.clone(), schema);
+
+                // Write mutated entities to Fjall
+                for entity in mutated_entities {
+                    self.store.insert(&p.collection, entity)?;
+                }
 
                 Ok(QueryResult {
                     columns: vec!["message".into()],
@@ -11171,5 +11233,225 @@ mod tests {
         // --- Metrics verification ---
         assert!(exec.engine_metrics().queries_total.get() > 0, "queries_total should be incremented");
         assert!(exec.engine_metrics().inserts_total.get() > 0, "inserts_total should be incremented");
+    }
+
+    // --- ALTER COLLECTION WAL crash-safety ---
+
+    #[tokio::test]
+    async fn alter_collection_schema_alter_wal_record() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a field we will rename
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "wal_test".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "old_field".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        insert_entity(&exec, "wal_test", "e1", vec![("old_field", Literal::String("val".into()))], None).await;
+
+        // Alter should succeed
+        exec.execute(&Plan::AlterCollection(AlterCollectionPlan {
+            collection: "wal_test".into(),
+            operation: trondb_tql::AlterCollectionOp::RenameField {
+                old_name: "old_field".into(),
+                new_name: "new_field".into(),
+            },
+        })).await.unwrap();
+
+        // Verify schema was updated
+        let schema = exec.schemas.get("wal_test").unwrap();
+        assert!(schema.fields.iter().any(|f| f.name == "new_field"), "schema should have new_field");
+        assert!(!schema.fields.iter().any(|f| f.name == "old_field"), "schema should not have old_field");
+
+        // Verify entity data was migrated
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "wal_test".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].values.contains_key("new_field"), "entity should have new_field");
+        assert!(!result.rows[0].values.contains_key("old_field"), "entity should not have old_field");
+    }
+
+    #[tokio::test]
+    async fn alter_collection_wal_replay_rename() {
+        // Simulate WAL replay of a SchemaAlter record for rename
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "replay_rename".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "old_field".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Build a SchemaAlter WAL record manually
+        let alter_payload = super::SchemaAlterPayload {
+            collection: "replay_rename".into(),
+            op: super::SchemaAlterOp::RenameField {
+                old_name: "old_field".into(),
+                new_name: "new_field".into(),
+            },
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&alter_payload).unwrap();
+        let wal_record = WalRecord {
+            lsn: 999,
+            ts: 0,
+            tx_id: 999,
+            record_type: RecordType::SchemaAlter,
+            schema_ver: 1,
+            collection: "replay_rename".into(),
+            payload: payload_bytes,
+        };
+
+        let (replayed, unhandled) = exec.replay_wal_records(&[wal_record]).unwrap();
+        assert_eq!(replayed, 1, "SchemaAlter record should be replayed");
+        assert!(unhandled.is_empty(), "SchemaAlter should not be unhandled");
+
+        // Verify schema was updated by replay
+        let schema = exec.schemas.get("replay_rename").unwrap();
+        assert!(schema.fields.iter().any(|f| f.name == "new_field"), "replayed schema should have new_field");
+        assert!(!schema.fields.iter().any(|f| f.name == "old_field"), "replayed schema should not have old_field");
+    }
+
+    #[tokio::test]
+    async fn alter_collection_wal_replay_drop() {
+        // Simulate WAL replay of a SchemaAlter record for drop
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with two fields
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "replay_drop".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl {
+                    name: "keep_me".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+                trondb_tql::FieldDecl {
+                    name: "drop_me".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Build a SchemaAlter WAL record for drop
+        let alter_payload = super::SchemaAlterPayload {
+            collection: "replay_drop".into(),
+            op: super::SchemaAlterOp::DropField {
+                field_name: "drop_me".into(),
+            },
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&alter_payload).unwrap();
+        let wal_record = WalRecord {
+            lsn: 999,
+            ts: 0,
+            tx_id: 999,
+            record_type: RecordType::SchemaAlter,
+            schema_ver: 1,
+            collection: "replay_drop".into(),
+            payload: payload_bytes,
+        };
+
+        let (replayed, unhandled) = exec.replay_wal_records(&[wal_record]).unwrap();
+        assert_eq!(replayed, 1, "SchemaAlter drop record should be replayed");
+        assert!(unhandled.is_empty());
+
+        // Verify schema was updated by replay
+        let schema = exec.schemas.get("replay_drop").unwrap();
+        assert!(schema.fields.iter().any(|f| f.name == "keep_me"), "keep_me should remain");
+        assert!(!schema.fields.iter().any(|f| f.name == "drop_me"), "drop_me should be removed by replay");
+    }
+
+    #[tokio::test]
+    async fn alter_collection_wal_replay_idempotent() {
+        // Replaying a SchemaAlter for an already-renamed field should be a no-op
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "replay_idem".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "already_renamed".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Try to replay a rename for a field that no longer exists (already applied)
+        let alter_payload = super::SchemaAlterPayload {
+            collection: "replay_idem".into(),
+            op: super::SchemaAlterOp::RenameField {
+                old_name: "nonexistent".into(),
+                new_name: "something".into(),
+            },
+        };
+        let payload_bytes = rmp_serde::to_vec_named(&alter_payload).unwrap();
+        let wal_record = WalRecord {
+            lsn: 999,
+            ts: 0,
+            tx_id: 999,
+            record_type: RecordType::SchemaAlter,
+            schema_ver: 1,
+            collection: "replay_idem".into(),
+            payload: payload_bytes,
+        };
+
+        // Should succeed without error (idempotent — field not found is silently skipped)
+        let (replayed, _) = exec.replay_wal_records(&[wal_record]).unwrap();
+        assert_eq!(replayed, 1);
+
+        // Schema should be unchanged
+        let schema = exec.schemas.get("replay_idem").unwrap();
+        assert!(schema.fields.iter().any(|f| f.name == "already_renamed"));
+        assert!(!schema.fields.iter().any(|f| f.name == "something"));
     }
 }

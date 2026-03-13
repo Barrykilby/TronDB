@@ -21,6 +21,7 @@ pub enum RecordType {
     SchemaCreateEdgeType = 0x51,
     SchemaDropColl       = 0x52,
     SchemaDropEdgeType   = 0x53,
+    SchemaAlter          = 0x54,
     AffinityGroupCreate  = 0x60,
     AffinityGroupMember  = 0x61,
     AffinityGroupRemove  = 0x62,
@@ -151,6 +152,7 @@ mod tests {
         assert_eq!(RecordType::TxCommit as u8, 0x02);
         assert_eq!(RecordType::EntityWrite as u8, 0x10);
         assert_eq!(RecordType::Checkpoint as u8, 0xFF);
+        assert_eq!(RecordType::SchemaAlter as u8, 0x54);
         assert_eq!(RecordType::AffinityGroupCreate as u8, 0x60);
         assert_eq!(RecordType::AffinityGroupMember as u8, 0x61);
         assert_eq!(RecordType::AffinityGroupRemove as u8, 0x62);
