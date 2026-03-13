@@ -59,6 +59,7 @@ pub enum Plan {
     DropEdgeType(DropEdgeTypePlan),
     Join(JoinPlan),
     TraverseMatch(TraverseMatchPlan),
+    Upsert(UpsertPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +193,14 @@ pub struct UpdateEntityPlan {
     pub entity_id: String,
     pub collection: String,
     pub assignments: Vec<(String, trondb_tql::Literal)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertPlan {
+    pub collection: String,
+    pub fields: Vec<String>,
+    pub values: Vec<Literal>,
+    pub vectors: Vec<(String, VectorLiteral)>,
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +567,13 @@ pub fn plan(
             confidence_threshold: s.confidence_threshold,
             limit: s.limit,
         })),
+
+        Statement::Upsert(s) => Ok(Plan::Upsert(UpsertPlan {
+            collection: s.collection.clone(),
+            fields: s.fields.clone(),
+            values: s.values.clone(),
+            vectors: s.vectors.clone(),
+        })),
     }
 }
 
@@ -644,7 +660,8 @@ pub fn estimate_plan_cost(
         | Plan::InsertEdge(_) | Plan::DeleteEntity(_) | Plan::DeleteEdge(_)
         | Plan::CreateAffinityGroup(_) | Plan::AlterEntityDropAffinity(_)
         | Plan::Demote(_) | Plan::Promote(_) | Plan::UpdateEntity(_)
-        | Plan::ConfirmEdge(_) | Plan::DropCollection(_) | Plan::DropEdgeType(_) => {
+        | Plan::ConfirmEdge(_) | Plan::DropCollection(_) | Plan::DropEdgeType(_)
+        | Plan::Upsert(_) => {
             AcuEstimate::single("write", 1, cost.write_base_acu())
         }
         // Metadata / explain operations are free
@@ -1512,5 +1529,23 @@ mod tests {
         let est = estimate_plan_cost(&plan, &provider, 1000);
         // HNSW: 50 + two_pass_rescore: 15 + fetch k: 100*1.0 = 165 ACU
         assert!((est.total_acu - 165.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn plan_upsert() {
+        let stmt = Statement::Upsert(trondb_tql::UpsertStmt {
+            collection: "venues".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("v1".into()), Literal::String("X".into())],
+            vectors: vec![],
+        });
+        let p = plan(&stmt, &empty_schemas()).unwrap();
+        match p {
+            Plan::Upsert(up) => {
+                assert_eq!(up.collection, "venues");
+                assert_eq!(up.fields, vec!["id", "name"]);
+            }
+            _ => panic!("expected UpsertPlan"),
+        }
     }
 }
