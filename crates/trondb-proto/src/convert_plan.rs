@@ -434,6 +434,14 @@ fn proto_to_join_type(val: i32) -> trondb_tql::JoinType {
     }
 }
 
+fn proto_to_edge_direction(val: i32) -> trondb_tql::EdgeDirection {
+    match val {
+        x if x == pb::EdgeDirectionProto::EdgeDirectionBackward as i32 => trondb_tql::EdgeDirection::Backward,
+        x if x == pb::EdgeDirectionProto::EdgeDirectionUndirected as i32 => trondb_tql::EdgeDirection::Undirected,
+        _ => trondb_tql::EdgeDirection::Forward,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plan -> Proto
 // ---------------------------------------------------------------------------
@@ -668,9 +676,33 @@ impl From<&Plan> for pb::PlanRequest {
                     })
                 }
 
-                // Task 12 will add full proto message support for TraverseMatch
-                Plan::TraverseMatch(_) => {
-                    panic!("TraverseMatch proto serialisation not yet implemented — Task 12")
+                Plan::TraverseMatch(p) => {
+                    let direction = match p.pattern.edge.direction {
+                        trondb_tql::EdgeDirection::Forward => pb::EdgeDirectionProto::EdgeDirectionForward,
+                        trondb_tql::EdgeDirection::Backward => pb::EdgeDirectionProto::EdgeDirectionBackward,
+                        trondb_tql::EdgeDirection::Undirected => pb::EdgeDirectionProto::EdgeDirectionUndirected,
+                    };
+
+                    let edge_pattern = pb::EdgePatternProto {
+                        variable: p.pattern.edge.variable.clone(),
+                        edge_type: p.pattern.edge.edge_type.clone(),
+                        direction: direction.into(),
+                    };
+
+                    let pattern = pb::MatchPatternProto {
+                        source_var: p.pattern.source_var.clone(),
+                        edge: Some(edge_pattern),
+                        target_var: p.pattern.target_var.clone(),
+                    };
+
+                    PP::TraverseMatch(pb::TraverseMatchPlanProto {
+                        from_id: p.from_id.clone(),
+                        pattern: Some(pattern),
+                        min_depth: p.min_depth as u64,
+                        max_depth: p.max_depth as u64,
+                        confidence_threshold: p.confidence_threshold,
+                        limit: p.limit.map(|l| l as u64),
+                    })
                 }
             }),
         }
@@ -941,6 +973,32 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     order_by: p.order_by.iter().map(proto_to_order_by).collect(),
                     limit: p.limit.map(|l| l as usize),
                     hints: p.hints.iter().filter_map(|s| proto_to_hint(s)).collect(),
+                }))
+            }
+
+            PP::TraverseMatch(p) => {
+                let pattern_proto = p.pattern.as_ref().ok_or("missing pattern")?;
+                let edge_proto = pattern_proto.edge.as_ref().ok_or("missing edge pattern")?;
+
+                let direction = proto_to_edge_direction(edge_proto.direction);
+
+                let pattern = trondb_tql::MatchPattern {
+                    source_var: pattern_proto.source_var.clone(),
+                    edge: trondb_tql::EdgePattern {
+                        variable: edge_proto.variable.clone(),
+                        edge_type: edge_proto.edge_type.clone(),
+                        direction,
+                    },
+                    target_var: pattern_proto.target_var.clone(),
+                };
+
+                Ok(Plan::TraverseMatch(TraverseMatchPlan {
+                    from_id: p.from_id.clone(),
+                    pattern,
+                    min_depth: p.min_depth as usize,
+                    max_depth: p.max_depth as usize,
+                    confidence_threshold: p.confidence_threshold,
+                    limit: p.limit.map(|l| l as usize),
                 }))
             }
         }
@@ -1724,6 +1782,112 @@ mod tests {
                 assert!(jp.limit.is_none());
             }
             _ => panic!("expected Join"),
+        }
+    }
+
+    #[test]
+    fn round_trip_traverse_match_forward() {
+        use trondb_tql::{EdgeDirection, EdgePattern, MatchPattern};
+
+        let plan = Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "ent_abc".into(),
+            pattern: MatchPattern {
+                source_var: "a".into(),
+                edge: EdgePattern {
+                    variable: Some("e".into()),
+                    edge_type: Some("RELATED_TO".into()),
+                    direction: EdgeDirection::Forward,
+                },
+                target_var: "b".into(),
+            },
+            min_depth: 1,
+            max_depth: 3,
+            confidence_threshold: Some(0.70),
+            limit: Some(50),
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::TraverseMatch(tp) => {
+                assert_eq!(tp.from_id, "ent_abc");
+                assert_eq!(tp.pattern.source_var, "a");
+                assert_eq!(tp.pattern.target_var, "b");
+                assert_eq!(tp.pattern.edge.variable, Some("e".into()));
+                assert_eq!(tp.pattern.edge.edge_type, Some("RELATED_TO".into()));
+                assert_eq!(tp.pattern.edge.direction, EdgeDirection::Forward);
+                assert_eq!(tp.min_depth, 1);
+                assert_eq!(tp.max_depth, 3);
+                assert_eq!(tp.confidence_threshold, Some(0.70));
+                assert_eq!(tp.limit, Some(50));
+            }
+            _ => panic!("expected TraverseMatch"),
+        }
+    }
+
+    #[test]
+    fn round_trip_traverse_match_backward() {
+        use trondb_tql::{EdgeDirection, EdgePattern, MatchPattern};
+
+        let plan = Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "node_1".into(),
+            pattern: MatchPattern {
+                source_var: "x".into(),
+                edge: EdgePattern {
+                    variable: None,
+                    edge_type: None,
+                    direction: EdgeDirection::Backward,
+                },
+                target_var: "y".into(),
+            },
+            min_depth: 2,
+            max_depth: 5,
+            confidence_threshold: None,
+            limit: None,
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::TraverseMatch(tp) => {
+                assert_eq!(tp.from_id, "node_1");
+                assert_eq!(tp.pattern.edge.variable, None);
+                assert_eq!(tp.pattern.edge.edge_type, None);
+                assert_eq!(tp.pattern.edge.direction, EdgeDirection::Backward);
+                assert_eq!(tp.min_depth, 2);
+                assert_eq!(tp.max_depth, 5);
+                assert_eq!(tp.confidence_threshold, None);
+                assert_eq!(tp.limit, None);
+            }
+            _ => panic!("expected TraverseMatch"),
+        }
+    }
+
+    #[test]
+    fn round_trip_traverse_match_undirected() {
+        use trondb_tql::{EdgeDirection, EdgePattern, MatchPattern};
+
+        let plan = Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "center".into(),
+            pattern: MatchPattern {
+                source_var: "s".into(),
+                edge: EdgePattern {
+                    variable: Some("r".into()),
+                    edge_type: Some("KNOWS".into()),
+                    direction: EdgeDirection::Undirected,
+                },
+                target_var: "t".into(),
+            },
+            min_depth: 1,
+            max_depth: 1,
+            confidence_threshold: Some(0.5),
+            limit: Some(10),
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::TraverseMatch(tp) => {
+                assert_eq!(tp.pattern.edge.direction, EdgeDirection::Undirected);
+                assert_eq!(tp.pattern.edge.edge_type, Some("KNOWS".into()));
+                assert_eq!(tp.pattern.edge.variable, Some("r".into()));
+                assert_eq!(tp.limit, Some(10));
+            }
+            _ => panic!("expected TraverseMatch"),
         }
     }
 }

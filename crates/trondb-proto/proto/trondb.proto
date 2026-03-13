@@ -52,6 +52,7 @@ message PlanRequest {
         DropCollectionPlanProto drop_collection = 20;
         DropEdgeTypePlanProto drop_edge_type = 21;
         JoinPlanProto join = 22;
+        TraverseMatchPlanProto traverse_match = 23;
     }
 }
 
@@ -226,6 +227,33 @@ message JoinPlanProto {
     repeated OrderByClauseProto order_by = 6;
     optional uint64 limit = 7;
     repeated string hints = 8;
+}
+
+enum EdgeDirectionProto {
+    EDGE_DIRECTION_FORWARD = 0;
+    EDGE_DIRECTION_BACKWARD = 1;
+    EDGE_DIRECTION_UNDIRECTED = 2;
+}
+
+message EdgePatternProto {
+    optional string variable = 1;
+    optional string edge_type = 2;
+    EdgeDirectionProto direction = 3;
+}
+
+message MatchPatternProto {
+    string source_var = 1;
+    EdgePatternProto edge = 2;
+    string target_var = 3;
+}
+
+message TraverseMatchPlanProto {
+    string from_id = 1;
+    MatchPatternProto pattern = 2;
+    uint64 min_depth = 3;
+    uint64 max_depth = 4;
+    optional double confidence_threshold = 5;
+    optional uint64 limit = 6;
 }
 
 // ---------------------------------------------------------------------------
