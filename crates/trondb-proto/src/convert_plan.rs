@@ -778,6 +778,8 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     vectors,
                     collocate_with,
                     affinity_group: ip.affinity_group,
+                    valid_from: None,
+                    valid_to: None,
                 }))
             }
 
@@ -785,6 +787,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                 collection: fp.collection,
                 fields: proto_to_field_list(&fp.fields.ok_or("missing fields")?),
                 filter: fp.filter.as_ref().map(proto_to_where_clause).transpose()?,
+                temporal: None,
                 order_by: fp.order_by.iter().map(proto_to_order_by).collect(),
                 limit: fp.limit.map(|l| l as usize),
                 strategy: proto_to_fetch_strategy(fp.strategy, &fp.strategy_index_name),
@@ -856,6 +859,8 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     from_id: ie.from_id,
                     to_id: ie.to_id,
                     metadata,
+                    valid_from: None,
+                    valid_to: None,
                 }))
             }
 
@@ -1014,6 +1019,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     min_depth: p.min_depth as usize,
                     max_depth: p.max_depth as usize,
                     confidence_threshold: p.confidence_threshold,
+                    temporal: None,
                     limit: p.limit.map(|l| l as usize),
                 }))
             }
@@ -1043,6 +1049,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: Some(10),
             strategy: FetchStrategy::FullScan,
@@ -1106,6 +1113,8 @@ mod tests {
             vectors: vec![("default".into(), VectorLiteral::Dense(vec![1.0, 2.0]))],
             collocate_with: Some(vec!["v2".into()]),
             affinity_group: Some("group-1".into()),
+            valid_from: None,
+            valid_to: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1127,6 +1136,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -1172,6 +1182,7 @@ mod tests {
                 Box::new(WhereClause::Gte("score".into(), Literal::Int(50))),
                 Box::new(WhereClause::Lt("score".into(), Literal::Int(100))),
             )),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
@@ -1309,6 +1320,8 @@ mod tests {
             from_id: "u1".into(),
             to_id: "v1".into(),
             metadata: vec![("weight".into(), Literal::Float(0.9))],
+            valid_from: None,
+            valid_to: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1409,6 +1422,8 @@ mod tests {
             vectors: vec![],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1429,6 +1444,7 @@ mod tests {
                 Box::new(WhereClause::Eq("city".into(), Literal::String("London".into()))),
                 Box::new(WhereClause::Eq("city".into(), Literal::String("Paris".into()))),
             )),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -1471,6 +1487,8 @@ mod tests {
             )],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1630,6 +1648,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::Named(vec!["name".into(), "score".into()]),
             filter: Some(WhereClause::Gt("score".into(), Literal::Int(50))),
+            temporal: None,
             order_by: vec![
                 OrderByClause {
                     field: "score".into(),
@@ -1668,6 +1687,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -1853,6 +1873,7 @@ mod tests {
             min_depth: 1,
             max_depth: 3,
             confidence_threshold: Some(0.70),
+            temporal: None,
             limit: Some(50),
         });
         let restored = round_trip(plan);
@@ -1891,6 +1912,7 @@ mod tests {
             min_depth: 2,
             max_depth: 5,
             confidence_threshold: None,
+            temporal: None,
             limit: None,
         });
         let restored = round_trip(plan);
@@ -1927,6 +1949,7 @@ mod tests {
             min_depth: 1,
             max_depth: 1,
             confidence_threshold: Some(0.5),
+            temporal: None,
             limit: Some(10),
         });
         let restored = round_trip(plan);

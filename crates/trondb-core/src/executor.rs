@@ -3796,6 +3796,8 @@ mod tests {
             vectors,
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -3828,6 +3830,7 @@ mod tests {
                 collection: "venues".into(),
                 fields: FieldList::All,
                 filter: None,
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
@@ -3875,6 +3878,7 @@ mod tests {
                     "city".into(),
                     Literal::String("London".into()),
                 )),
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
@@ -3898,6 +3902,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -4099,6 +4104,8 @@ mod tests {
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![1.0, 2.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await;
 
         assert!(result.is_err());
@@ -4140,6 +4147,8 @@ mod tests {
             vectors: vec![("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.8), (42, 0.5)]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Verify SparseIndex contains the entry
@@ -4184,6 +4193,8 @@ mod tests {
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Verify FieldIndex contains the entry
@@ -4235,6 +4246,8 @@ mod tests {
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -4244,6 +4257,8 @@ mod tests {
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.4, 0.5, 0.6]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // FETCH with FieldIndexLookup strategy
@@ -4251,6 +4266,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
@@ -4303,6 +4319,8 @@ mod tests {
                 vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -4311,6 +4329,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Gte("score".into(), Literal::Int(30))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
@@ -4371,6 +4390,8 @@ mod tests {
                 vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -4379,6 +4400,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Gt("score".into(), Literal::Int(30))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
@@ -4435,6 +4457,8 @@ mod tests {
                 vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -4447,6 +4471,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(filter),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
@@ -4503,6 +4528,8 @@ mod tests {
                 vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -4511,6 +4538,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Lt("score".into(), Literal::Int(30))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
@@ -4567,6 +4595,8 @@ mod tests {
                 vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -4575,6 +4605,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Lte("score".into(), Literal::Int(30))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
@@ -4627,6 +4658,8 @@ mod tests {
                 vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.1, 0.2, 0.3]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -4635,6 +4668,7 @@ mod tests {
             collection: "scores".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Gte("score".into(), Literal::Int(30))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -4680,6 +4714,8 @@ mod tests {
             vectors: vec![("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.8), (42, 0.5)]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -4689,6 +4725,8 @@ mod tests {
             vectors: vec![("keywords".to_string(), VectorLiteral::Sparse(vec![(1, 0.3), (99, 0.9)]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // SEARCH Sparse
@@ -4756,6 +4794,8 @@ mod tests {
             ],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -4768,6 +4808,8 @@ mod tests {
             ],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // SEARCH Hybrid
@@ -4828,6 +4870,8 @@ mod tests {
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -4837,6 +4881,8 @@ mod tests {
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.9, 0.1, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         exec.execute(&Plan::Insert(InsertPlan {
@@ -4846,6 +4892,8 @@ mod tests {
             vectors: vec![("default".to_string(), VectorLiteral::Dense(vec![0.8, 0.2, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // SEARCH with pre-filter on city=London
@@ -4927,6 +4975,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
@@ -4997,6 +5046,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -5082,6 +5132,8 @@ mod tests {
                 from_id: from.into(),
                 to_id: to.into(),
                 metadata: vec![],
+                valid_from: None,
+                valid_to: None,
             }))
             .await
             .unwrap();
@@ -5156,6 +5208,8 @@ mod tests {
                 from_id: from.into(),
                 to_id: to.into(),
                 metadata: vec![],
+                valid_from: None,
+                valid_to: None,
             }))
             .await
             .unwrap();
@@ -5227,6 +5281,8 @@ mod tests {
                 from_id: from.into(),
                 to_id: to.into(),
                 metadata: vec![],
+                valid_from: None,
+                valid_to: None,
             }))
             .await
             .unwrap();
@@ -5298,6 +5354,8 @@ mod tests {
                 from_id: "a".into(),
                 to_id: to.into(),
                 metadata: vec![],
+                valid_from: None,
+                valid_to: None,
             }))
             .await
             .unwrap();
@@ -5368,6 +5426,8 @@ mod tests {
             from_id: "a".into(),
             to_id: "b".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -5415,6 +5475,7 @@ mod tests {
                 collection: "venues".into(),
                 fields: FieldList::All,
                 filter: None,
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
@@ -5444,6 +5505,7 @@ mod tests {
                 collection: "venues".into(),
                 fields: FieldList::All,
                 filter: None,
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
@@ -5483,6 +5545,8 @@ mod tests {
             from_id: "p1".into(),
             to_id: "p2".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -5492,6 +5556,8 @@ mod tests {
             from_id: "p3".into(),
             to_id: "p1".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -5628,6 +5694,8 @@ mod tests {
             )],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -5645,6 +5713,8 @@ mod tests {
             )],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -5658,6 +5728,7 @@ mod tests {
                     "city".into(),
                     Literal::String("London".into()),
                 )),
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
@@ -5684,6 +5755,7 @@ mod tests {
                     "city".into(),
                     Literal::String("London".into()),
                 )),
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
@@ -5743,6 +5815,8 @@ mod tests {
             vectors: vec![("semantic".to_string(), VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -5754,6 +5828,8 @@ mod tests {
             vectors: vec![("semantic".to_string(), VectorLiteral::Dense(vec![0.9, 0.1, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -5930,6 +6006,8 @@ mod tests {
             vectors: vec![],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -5941,6 +6019,8 @@ mod tests {
             vectors: vec![],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -6043,6 +6123,8 @@ mod tests {
             vectors: vec![],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -6523,6 +6605,8 @@ mod tests {
             from_id: "art1".into(),
             to_id: "ven1".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Run INFER
@@ -6786,6 +6870,8 @@ mod tests {
             from_id: "a1".into(),
             to_id: "v1".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // CONFIRM should fail on structural edge
@@ -7149,6 +7235,8 @@ mod tests {
             from_id: "artist1".into(),
             to_id: "venue1".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Drain the inference queue
@@ -7283,6 +7371,8 @@ mod tests {
             from_id: "alice".into(),
             to_id: "bob".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Verify the structural edge exists
@@ -7370,6 +7460,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Neq("status".into(), Literal::String("archived".into()))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -7389,6 +7480,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::IsNull("name".into())),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -7409,6 +7501,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::IsNotNull("name".into())),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -7433,6 +7526,7 @@ mod tests {
                 Literal::String("music".into()),
                 Literal::String("theatre".into()),
             ])),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -7453,6 +7547,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Like("name".into(), "Jazz%".into())),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -7474,6 +7569,7 @@ mod tests {
             filter: Some(WhereClause::Not(Box::new(
                 WhereClause::Eq("active".into(), Literal::Bool(true))
             ))),
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -7495,6 +7591,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![trondb_tql::OrderByClause {
                 field: "name".into(),
                 direction: trondb_tql::SortDirection::Asc,
@@ -7522,6 +7619,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![trondb_tql::OrderByClause {
                 field: "score".into(),
                 direction: trondb_tql::SortDirection::Desc,
@@ -7565,6 +7663,7 @@ mod tests {
                 collection: "venues".into(),
                 fields: FieldList::All,
                 filter: None,
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
@@ -7594,6 +7693,7 @@ mod tests {
                 collection: "venues".into(),
                 fields: FieldList::All,
                 filter: None,
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
@@ -7650,6 +7750,8 @@ mod tests {
             from_id: "p1".into(),
             to_id: "v1".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -7784,6 +7886,7 @@ mod tests {
                         Literal::String("comedy".into()),
                     ],
                 )),
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
@@ -7799,6 +7902,7 @@ mod tests {
                 collection: "events".into(),
                 fields: FieldList::All,
                 filter: Some(WhereClause::Like("name".into(), "Jazz%".into())),
+                temporal: None,
                 order_by: vec![trondb_tql::OrderByClause {
                     field: "score".into(),
                     direction: trondb_tql::SortDirection::Desc,
@@ -7830,6 +7934,7 @@ mod tests {
                         "Rock%".into(),
                     )))),
                 )),
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
@@ -7852,6 +7957,7 @@ mod tests {
                 collection: "events".into(),
                 fields: FieldList::All,
                 filter: None,
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
@@ -7913,6 +8019,8 @@ mod tests {
             vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Insert person referencing venue
@@ -7927,6 +8035,8 @@ mod tests {
             vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![0.0, 1.0, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Execute INNER JOIN
@@ -8013,6 +8123,8 @@ mod tests {
             vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![0.0, 1.0, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // INNER JOIN should return 0 rows (no matching venue)
@@ -8088,6 +8200,8 @@ mod tests {
             vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![0.0, 1.0, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // LEFT JOIN should return 1 row with NULLs for venue fields
@@ -8152,6 +8266,8 @@ mod tests {
                 vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -8170,12 +8286,16 @@ mod tests {
             from_id: "a".into(),
             to_id: "b".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(),
             from_id: "b".into(),
             to_id: "c".into(),
             metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // TRAVERSE MATCH from a, depth 1..2 — should get b (depth 1) and c (depth 2)
@@ -8194,6 +8314,7 @@ mod tests {
             min_depth: 1,
             max_depth: 2,
             confidence_threshold: None,
+            temporal: None,
             limit: None,
         })).await.unwrap();
 
@@ -8235,6 +8356,8 @@ mod tests {
                 vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -8248,9 +8371,13 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // TRAVERSE MATCH from a, depth 2..3 — should only get c (depth 2), not b (depth 1)
@@ -8269,6 +8396,7 @@ mod tests {
             min_depth: 2,
             max_depth: 3,
             confidence_threshold: None,
+            temporal: None,
             limit: None,
         })).await.unwrap();
 
@@ -8309,6 +8437,8 @@ mod tests {
                 vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -8322,9 +8452,13 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Backward traversal from c — should find b (depth 1) and a (depth 2)
@@ -8343,6 +8477,7 @@ mod tests {
             min_depth: 1,
             max_depth: 2,
             confidence_threshold: None,
+            temporal: None,
             limit: None,
         })).await.unwrap();
 
@@ -8385,6 +8520,8 @@ mod tests {
                 vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -8398,9 +8535,13 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Undirected traversal from b, depth 1 — should find a and c
@@ -8419,6 +8560,7 @@ mod tests {
             min_depth: 1,
             max_depth: 1,
             confidence_threshold: None,
+            temporal: None,
             limit: None,
         })).await.unwrap();
 
@@ -8460,6 +8602,8 @@ mod tests {
                 vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -8473,12 +8617,18 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "c".into(), to_id: "a".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Traverse with large depth — cycle detection should prevent infinite loop
@@ -8497,6 +8647,7 @@ mod tests {
             min_depth: 1,
             max_depth: 10,
             confidence_threshold: None,
+            temporal: None,
             limit: None,
         })).await.unwrap();
 
@@ -8534,6 +8685,8 @@ mod tests {
                 vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -8547,9 +8700,13 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "b".into(), to_id: "c".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Limit to 1 result
@@ -8568,6 +8725,7 @@ mod tests {
             min_depth: 1,
             max_depth: 5,
             confidence_threshold: None,
+            temporal: None,
             limit: Some(1),
         })).await.unwrap();
 
@@ -8604,6 +8762,8 @@ mod tests {
                 vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -8624,9 +8784,13 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "likes".into(), from_id: "a".into(), to_id: "c".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // No edge type filter — should traverse both types and find b + c
@@ -8645,6 +8809,7 @@ mod tests {
             min_depth: 1,
             max_depth: 1,
             confidence_threshold: None,
+            temporal: None,
             limit: None,
         })).await.unwrap();
 
@@ -8686,6 +8851,8 @@ mod tests {
                 vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -8699,6 +8866,8 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
@@ -8716,6 +8885,7 @@ mod tests {
             min_depth: 1,
             max_depth: 1,
             confidence_threshold: None,
+            temporal: None,
             limit: None,
         })).await.unwrap();
 
@@ -8765,6 +8935,8 @@ mod tests {
                 vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
                 collocate_with: None,
                 affinity_group: None,
+                valid_from: None,
+                valid_to: None,
             })).await.unwrap();
         }
 
@@ -8778,6 +8950,8 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "knows".into(), from_id: "a".into(), to_id: "b".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // Use the old Plan::Traverse — should still work
@@ -8830,6 +9004,8 @@ mod tests {
         collection: &str,
         id: &str,
         metadata: Vec<(&str, Literal)>,
+        valid_from: Option<String>,
+        valid_to: Option<String>,
     ) {
         let mut fields = vec!["id".to_string()];
         let mut values = vec![Literal::String(id.into())];
@@ -8844,6 +9020,8 @@ mod tests {
             vectors: vec![("default".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
             collocate_with: None,
             affinity_group: None,
+            valid_from: None,
+            valid_to: None,
         }))
         .await
         .unwrap();
@@ -8885,17 +9063,17 @@ mod tests {
         // ---------------------------------------------------------------
         // Venues
         insert_entity_full(&exec, "venues", "v1",
-            vec![("address", Literal::String("100 Main St".into())), ("capacity", Literal::Int(500))]).await;
+            vec![("address", Literal::String("100 Main St".into())), ("capacity", Literal::Int(500))], None, None).await;
         insert_entity_full(&exec, "venues", "v2",
-            vec![("address", Literal::String("200 Oak Ave".into())), ("capacity", Literal::Int(1000))]).await;
+            vec![("address", Literal::String("200 Oak Ave".into())), ("capacity", Literal::Int(1000))], None, None).await;
 
         // Artists: a1 and a2 have venue_ids, a3 has no venue
         insert_entity_full(&exec, "artists", "a1",
-            vec![("name", Literal::String("Alice".into())), ("genre", Literal::String("jazz".into())), ("venue_id", Literal::String("v1".into()))]).await;
+            vec![("name", Literal::String("Alice".into())), ("genre", Literal::String("jazz".into())), ("venue_id", Literal::String("v1".into()))], None, None).await;
         insert_entity_full(&exec, "artists", "a2",
-            vec![("name", Literal::String("Bob".into())), ("genre", Literal::String("rock".into())), ("venue_id", Literal::String("v2".into()))]).await;
+            vec![("name", Literal::String("Bob".into())), ("genre", Literal::String("rock".into())), ("venue_id", Literal::String("v2".into()))], None, None).await;
         insert_entity_full(&exec, "artists", "a3",
-            vec![("name", Literal::String("Charlie".into())), ("genre", Literal::String("blues".into())), ("venue_id", Literal::String("nonexistent".into()))]).await;
+            vec![("name", Literal::String("Charlie".into())), ("genre", Literal::String("blues".into())), ("venue_id", Literal::String("nonexistent".into()))], None, None).await;
 
         // ---------------------------------------------------------------
         // 3. Create an edge type linking artists to venues
@@ -8913,9 +9091,13 @@ mod tests {
         // ---------------------------------------------------------------
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "performs_at".into(), from_id: "a1".into(), to_id: "v1".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "performs_at".into(), from_id: "a2".into(), to_id: "v2".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // ---------------------------------------------------------------
@@ -8982,9 +9164,13 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "collaborates".into(), from_id: "a1".into(), to_id: "a2".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "collaborates".into(), from_id: "a2".into(), to_id: "a3".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         {
@@ -9074,14 +9260,14 @@ mod tests {
         ]).await;
 
         insert_entity_full(&exec, "venues", "v1",
-            vec![("address", Literal::String("123 Main St".into()))]).await;
+            vec![("address", Literal::String("123 Main St".into()))], None, None).await;
         insert_entity_full(&exec, "venues", "v2",
-            vec![("address", Literal::String("456 Oak Ave".into()))]).await;
+            vec![("address", Literal::String("456 Oak Ave".into()))], None, None).await;
 
         insert_entity_full(&exec, "people", "p1",
-            vec![("name", Literal::String("Alice".into())), ("venue_id", Literal::String("v1".into()))]).await;
+            vec![("name", Literal::String("Alice".into())), ("venue_id", Literal::String("v1".into()))], None, None).await;
         insert_entity_full(&exec, "people", "p2",
-            vec![("name", Literal::String("Bob".into())), ("venue_id", Literal::String("v2".into()))]).await;
+            vec![("name", Literal::String("Bob".into())), ("venue_id", Literal::String("v2".into()))], None, None).await;
 
         // INNER JOIN with WHERE filtering to only Alice's row
         let stmt = trondb_tql::parse(
@@ -9112,7 +9298,7 @@ mod tests {
 
         for (id, label) in &[("n1", "Start"), ("n2", "Mid"), ("n3", "End")] {
             insert_entity_full(&exec, "nodes", id,
-                vec![("label", Literal::String(label.to_string()))]).await;
+                vec![("label", Literal::String(label.to_string()))], None, None).await;
         }
 
         exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
@@ -9125,9 +9311,13 @@ mod tests {
 
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "links".into(), from_id: "n1".into(), to_id: "n2".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
         exec.execute(&Plan::InsertEdge(InsertEdgePlan {
             edge_type: "links".into(), from_id: "n2".into(), to_id: "n3".into(), metadata: vec![],
+            valid_from: None,
+            valid_to: None,
         })).await.unwrap();
 
         // TRAVERSE MATCH with LIMIT 1
@@ -9155,9 +9345,9 @@ mod tests {
         ]).await;
 
         insert_entity_full(&exec, "categories", "c1",
-            vec![("label", Literal::String("Books".into()))]).await;
+            vec![("label", Literal::String("Books".into()))], None, None).await;
         insert_entity_full(&exec, "items", "i1",
-            vec![("title", Literal::String("Rust in Action".into())), ("cat_id", Literal::String("c1".into()))]).await;
+            vec![("title", Literal::String("Rust in Action".into())), ("cat_id", Literal::String("c1".into()))], None, None).await;
 
         // FETCH * => all fields from both collections
         let stmt = trondb_tql::parse(
@@ -9243,6 +9433,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -9266,6 +9457,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -9370,6 +9562,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
@@ -9414,6 +9607,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            temporal: None,
             order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
