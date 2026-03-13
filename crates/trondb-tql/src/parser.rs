@@ -633,14 +633,30 @@ impl Parser {
             Vec::new()
         };
 
+        // Optional temporal: VALID FROM 'timestamp' [TO 'timestamp']
+        let (valid_from, valid_to) = if self.peek() == Some(&Token::Valid) {
+            self.advance(); // VALID
+            self.expect(&Token::From)?;
+            let from = self.expect_string_lit()?;
+            let to = if self.peek() == Some(&Token::To) {
+                self.advance();
+                Some(self.expect_string_lit()?)
+            } else {
+                None
+            };
+            (Some(from), to)
+        } else {
+            (None, None)
+        };
+
         self.expect(&Token::Semicolon)?;
         Ok(Statement::InsertEdge(InsertEdgeStmt {
             edge_type,
             from_id,
             to_id,
             metadata,
-            valid_from: None,
-            valid_to: None,
+            valid_from,
+            valid_to,
         }))
     }
 
@@ -3045,6 +3061,34 @@ mod tests {
                 assert_eq!(i.valid_to, None);
             }
             _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_edge_valid_from() {
+        let stmt = parse(
+            "INSERT EDGE performs FROM 'artist1' TO 'event1' VALID FROM '2025-03-01T00:00:00Z';"
+        ).unwrap();
+        match stmt {
+            Statement::InsertEdge(e) => {
+                assert_eq!(e.valid_from, Some("2025-03-01T00:00:00Z".into()));
+                assert_eq!(e.valid_to, None);
+            }
+            _ => panic!("expected InsertEdge"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_edge_valid_from_to() {
+        let stmt = parse(
+            "INSERT EDGE performs FROM 'artist1' TO 'event1' VALID FROM '2025-03-01T00:00:00Z' TO '2025-12-31T00:00:00Z';"
+        ).unwrap();
+        match stmt {
+            Statement::InsertEdge(e) => {
+                assert_eq!(e.valid_from, Some("2025-03-01T00:00:00Z".into()));
+                assert_eq!(e.valid_to, Some("2025-12-31T00:00:00Z".into()));
+            }
+            _ => panic!("expected InsertEdge"),
         }
     }
 }
