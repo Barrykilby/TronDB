@@ -102,6 +102,12 @@ pub struct Representation {
     pub vector: VectorData,
     pub recipe_hash: [u8; 32],
     pub state: ReprState,
+    /// Timestamp (millis since epoch) when this embedding was computed.
+    #[serde(default)]
+    pub computed_at: u64,
+    /// Version identifier of the model used.
+    #[serde(default)]
+    pub model_version: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +122,15 @@ pub struct Entity {
     pub metadata: HashMap<String, Value>,
     pub representations: Vec<Representation>,
     pub schema_version: u32,
+    /// Valid time: when this fact became true (millis since epoch). None = always valid.
+    #[serde(default)]
+    pub valid_from: Option<i64>,
+    /// Valid time: when this fact stopped being true (millis since epoch). None = still valid.
+    #[serde(default)]
+    pub valid_to: Option<i64>,
+    /// Transaction time: WAL LSN at which this entity was written. Engine-controlled.
+    #[serde(default)]
+    pub tx_time: u64,
 }
 
 impl Entity {
@@ -127,6 +142,9 @@ impl Entity {
             metadata: HashMap::new(),
             representations: Vec::new(),
             schema_version: 1,
+            valid_from: None,
+            valid_to: None,
+            tx_time: 0,
         }
     }
 
@@ -145,6 +163,18 @@ impl Entity {
     /// Set raw data (builder style).
     pub fn with_raw_data(mut self, data: Bytes) -> Self {
         self.raw_data = data;
+        self
+    }
+
+    /// Set valid_from (builder style).
+    pub fn with_valid_from(mut self, ts: i64) -> Self {
+        self.valid_from = Some(ts);
+        self
+    }
+
+    /// Set valid_to (builder style).
+    pub fn with_valid_to(mut self, ts: i64) -> Self {
+        self.valid_to = Some(ts);
         self
     }
 }
@@ -212,6 +242,12 @@ pub struct StoredRepresentation {
     pub sparse: bool,
     #[serde(default)]
     pub fields: Vec<String>,
+    /// Timestamp (millis since epoch) when the embedding was computed.
+    #[serde(default)]
+    pub computed_at: u64,
+    /// Version identifier of the model used to compute this representation.
+    #[serde(default)]
+    pub model_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -310,6 +346,8 @@ mod tests {
                 metric: Metric::Cosine,
                 sparse: false,
             fields: vec![],
+            computed_at: 0,
+            model_version: String::new(),
             }],
             fields: vec![StoredField {
                 name: "status".into(),
@@ -338,5 +376,84 @@ mod tests {
             FieldType::EntityRef("venues".into()),
             FieldType::EntityRef("venues".into())
         );
+    }
+
+    #[test]
+    fn entity_temporal_fields_default_none() {
+        let entity = Entity::new(LogicalId::from_string("e1"));
+        assert_eq!(entity.valid_from, None);
+        assert_eq!(entity.valid_to, None);
+        assert_eq!(entity.tx_time, 0);
+    }
+
+    #[test]
+    fn entity_temporal_serde_roundtrip() {
+        let mut entity = Entity::new(LogicalId::from_string("e1"));
+        entity.valid_from = Some(1704067200000); // 2024-01-01
+        entity.valid_to = Some(1719792000000);   // 2024-07-01
+        entity.tx_time = 42;
+        let bytes = rmp_serde::to_vec_named(&entity).unwrap();
+        let restored: Entity = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.valid_from, Some(1704067200000));
+        assert_eq!(restored.valid_to, Some(1719792000000));
+        assert_eq!(restored.tx_time, 42);
+    }
+
+    #[test]
+    fn entity_backward_compat_no_temporal_fields() {
+        // Simulate an old entity without temporal fields
+        #[derive(serde::Serialize)]
+        struct OldEntity {
+            id: LogicalId,
+            metadata: HashMap<String, Value>,
+            representations: Vec<Representation>,
+            schema_version: u32,
+        }
+        let old = OldEntity {
+            id: LogicalId::from_string("e1"),
+            metadata: HashMap::new(),
+            representations: vec![],
+            schema_version: 1,
+        };
+        let bytes = rmp_serde::to_vec_named(&old).unwrap();
+        let restored: Entity = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.valid_from, None);
+        assert_eq!(restored.valid_to, None);
+        assert_eq!(restored.tx_time, 0);
+    }
+
+    #[test]
+    fn entity_with_valid_time_builder() {
+        let entity = Entity::new(LogicalId::from_string("e1"))
+            .with_valid_from(1704067200000)
+            .with_valid_to(1719792000000);
+        assert_eq!(entity.valid_from, Some(1704067200000));
+        assert_eq!(entity.valid_to, Some(1719792000000));
+    }
+
+    #[test]
+    fn stored_representation_computed_at_default() {
+        // Simulate an old StoredRepresentation without computed_at/model_version
+        #[derive(serde::Serialize)]
+        struct OldStoredRepresentation {
+            name: String,
+            model: Option<String>,
+            dimensions: Option<usize>,
+            metric: Metric,
+            sparse: bool,
+            fields: Vec<String>,
+        }
+        let old = OldStoredRepresentation {
+            name: "identity".into(),
+            model: Some("jina-v4".into()),
+            dimensions: Some(1024),
+            metric: Metric::Cosine,
+            sparse: false,
+            fields: vec![],
+        };
+        let bytes = rmp_serde::to_vec_named(&old).unwrap();
+        let restored: StoredRepresentation = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.computed_at, 0);
+        assert_eq!(restored.model_version, "");
     }
 }

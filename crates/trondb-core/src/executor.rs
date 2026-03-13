@@ -509,6 +509,8 @@ impl Executor {
                         vector: vector_data,
                         recipe_hash,
                         state: ReprState::Clean,
+                        computed_at: 0,
+                        model_version: String::new(),
                     };
                     entity.representations.push(repr);
                 }
@@ -558,6 +560,8 @@ impl Executor {
                         vector: vector_data,
                         recipe_hash,
                         state: ReprState::Clean,
+                        computed_at: 0,
+                        model_version: String::new(),
                     };
                     entity.representations.push(repr);
                 }
@@ -3000,6 +3004,8 @@ fn build_collection_schema(p: &crate::planner::CreateCollectionPlan) -> Collecti
             metric: convert_metric(&r.metric),
             sparse: r.sparse,
             fields: r.fields.clone(),
+            computed_at: 0,
+            model_version: String::new(),
         }
     }).collect();
 
@@ -6159,8 +6165,13 @@ mod tests {
                 vector: VectorData::Dense(vec![0.5, 0.5, 0.0, 0.0]),
                 recipe_hash: [0u8; 32],
                 state: ReprState::Clean,
+                computed_at: 0,
+                model_version: String::new(),
             }],
             schema_version: 1,
+            valid_from: None,
+            valid_to: None,
+            tx_time: 0,
         };
 
         // Register the location entry in Dirty state (simulates crash after UPDATE)
@@ -6233,8 +6244,13 @@ mod tests {
                 vector: VectorData::Dense(vec![1.0, 0.0, 0.0, 0.0]),
                 recipe_hash: [0u8; 32],
                 state: ReprState::Clean,
+                computed_at: 0,
+                model_version: String::new(),
             }],
             schema_version: 1,
+            valid_from: None,
+            valid_to: None,
+            tx_time: 0,
         };
 
         // Register location entry and transition to Recomputing
@@ -6335,8 +6351,13 @@ mod tests {
                 vector: VectorData::Dense(vec![0.0, 0.0, 1.0, 0.0]),
                 recipe_hash: [0u8; 32],
                 state: ReprState::Clean,
+                computed_at: 0,
+                model_version: String::new(),
             }],
             schema_version: 1,
+            valid_from: None,
+            valid_to: None,
+            tx_time: 0,
         };
         let write_payload = rmp_serde::to_vec_named(&updated_entity).unwrap();
         let write_record = WalRecord {

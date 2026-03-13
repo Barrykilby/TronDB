@@ -830,6 +830,8 @@ mod tests {
                 metric: Metric::Cosine,
                 sparse: false,
             fields: vec![],
+            computed_at: 0,
+            model_version: String::new(),
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -879,6 +881,8 @@ mod tests {
                 metric: Metric::Cosine,
                 sparse: false,
             fields: vec![],
+            computed_at: 0,
+            model_version: String::new(),
             }],
             fields: vec![],
             indexes: vec![],
@@ -919,6 +923,8 @@ mod tests {
                 metric: Metric::Cosine,
                 sparse: false,
             fields: vec![],
+            computed_at: 0,
+            model_version: String::new(),
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -965,6 +971,8 @@ mod tests {
                 metric: Metric::Cosine,
                 sparse: false,
             fields: vec![],
+            computed_at: 0,
+            model_version: String::new(),
             }],
             fields: vec![StoredField {
                 name: "score".into(),
@@ -1056,6 +1064,8 @@ mod tests {
                 metric: Metric::Cosine,
                 sparse: false,
             fields: vec![],
+            computed_at: 0,
+            model_version: String::new(),
             }],
             fields: vec![StoredField {
                 name: "score".into(),
@@ -1101,6 +1111,8 @@ mod tests {
                 metric: Metric::Cosine,
                 sparse: false,
             fields: vec![],
+            computed_at: 0,
+            model_version: String::new(),
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -1147,6 +1159,8 @@ mod tests {
                 metric: Metric::Cosine,
                 sparse: false,
             fields: vec![],
+            computed_at: 0,
+            model_version: String::new(),
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -1196,6 +1210,8 @@ mod tests {
                 metric: Metric::Cosine,
                 sparse: false,
             fields: vec![],
+            computed_at: 0,
+            model_version: String::new(),
             }],
             fields: vec![],
             indexes: vec![],
