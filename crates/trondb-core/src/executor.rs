@@ -1241,6 +1241,8 @@ impl Executor {
                     metadata,
                     created_at: now_millis,
                     source: EdgeSource::Structural,
+                    valid_from: None,
+                    valid_to: None,
                 };
 
                 // WAL: TxBegin -> EdgeWrite -> commit
@@ -1256,7 +1258,7 @@ impl Executor {
                 self.store.persist()?;
 
                 // Apply to AdjacencyIndex
-                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0, now_millis, EdgeSource::Structural);
+                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0, now_millis, EdgeSource::Structural, None, None);
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
@@ -1812,6 +1814,8 @@ impl Executor {
                             metadata: _edge.metadata.clone(),
                             created_at: now_millis,
                             source: EdgeSource::Confirmed,
+                            valid_from: None,
+                            valid_to: None,
                         };
 
                         // WAL: TxBegin -> EdgeConfirm -> commit
@@ -1828,7 +1832,7 @@ impl Executor {
 
                         // Update AdjacencyIndex: remove old entry, insert new
                         self.adjacency.remove(&from_id, &p.edge_type, &to_id);
-                        self.adjacency.insert(&from_id, &p.edge_type, &to_id, p.confidence, now_millis, EdgeSource::Confirmed);
+                        self.adjacency.insert(&from_id, &p.edge_type, &to_id, p.confidence, now_millis, EdgeSource::Confirmed, None, None);
 
                         Ok(QueryResult {
                             columns: vec!["result".into()],
@@ -1863,6 +1867,8 @@ impl Executor {
                             metadata: _edge.metadata.clone(),
                             created_at: _edge.created_at,
                             source: EdgeSource::Confirmed,
+                            valid_from: None,
+                            valid_to: None,
                         };
 
                         // WAL: TxBegin -> EdgeConfidenceUpdate -> commit
@@ -1879,7 +1885,7 @@ impl Executor {
 
                         // Update AdjacencyIndex
                         self.adjacency.remove(&from_id, &p.edge_type, &to_id);
-                        self.adjacency.insert(&from_id, &p.edge_type, &to_id, p.confidence, _edge.created_at, EdgeSource::Confirmed);
+                        self.adjacency.insert(&from_id, &p.edge_type, &to_id, p.confidence, _edge.created_at, EdgeSource::Confirmed, None, None);
 
                         Ok(QueryResult {
                             columns: vec!["result".into()],
@@ -1921,6 +1927,8 @@ impl Executor {
                             metadata: HashMap::new(),
                             created_at: now_millis,
                             source: EdgeSource::Confirmed,
+                            valid_from: None,
+                            valid_to: None,
                         };
 
                         // WAL: TxBegin -> EdgeConfirm -> commit
@@ -1936,7 +1944,7 @@ impl Executor {
                         self.store.persist()?;
 
                         // Update AdjacencyIndex
-                        self.adjacency.insert(&from_id, &p.edge_type, &to_id, p.confidence, now_millis, EdgeSource::Confirmed);
+                        self.adjacency.insert(&from_id, &p.edge_type, &to_id, p.confidence, now_millis, EdgeSource::Confirmed, None, None);
 
                         Ok(QueryResult {
                             columns: vec!["result".into()],
@@ -2784,6 +2792,8 @@ impl Executor {
                         metadata: HashMap::new(),
                         created_at: now_millis,
                         source: EdgeSource::Inferred,
+                        valid_from: None,
+                        valid_to: None,
                     };
 
                     // WAL write (EdgeInferred)
@@ -2805,6 +2815,8 @@ impl Executor {
                         edge.confidence,
                         edge.created_at,
                         EdgeSource::Inferred,
+                        None,
+                        None,
                     );
 
                     created_count += 1;

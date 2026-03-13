@@ -40,6 +40,12 @@ pub struct Edge {
     pub created_at: u64,
     #[serde(default)]
     pub source: EdgeSource,
+    /// Valid time: when this edge became true (millis since epoch). None = always valid.
+    #[serde(default)]
+    pub valid_from: Option<i64>,
+    /// Valid time: when this edge stopped being true (millis since epoch). None = still valid.
+    #[serde(default)]
+    pub valid_to: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +141,8 @@ pub struct AdjEntry {
     pub confidence: f32,
     pub created_at: u64,
     pub source: EdgeSource,
+    pub valid_from: Option<i64>,
+    pub valid_to: Option<i64>,
 }
 
 pub struct AdjacencyIndex {
@@ -150,13 +158,25 @@ impl AdjacencyIndex {
         }
     }
 
-    pub fn insert(&self, from_id: &LogicalId, edge_type: &str, to_id: &LogicalId, confidence: f32, created_at: u64, source: EdgeSource) {
+    pub fn insert(
+        &self,
+        from_id: &LogicalId,
+        edge_type: &str,
+        to_id: &LogicalId,
+        confidence: f32,
+        created_at: u64,
+        source: EdgeSource,
+        valid_from: Option<i64>,
+        valid_to: Option<i64>,
+    ) {
         let key = (from_id.clone(), edge_type.to_string());
         let entry = AdjEntry {
             to_id: to_id.clone(),
             confidence,
             created_at,
             source,
+            valid_from,
+            valid_to,
         };
         self.forward
             .entry(key)
@@ -276,8 +296,8 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
-        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural, None, None);
+        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0, EdgeSource::Structural, None, None);
 
         let results = idx.get(&make_id("v1"), "knows");
         assert_eq!(results.len(), 2);
@@ -293,8 +313,8 @@ mod tests {
     #[test]
     fn remove_edge() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
-        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural, None, None);
+        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0, EdgeSource::Structural, None, None);
 
         idx.remove(&make_id("v1"), "knows", &make_id("v2"));
         let results = idx.get(&make_id("v1"), "knows");
@@ -305,7 +325,7 @@ mod tests {
     #[test]
     fn remove_last_edge_cleans_key() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural, None, None);
         idx.remove(&make_id("v1"), "knows", &make_id("v2"));
         assert!(idx.is_empty());
     }
@@ -313,8 +333,8 @@ mod tests {
     #[test]
     fn different_edge_types_separate() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
-        idx.insert(&make_id("v1"), "likes", &make_id("v3"), 0.8, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural, None, None);
+        idx.insert(&make_id("v1"), "likes", &make_id("v3"), 0.8, 0, EdgeSource::Structural, None, None);
 
         assert_eq!(idx.get(&make_id("v1"), "knows").len(), 1);
         assert_eq!(idx.get(&make_id("v1"), "likes").len(), 1);
@@ -323,16 +343,16 @@ mod tests {
     #[test]
     fn len_counts_all_edges() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
-        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0, EdgeSource::Structural);
-        idx.insert(&make_id("v2"), "likes", &make_id("v1"), 0.5, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural, None, None);
+        idx.insert(&make_id("v1"), "knows", &make_id("v3"), 1.0, 0, EdgeSource::Structural, None, None);
+        idx.insert(&make_id("v2"), "likes", &make_id("v1"), 0.5, 0, EdgeSource::Structural, None, None);
         assert_eq!(idx.len(), 3);
     }
 
     #[test]
     fn backward_index_populated_on_insert() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural, None, None);
         let backwards = idx.get_backward(&make_id("v2"), "knows");
         assert_eq!(backwards.len(), 1);
         assert_eq!(backwards[0], make_id("v1"));
@@ -341,7 +361,7 @@ mod tests {
     #[test]
     fn backward_index_remove() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural, None, None);
         idx.remove(&make_id("v1"), "knows", &make_id("v2"));
         let backwards = idx.get_backward(&make_id("v2"), "knows");
         assert!(backwards.is_empty());
@@ -350,9 +370,9 @@ mod tests {
     #[test]
     fn edges_involving_entity() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural);
-        idx.insert(&make_id("v3"), "knows", &make_id("v1"), 1.0, 0, EdgeSource::Structural);
-        idx.insert(&make_id("v1"), "likes", &make_id("v4"), 1.0, 0, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 0, EdgeSource::Structural, None, None);
+        idx.insert(&make_id("v3"), "knows", &make_id("v1"), 1.0, 0, EdgeSource::Structural, None, None);
+        idx.insert(&make_id("v1"), "likes", &make_id("v4"), 1.0, 0, EdgeSource::Structural, None, None);
 
         let (forward, backward) = idx.edges_involving(&make_id("v1"));
         assert_eq!(forward.len(), 2); // knows->v2, likes->v4
@@ -369,6 +389,8 @@ mod tests {
             metadata: HashMap::new(),
             created_at: 0,
             source: EdgeSource::Structural,
+            valid_from: None,
+            valid_to: None,
         };
         let bytes = rmp_serde::to_vec_named(&edge).unwrap();
         let restored: Edge = rmp_serde::from_slice(&bytes).unwrap();
@@ -402,7 +424,7 @@ mod tests {
     #[test]
     fn adj_entry_stores_created_at() {
         let idx = AdjacencyIndex::new();
-        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 42, EdgeSource::Structural);
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 42, EdgeSource::Structural, None, None);
         let results = idx.get(&make_id("v1"), "knows");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].created_at, 42);
@@ -513,6 +535,8 @@ mod tests {
             metadata: HashMap::new(),
             created_at: 0,
             source: EdgeSource::Inferred,
+            valid_from: None,
+            valid_to: None,
         };
         let json = serde_json::to_string(&edge).unwrap();
         assert!(json.contains("Inferred"));
@@ -537,5 +561,46 @@ mod tests {
         assert!(!config.auto);
         assert_eq!(config.confidence_floor, 0.5);
         assert_eq!(config.limit, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge temporal field tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn edge_temporal_fields_default_none() {
+        let json = r#"{"from_id":"a","to_id":"b","edge_type":"test","confidence":1.0,"metadata":{},"created_at":0,"source":"Structural"}"#;
+        let edge: Edge = serde_json::from_str(json).unwrap();
+        assert_eq!(edge.valid_from, None);
+        assert_eq!(edge.valid_to, None);
+    }
+
+    #[test]
+    fn edge_temporal_roundtrip() {
+        let edge = Edge {
+            from_id: make_id("a"),
+            to_id: make_id("b"),
+            edge_type: "knows".into(),
+            confidence: 1.0,
+            metadata: HashMap::new(),
+            created_at: 0,
+            source: EdgeSource::Structural,
+            valid_from: Some(1704067200000),
+            valid_to: Some(1719792000000),
+        };
+        let bytes = rmp_serde::to_vec_named(&edge).unwrap();
+        let restored: Edge = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.valid_from, Some(1704067200000));
+        assert_eq!(restored.valid_to, Some(1719792000000));
+    }
+
+    #[test]
+    fn adj_entry_temporal_fields() {
+        let idx = AdjacencyIndex::new();
+        idx.insert(&make_id("v1"), "knows", &make_id("v2"), 1.0, 42, EdgeSource::Structural,
+                   Some(1704067200000), Some(1719792000000));
+        let results = idx.get(&make_id("v1"), "knows");
+        assert_eq!(results[0].valid_from, Some(1704067200000));
+        assert_eq!(results[0].valid_to, Some(1719792000000));
     }
 }
