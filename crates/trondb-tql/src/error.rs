@@ -9,6 +9,7 @@ pub enum ParseError {
     },
     UnexpectedEof(String),
     InvalidSyntax(String),
+    InvalidQuery(String),
     LexerError(usize),
 }
 
@@ -20,6 +21,7 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnexpectedEof(msg) => write!(f, "unexpected end of input: {msg}"),
             ParseError::InvalidSyntax(msg) => write!(f, "invalid syntax: {msg}"),
+            ParseError::InvalidQuery(msg) => write!(f, "invalid query: {msg}"),
             ParseError::LexerError(pos) => write!(f, "lexer error at position {pos}"),
         }
     }

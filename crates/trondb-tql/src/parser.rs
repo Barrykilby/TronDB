@@ -771,9 +771,45 @@ impl Parser {
     fn parse_fetch(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // FETCH
         let hints = self.parse_hints();
+
+        // Peek ahead: if first field token is followed by a Dot, this is a JOIN query
+        let is_join_style = match self.peek() {
+            Some(Token::Star) => {
+                // Could be either — check after FROM for AS
+                false // will detect via AS after collection
+            }
+            Some(Token::Ident(_)) => {
+                // Check if next-next is Dot (qualified field)
+                self.pos + 1 < self.tokens.len() && self.tokens[self.pos + 1].0 == Token::Dot
+            }
+            _ => false,
+        };
+
+        if is_join_style {
+            let join_fields = self.parse_join_field_list()?;
+            self.expect(&Token::From)?;
+            let collection = self.expect_ident()?;
+            return self.parse_fetch_join(hints, join_fields, collection);
+        }
+
+        // Standard FETCH — parse plain field list
         let fields = self.parse_field_list()?;
         self.expect(&Token::From)?;
         let collection = self.expect_ident()?;
+
+        // Even with *, check for AS (JOIN with SELECT *)
+        if self.peek() == Some(&Token::As) {
+            let join_fields = match fields {
+                FieldList::All => JoinFieldList::All,
+                FieldList::Named(_names) => {
+                    // Convert unqualified names — shouldn't happen if detection above is correct
+                    return Err(ParseError::InvalidQuery(
+                        "JOIN fields must be qualified (alias.field)".into(),
+                    ));
+                }
+            };
+            return self.parse_fetch_join(hints, join_fields, collection);
+        }
 
         let filter = if self.peek() == Some(&Token::Where) {
             self.advance();
@@ -1028,6 +1064,246 @@ impl Parser {
         }))
     }
 
+    /// Parse a field name in WHERE context: plain `field` or qualified `alias.field`.
+    /// Returns the field as a string (e.g., "name" or "e.type").
+    /// Handles keywords after dot (e.g., `e.type` where `type` is Token::Type).
+    fn expect_where_field(&mut self) -> Result<String, ParseError> {
+        let first = self.expect_ident()?;
+        // Check for qualified: alias.field
+        if self.peek() == Some(&Token::Dot) {
+            self.advance(); // consume Dot
+            // After the dot, accept either Ident or keyword tokens used as field names
+            let field_part = match self.advance() {
+                Some((Token::Ident(s), _)) => s,
+                Some((Token::Type, _)) => "type".to_string(),
+                Some((Token::Order, _)) => "order".to_string(),
+                Some((Token::Set, _)) => "set".to_string(),
+                Some((Token::All, _)) => "all".to_string(),
+                Some((Token::In, _)) => "in".to_string(),
+                Some((Token::Index, _)) => "index".to_string(),
+                Some((Token::Edge, _)) => "edge".to_string(),
+                Some((Token::Fields, _)) => "fields".to_string(),
+                Some((Token::Auto, _)) => "auto".to_string(),
+                Some((Token::Step, _)) => "step".to_string(),
+                Some((Token::Group, _)) => "group".to_string(),
+                Some((tok, pos)) => return Err(ParseError::UnexpectedToken {
+                    pos,
+                    expected: "field name after dot".to_string(),
+                    got: format!("{tok:?}"),
+                }),
+                None => return Err(ParseError::UnexpectedEof("expected field name after dot".to_string())),
+            };
+            Ok(format!("{first}.{field_part}"))
+        } else {
+            Ok(first)
+        }
+    }
+
+    /// Parse a qualified field: `alias.field` or `_edge.confidence`
+    /// Returns QualifiedField if a dot follows the ident, otherwise None.
+    /// Accepts keywords after the dot (e.g., `_edge.confidence`, `e.type`).
+    fn try_parse_qualified_field(&mut self) -> Result<Option<QualifiedField>, ParseError> {
+        // Check if current token is Ident followed by Dot
+        if let Some(Token::Ident(_)) = self.peek() {
+            // Lookahead: is the next-next token a Dot?
+            if self.pos + 1 < self.tokens.len() {
+                if self.tokens[self.pos + 1].0 == Token::Dot {
+                    let alias = self.expect_ident()?;
+                    self.expect(&Token::Dot)?;
+                    let field = self.expect_ident_or_keyword_as_field()?;
+                    return Ok(Some(QualifiedField { alias, field }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Accept an identifier or a keyword token as a field name.
+    /// This is needed because qualified fields like `_edge.confidence` or `e.type`
+    /// have keywords after the dot.
+    fn expect_ident_or_keyword_as_field(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Some((Token::Ident(s), _)) => Ok(s),
+            Some((Token::Confidence, _)) => Ok("confidence".to_string()),
+            Some((Token::Type, _)) => Ok("type".to_string()),
+            Some((Token::Order, _)) => Ok("order".to_string()),
+            Some((Token::Set, _)) => Ok("set".to_string()),
+            Some((Token::All, _)) => Ok("all".to_string()),
+            Some((Token::In, _)) => Ok("in".to_string()),
+            Some((Token::Index, _)) => Ok("index".to_string()),
+            Some((Token::Edge, _)) => Ok("edge".to_string()),
+            Some((Token::Fields, _)) => Ok("fields".to_string()),
+            Some((Token::Auto, _)) => Ok("auto".to_string()),
+            Some((Token::Step, _)) => Ok("step".to_string()),
+            Some((Token::Group, _)) => Ok("group".to_string()),
+            Some((Token::Inner, _)) => Ok("inner".to_string()),
+            Some((Token::Left, _)) => Ok("left".to_string()),
+            Some((Token::Right, _)) => Ok("right".to_string()),
+            Some((Token::Full, _)) => Ok("full".to_string()),
+            Some((Token::Join, _)) => Ok("join".to_string()),
+            Some((Token::As, _)) => Ok("as".to_string()),
+            Some((Token::Text, _)) => Ok("text".to_string()),
+            Some((tok, pos)) => Err(ParseError::UnexpectedToken {
+                pos,
+                expected: "field name".to_string(),
+                got: format!("{tok:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEof("expected field name".to_string())),
+        }
+    }
+
+    /// Parse a join field list: `*` or `alias.field, alias.field, ...`
+    fn parse_join_field_list(&mut self) -> Result<JoinFieldList, ParseError> {
+        if self.peek() == Some(&Token::Star) {
+            self.advance();
+            return Ok(JoinFieldList::All);
+        }
+        let mut fields = Vec::new();
+        // First field
+        match self.try_parse_qualified_field()? {
+            Some(qf) => fields.push(qf),
+            None => {
+                // Unqualified field in a JOIN context — error
+                let ident = self.expect_ident()?;
+                return Err(ParseError::InvalidQuery(format!(
+                    "JOIN fields must be qualified (alias.field), got bare '{ident}'"
+                )));
+            }
+        }
+        while self.peek() == Some(&Token::Comma) {
+            self.advance();
+            match self.try_parse_qualified_field()? {
+                Some(qf) => fields.push(qf),
+                None => {
+                    let ident = self.expect_ident()?;
+                    return Err(ParseError::InvalidQuery(format!(
+                        "JOIN fields must be qualified (alias.field), got bare '{ident}'"
+                    )));
+                }
+            }
+        }
+        Ok(JoinFieldList::Named(fields))
+    }
+
+    /// Parse a FETCH ... FROM ... AS ... JOIN statement.
+    /// Called from parse_fetch when we detect `AS` after the FROM collection.
+    fn parse_fetch_join(
+        &mut self,
+        hints: Vec<QueryHint>,
+        fields_raw: JoinFieldList,
+        from_collection: String,
+    ) -> Result<Statement, ParseError> {
+        // We've already consumed: FETCH fields FROM collection
+        // Now expect: AS alias
+        self.expect(&Token::As)?;
+        let from_alias = self.expect_ident()?;
+
+        // Parse one or more JOIN clauses
+        let mut joins = Vec::new();
+        loop {
+            let join_type = match self.peek() {
+                Some(Token::Inner) => {
+                    self.advance();
+                    self.expect(&Token::Join)?;
+                    JoinType::Inner
+                }
+                Some(Token::Left) => {
+                    self.advance();
+                    self.expect(&Token::Join)?;
+                    JoinType::Left
+                }
+                Some(Token::Right) => {
+                    self.advance();
+                    self.expect(&Token::Join)?;
+                    JoinType::Right
+                }
+                Some(Token::Full) => {
+                    self.advance();
+                    self.expect(&Token::Join)?;
+                    JoinType::Full
+                }
+                Some(Token::Join) => {
+                    self.advance();
+                    JoinType::Inner // bare JOIN = INNER JOIN
+                }
+                _ => break,
+            };
+
+            let join_collection = self.expect_ident()?;
+            self.expect(&Token::As)?;
+            let join_alias = self.expect_ident()?;
+
+            self.expect(&Token::On)?;
+
+            // ON left_alias.left_field = right_alias.right_field
+            let on_left = self.try_parse_qualified_field()?.ok_or_else(|| {
+                ParseError::InvalidQuery("expected qualified field in ON clause (alias.field)".into())
+            })?;
+            self.expect(&Token::Eq)?;
+            let on_right = self.try_parse_qualified_field()?.ok_or_else(|| {
+                ParseError::InvalidQuery("expected qualified field in ON clause (alias.field)".into())
+            })?;
+
+            // Optional CONFIDENCE > threshold (probabilistic join)
+            let confidence_threshold = if self.peek() == Some(&Token::Confidence) {
+                self.advance();
+                self.expect(&Token::Gt)?;
+                Some(self.expect_float_or_int()?)
+            } else {
+                None
+            };
+
+            joins.push(JoinClause {
+                join_type,
+                collection: join_collection,
+                alias: join_alias,
+                on_left,
+                on_right,
+                confidence_threshold,
+            });
+        }
+
+        if joins.is_empty() {
+            return Err(ParseError::InvalidQuery("expected at least one JOIN clause".into()));
+        }
+
+        // Optional WHERE
+        let filter = if self.peek() == Some(&Token::Where) {
+            self.advance();
+            Some(self.parse_where_clause()?)
+        } else {
+            None
+        };
+
+        // Optional ORDER BY
+        let order_by = if self.peek() == Some(&Token::Order) {
+            self.advance();
+            self.parse_order_by()?
+        } else {
+            vec![]
+        };
+
+        // Optional LIMIT
+        let limit = if self.peek() == Some(&Token::Limit) {
+            self.advance();
+            Some(self.expect_int()? as usize)
+        } else {
+            None
+        };
+
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::FetchJoin(FetchJoinStmt {
+            fields: fields_raw,
+            from_collection,
+            from_alias,
+            joins,
+            filter,
+            order_by,
+            limit,
+            hints,
+        }))
+    }
+
     fn parse_field_list(&mut self) -> Result<FieldList, ParseError> {
         if self.peek() == Some(&Token::Star) {
             self.advance();
@@ -1070,7 +1346,7 @@ impl Parser {
             return Ok(WhereClause::Not(Box::new(inner)));
         }
 
-        let field = self.expect_ident()?;
+        let field = self.expect_where_field()?;
 
         // IS NULL / IS NOT NULL
         if self.peek() == Some(&Token::Is) {
@@ -2298,6 +2574,109 @@ mod tests {
                 assert!(f.hints.is_empty());
             }
             _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_structural_inner_join() {
+        let stmt = parse(
+            "FETCH e.name, v.address FROM entities AS e INNER JOIN venues AS v ON e.venue_id = v.id WHERE e.type = 'event';"
+        ).unwrap();
+        match stmt {
+            Statement::FetchJoin(j) => {
+                assert_eq!(j.from_collection, "entities");
+                assert_eq!(j.from_alias, "e");
+                assert_eq!(j.joins.len(), 1);
+                assert_eq!(j.joins[0].join_type, JoinType::Inner);
+                assert_eq!(j.joins[0].collection, "venues");
+                assert_eq!(j.joins[0].alias, "v");
+                assert_eq!(j.joins[0].on_left, QualifiedField { alias: "e".into(), field: "venue_id".into() });
+                assert_eq!(j.joins[0].on_right, QualifiedField { alias: "v".into(), field: "id".into() });
+                assert!(j.joins[0].confidence_threshold.is_none());
+                assert!(j.filter.is_some());
+                match &j.fields {
+                    JoinFieldList::Named(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0], QualifiedField { alias: "e".into(), field: "name".into() });
+                        assert_eq!(fields[1], QualifiedField { alias: "v".into(), field: "address".into() });
+                    }
+                    _ => panic!("expected Named fields"),
+                }
+            }
+            _ => panic!("expected FetchJoin"),
+        }
+    }
+
+    #[test]
+    fn parse_probabilistic_join() {
+        let stmt = parse(
+            "FETCH e.name, a.name, _edge.confidence FROM entities AS e INNER JOIN acts AS a ON e.id = a.entity_id CONFIDENCE > 0.75;"
+        ).unwrap();
+        match stmt {
+            Statement::FetchJoin(j) => {
+                assert_eq!(j.joins[0].confidence_threshold, Some(0.75));
+                match &j.fields {
+                    JoinFieldList::Named(fields) => {
+                        assert_eq!(fields.len(), 3);
+                        assert_eq!(fields[2], QualifiedField { alias: "_edge".into(), field: "confidence".into() });
+                    }
+                    _ => panic!("expected Named fields"),
+                }
+            }
+            _ => panic!("expected FetchJoin"),
+        }
+    }
+
+    #[test]
+    fn parse_left_join() {
+        let stmt = parse(
+            "FETCH * FROM entities AS e LEFT JOIN venues AS v ON e.venue_id = v.id;"
+        ).unwrap();
+        match stmt {
+            Statement::FetchJoin(j) => {
+                assert_eq!(j.joins[0].join_type, JoinType::Left);
+                assert_eq!(j.fields, JoinFieldList::All);
+            }
+            _ => panic!("expected FetchJoin"),
+        }
+    }
+
+    #[test]
+    fn parse_right_join() {
+        let stmt = parse(
+            "FETCH * FROM entities AS e RIGHT JOIN venues AS v ON e.venue_id = v.id;"
+        ).unwrap();
+        match stmt {
+            Statement::FetchJoin(j) => {
+                assert_eq!(j.joins[0].join_type, JoinType::Right);
+            }
+            _ => panic!("expected FetchJoin"),
+        }
+    }
+
+    #[test]
+    fn parse_full_join() {
+        let stmt = parse(
+            "FETCH * FROM entities AS e FULL JOIN venues AS v ON e.venue_id = v.id;"
+        ).unwrap();
+        match stmt {
+            Statement::FetchJoin(j) => {
+                assert_eq!(j.joins[0].join_type, JoinType::Full);
+            }
+            _ => panic!("expected FetchJoin"),
+        }
+    }
+
+    #[test]
+    fn parse_join_with_limit() {
+        let stmt = parse(
+            "FETCH e.name FROM entities AS e INNER JOIN venues AS v ON e.venue_id = v.id LIMIT 10;"
+        ).unwrap();
+        match stmt {
+            Statement::FetchJoin(j) => {
+                assert_eq!(j.limit, Some(10));
+            }
+            _ => panic!("expected FetchJoin"),
         }
     }
 }
