@@ -7,7 +7,8 @@ use crate::pb;
 use trondb_core::planner::*;
 use trondb_tql::ast::{
     DecayConfigDecl, DecayFnDecl, FieldDecl, FieldList, FieldType, IndexDecl, Literal, Metric,
-    RepresentationDecl, TierTarget, VectorLiteral, WhereClause,
+    OrderByClause, QueryHint, RepresentationDecl, SortDirection, TierTarget, VectorLiteral,
+    WhereClause,
 };
 
 // ---------------------------------------------------------------------------
@@ -374,6 +375,56 @@ fn proto_to_pre_filter(proto: &pb::PreFilterProto) -> Result<PreFilter, String> 
     })
 }
 
+fn order_by_to_proto(clause: &OrderByClause) -> pb::OrderByClauseProto {
+    pb::OrderByClauseProto {
+        field: clause.field.clone(),
+        direction: match clause.direction {
+            SortDirection::Asc => "ASC".into(),
+            SortDirection::Desc => "DESC".into(),
+        },
+    }
+}
+
+fn proto_to_order_by(proto: &pb::OrderByClauseProto) -> OrderByClause {
+    OrderByClause {
+        field: proto.field.clone(),
+        direction: if proto.direction == "DESC" {
+            SortDirection::Desc
+        } else {
+            SortDirection::Asc
+        },
+    }
+}
+
+fn hint_to_proto(hint: &QueryHint) -> String {
+    match hint {
+        QueryHint::NoPromote => "NO_PROMOTE".into(),
+        QueryHint::NoPrefilter => "NO_PREFILTER".into(),
+        QueryHint::ForceFullScan => "FORCE_FULL_SCAN".into(),
+        QueryHint::MaxAcu(v) => format!("MAX_ACU({})", v),
+        QueryHint::Timeout(v) => format!("TIMEOUT({})", v),
+    }
+}
+
+fn proto_to_hint(s: &str) -> Option<QueryHint> {
+    match s {
+        "NO_PROMOTE" => Some(QueryHint::NoPromote),
+        "NO_PREFILTER" => Some(QueryHint::NoPrefilter),
+        "FORCE_FULL_SCAN" => Some(QueryHint::ForceFullScan),
+        other => {
+            if let Some(inner) = other.strip_prefix("MAX_ACU(").and_then(|s| s.strip_suffix(')')) {
+                inner.parse::<f64>().ok().map(QueryHint::MaxAcu)
+            } else if let Some(inner) =
+                other.strip_prefix("TIMEOUT(").and_then(|s| s.strip_suffix(')'))
+            {
+                inner.parse::<u64>().ok().map(QueryHint::Timeout)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plan -> Proto
 // ---------------------------------------------------------------------------
@@ -418,6 +469,8 @@ impl From<&Plan> for pb::PlanRequest {
                         limit: fp.limit.map(|l| l as u64),
                         strategy,
                         strategy_index_name,
+                        order_by: fp.order_by.iter().map(order_by_to_proto).collect(),
+                        hints: fp.hints.iter().map(hint_to_proto).collect(),
                     })
                 }
 
@@ -446,6 +499,7 @@ impl From<&Plan> for pb::PlanRequest {
                     has_sparse: sp.sparse_vector.is_some(),
                     query_text: sp.query_text.clone(),
                     using_repr: sp.using_repr.clone(),
+                    hints: sp.hints.iter().map(hint_to_proto).collect(),
                 }),
 
                 Plan::Explain(inner) => PP::Explain(Box::new(pb::ExplainPlan {
@@ -623,10 +677,10 @@ impl TryFrom<pb::PlanRequest> for Plan {
                 collection: fp.collection,
                 fields: proto_to_field_list(&fp.fields.ok_or("missing fields")?),
                 filter: fp.filter.as_ref().map(proto_to_where_clause).transpose()?,
-                order_by: vec![],
+                order_by: fp.order_by.iter().map(proto_to_order_by).collect(),
                 limit: fp.limit.map(|l| l as usize),
                 strategy: proto_to_fetch_strategy(fp.strategy, &fp.strategy_index_name),
-                hints: vec![],
+                hints: fp.hints.iter().filter_map(|s| proto_to_hint(s)).collect(),
             })),
 
             PP::Search(sp) => {
@@ -661,7 +715,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     strategy: proto_to_search_strategy(sp.strategy),
                     query_text: sp.query_text,
                     using_repr: sp.using_repr,
-                    hints: vec![],
+                    hints: sp.hints.iter().filter_map(|s| proto_to_hint(s)).collect(),
                 }))
             }
 
@@ -795,7 +849,9 @@ impl TryFrom<pb::PlanRequest> for Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trondb_tql::{FieldList, Literal, VectorLiteral, WhereClause};
+    use trondb_tql::{
+        FieldList, Literal, OrderByClause, QueryHint, SortDirection, VectorLiteral, WhereClause,
+    };
 
     fn round_trip(plan: Plan) -> Plan {
         let proto: pb::PlanRequest = (&plan).into();
@@ -1356,6 +1412,120 @@ mod tests {
                 assert!(p.limit.is_none());
             }
             _ => panic!("expected ExplainHistory"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_drop_collection() {
+        let plan = Plan::DropCollection(DropCollectionPlan {
+            name: "old_data".into(),
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::DropCollection(p) => {
+                assert_eq!(p.name, "old_data");
+            }
+            _ => panic!("expected DropCollection"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_drop_edge_type() {
+        let plan = Plan::DropEdgeType(DropEdgeTypePlan {
+            name: "old_likes".into(),
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::DropEdgeType(p) => {
+                assert_eq!(p.name, "old_likes");
+            }
+            _ => panic!("expected DropEdgeType"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_fetch_with_order_by() {
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::Named(vec!["name".into(), "score".into()]),
+            filter: Some(WhereClause::Gt("score".into(), Literal::Int(50))),
+            order_by: vec![
+                OrderByClause {
+                    field: "score".into(),
+                    direction: SortDirection::Desc,
+                },
+                OrderByClause {
+                    field: "name".into(),
+                    direction: SortDirection::Asc,
+                },
+            ],
+            limit: Some(20),
+            strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
+            hints: vec![QueryHint::NoPromote, QueryHint::ForceFullScan],
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Fetch(fp) => {
+                assert_eq!(fp.collection, "venues");
+                assert_eq!(fp.order_by.len(), 2);
+                assert_eq!(fp.order_by[0].field, "score");
+                assert_eq!(fp.order_by[0].direction, SortDirection::Desc);
+                assert_eq!(fp.order_by[1].field, "name");
+                assert_eq!(fp.order_by[1].direction, SortDirection::Asc);
+                assert_eq!(fp.limit, Some(20));
+                assert_eq!(fp.hints.len(), 2);
+                assert!(fp.hints.contains(&QueryHint::NoPromote));
+                assert!(fp.hints.contains(&QueryHint::ForceFullScan));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_fetch_with_max_acu_hint() {
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![QueryHint::MaxAcu(200.0)],
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Fetch(fp) => {
+                assert_eq!(fp.hints.len(), 1);
+                assert_eq!(fp.hints[0], QueryHint::MaxAcu(200.0));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_search_with_hints() {
+        let plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![QueryHint::NoPrefilter, QueryHint::Timeout(5000)],
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Search(sp) => {
+                assert_eq!(sp.hints.len(), 2);
+                assert!(sp.hints.contains(&QueryHint::NoPrefilter));
+                assert!(sp.hints.contains(&QueryHint::Timeout(5000)));
+            }
+            _ => panic!("expected Search"),
         }
     }
 }
