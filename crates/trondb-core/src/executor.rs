@@ -2248,6 +2248,11 @@ impl Executor {
                     },
                 })
             }
+
+            Plan::TraverseMatch(_p) => {
+                // Stub: Task 11 will implement the full BFS traversal
+                Err(EngineError::UnsupportedOperation("TRAVERSE MATCH executor not yet implemented".into()))
+            }
         }
     }
 
@@ -3313,6 +3318,20 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
                 .join(", ");
             props.push(("joins", joins_str));
             props.push(("tier", "Fjall".into()));
+        }
+        Plan::TraverseMatch(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "TRAVERSE MATCH".into()));
+            props.push(("from_id", p.from_id.clone()));
+            if let Some(ref et) = p.pattern.edge.edge_type {
+                props.push(("edge_type", et.clone()));
+            }
+            props.push(("direction", format!("{:?}", p.pattern.edge.direction)));
+            props.push(("depth", format!("{}..{}", p.min_depth, p.max_depth)));
+            if let Some(conf) = p.confidence_threshold {
+                props.push(("confidence_threshold", format!("{conf}")));
+            }
+            props.push(("tier", "Ram".into()));
         }
     }
 

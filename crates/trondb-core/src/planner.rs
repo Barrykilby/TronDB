@@ -58,6 +58,7 @@ pub enum Plan {
     DropCollection(DropCollectionPlan),
     DropEdgeType(DropEdgeTypePlan),
     Join(JoinPlan),
+    TraverseMatch(TraverseMatchPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +210,16 @@ pub struct DropCollectionPlan {
 #[derive(Debug, Clone)]
 pub struct DropEdgeTypePlan {
     pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraverseMatchPlan {
+    pub from_id: String,
+    pub pattern: trondb_tql::MatchPattern,
+    pub min_depth: usize,
+    pub max_depth: usize,
+    pub confidence_threshold: Option<f64>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -514,8 +525,14 @@ pub fn plan(
             hints: s.hints.clone(),
         })),
 
-        // TODO(phase-12b): Task 10 will add TraverseMatchPlan and planner logic
-        Statement::TraverseMatch(_) => todo!("TRAVERSE MATCH planner not yet implemented"),
+        Statement::TraverseMatch(s) => Ok(Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: s.from_id.clone(),
+            pattern: s.pattern.clone(),
+            min_depth: s.min_depth,
+            max_depth: s.max_depth,
+            confidence_threshold: s.confidence_threshold,
+            limit: s.limit,
+        })),
     }
 }
 
@@ -1052,6 +1069,38 @@ mod tests {
                 assert!(sp.pre_filter.is_none());
             }
             _ => panic!("expected SearchPlan"),
+        }
+    }
+
+    #[test]
+    fn plan_traverse_match() {
+        use trondb_tql::{TraverseMatchStmt, MatchPattern, EdgePattern, EdgeDirection};
+
+        let stmt = Statement::TraverseMatch(TraverseMatchStmt {
+            from_id: "ent_abc".into(),
+            pattern: MatchPattern {
+                source_var: "a".into(),
+                edge: EdgePattern {
+                    variable: Some("e".into()),
+                    edge_type: Some("RELATED_TO".into()),
+                    direction: EdgeDirection::Forward,
+                },
+                target_var: "b".into(),
+            },
+            min_depth: 1,
+            max_depth: 3,
+            confidence_threshold: Some(0.70),
+            limit: None,
+        });
+        let p = plan(&stmt, &empty_schemas()).unwrap();
+        match p {
+            Plan::TraverseMatch(tp) => {
+                assert_eq!(tp.from_id, "ent_abc");
+                assert_eq!(tp.min_depth, 1);
+                assert_eq!(tp.max_depth, 3);
+                assert_eq!(tp.confidence_threshold, Some(0.70));
+            }
+            _ => panic!("expected TraverseMatchPlan"),
         }
     }
 

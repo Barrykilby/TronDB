@@ -667,6 +667,11 @@ impl From<&Plan> for pb::PlanRequest {
                         hints: p.hints.iter().map(hint_to_proto).collect(),
                     })
                 }
+
+                // Task 12 will add full proto message support for TraverseMatch
+                Plan::TraverseMatch(_) => {
+                    panic!("TraverseMatch proto serialisation not yet implemented — Task 12")
+                }
             }),
         }
     }
