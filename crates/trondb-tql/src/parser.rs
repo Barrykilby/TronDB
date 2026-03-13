@@ -596,6 +596,8 @@ impl Parser {
             vectors,
             collocate_with,
             affinity_group,
+            valid_from: None,
+            valid_to: None,
         }))
     }
 
@@ -621,6 +623,8 @@ impl Parser {
             from_id,
             to_id,
             metadata,
+            valid_from: None,
+            valid_to: None,
         }))
     }
 
@@ -826,6 +830,7 @@ impl Parser {
             min_depth,
             max_depth,
             confidence_threshold,
+            temporal: None,
             limit,
         }))
     }
@@ -942,6 +947,7 @@ impl Parser {
             collection,
             fields,
             filter,
+            temporal: None,
             order_by,
             limit,
             hints,
@@ -1869,6 +1875,7 @@ mod tests {
                 collection: "venues".to_string(),
                 fields: FieldList::All,
                 filter: None,
+                temporal: None,
                 order_by: vec![],
                 limit: None,
                 hints: vec![],

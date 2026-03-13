@@ -97,6 +97,8 @@ pub struct InsertStmt {
     pub vectors: Vec<(String, VectorLiteral)>,
     pub collocate_with: Option<Vec<String>>,
     pub affinity_group: Option<String>,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +132,19 @@ pub enum QueryHint {
     Timeout(u64),       // /*+ TIMEOUT(5000) */
 }
 
+// --- Temporal Clauses ---
+
+/// Temporal modifier for queries (AS OF, VALID DURING, AS OF TRANSACTION).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TemporalClause {
+    /// AS OF 'timestamp' -- point-in-time query (valid time)
+    AsOf(String),
+    /// VALID DURING 'start'..'end' -- range query (valid time)
+    ValidDuring(String, String),
+    /// AS OF TRANSACTION lsn -- point-in-time query (transaction time)
+    AsOfTransaction(u64),
+}
+
 // --- FETCH ---
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +152,7 @@ pub struct FetchStmt {
     pub collection: String,
     pub fields: FieldList,
     pub filter: Option<WhereClause>,
+    pub temporal: Option<TemporalClause>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<usize>,
     pub hints: Vec<QueryHint>,
@@ -227,6 +243,8 @@ pub struct InsertEdgeStmt {
     pub from_id: String,
     pub to_id: String,
     pub metadata: Vec<(String, Literal)>,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -426,5 +444,6 @@ pub struct TraverseMatchStmt {
     pub min_depth: usize,
     pub max_depth: usize,
     pub confidence_threshold: Option<f64>,
+    pub temporal: Option<TemporalClause>,
     pub limit: Option<usize>,
 }
