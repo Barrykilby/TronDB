@@ -240,7 +240,7 @@ The HNSW graph topology is never modified under memory pressure. When a hot-tier
 
 ## Current Status
 
-### What's built (Phases 1-10)
+### What's built (Phases 1-11)
 
 | Phase | Deliverable | Status |
 |-------|------------|--------|
@@ -254,13 +254,13 @@ The HNSW graph topology is never modified under memory pressure. When a hot-tier
 | 8 | UPDATE mutations, HNSW persistence, WAL replay for all record types | Done |
 | 9 | Multi-node (gRPC, WAL streaming, write forwarding, scatter-gather, Docker) | Done |
 | 10 | Pluggable vectoriser (ONNX/Network/External), auto-vectorise INSERT, mutation cascade, natural language SEARCH | Done |
+| 11 | Inference pipeline (INFER verb, CONFIRM verb, EdgeSource classification, InferenceSweeper, DecaySweeper, audit buffer) | Done |
 
-### Planned (Phases 11-15)
+### Planned (Phases 12-15)
 
 | Phase | Deliverable |
 |-------|-------------|
-| 11 | INFER verb + inferred edges + admission gate + confidence lifecycle |
-| 12 | CONFIRM verb + inference triggers + candidate generation strategies |
+| 12 | Inference triggers + candidate generation strategies |
 | 13 | Advanced query features (JOINs, ORDER BY, advanced WHERE, query hints) |
 | 14 | ACU cost model + bi-temporal model |
 | 15 | Advanced compression (RaBitQ, MRL, Float16/BF16, PQ) |
