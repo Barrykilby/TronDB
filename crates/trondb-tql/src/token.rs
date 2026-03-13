@@ -294,6 +294,18 @@ pub enum Token {
     #[token("AS", priority = 10, ignore(ascii_case))]
     As,
 
+    #[token("OF", priority = 10, ignore(ascii_case))]
+    Of,
+
+    #[token("TRANSACTION", priority = 10, ignore(ascii_case))]
+    Transaction,
+
+    #[token("VALID", priority = 10, ignore(ascii_case))]
+    Valid,
+
+    #[token("DURING", priority = 10, ignore(ascii_case))]
+    During,
+
     #[token("MATCH", priority = 10, ignore(ascii_case))]
     Match,
 
@@ -774,6 +786,75 @@ mod tests {
         assert_eq!(tokens[0], Token::IntLit(1));
         assert_eq!(tokens[1], Token::DotDot);
         assert_eq!(tokens[2], Token::IntLit(3));
+    }
+
+    #[test]
+    fn lex_of_keyword() {
+        assert_eq!(lex("OF"), vec![Token::Of]);
+        assert_eq!(lex("of"), vec![Token::Of]);
+    }
+
+    #[test]
+    fn lex_transaction_keyword() {
+        assert_eq!(lex("TRANSACTION"), vec![Token::Transaction]);
+        assert_eq!(lex("transaction"), vec![Token::Transaction]);
+    }
+
+    #[test]
+    fn lex_valid_keyword() {
+        assert_eq!(lex("VALID"), vec![Token::Valid]);
+        assert_eq!(lex("valid"), vec![Token::Valid]);
+    }
+
+    #[test]
+    fn lex_during_keyword() {
+        assert_eq!(lex("DURING"), vec![Token::During]);
+        assert_eq!(lex("during"), vec![Token::During]);
+    }
+
+    #[test]
+    fn lex_as_of_sequence() {
+        let tokens = lex("AS OF '2025-01-01T00:00:00Z'");
+        assert_eq!(tokens, vec![
+            Token::As,
+            Token::Of,
+            Token::StringLit("2025-01-01T00:00:00Z".into()),
+        ]);
+    }
+
+    #[test]
+    fn lex_as_of_transaction_sequence() {
+        let tokens = lex("AS OF TRANSACTION 42891");
+        assert_eq!(tokens, vec![
+            Token::As,
+            Token::Of,
+            Token::Transaction,
+            Token::IntLit(42891),
+        ]);
+    }
+
+    #[test]
+    fn lex_valid_during_sequence() {
+        let tokens = lex("VALID DURING '2025-01-01'..'2025-06-30'");
+        assert_eq!(tokens, vec![
+            Token::Valid,
+            Token::During,
+            Token::StringLit("2025-01-01".into()),
+            Token::DotDot,
+            Token::StringLit("2025-06-30".into()),
+        ]);
+    }
+
+    #[test]
+    fn lex_valid_from_to_sequence() {
+        let tokens = lex("VALID FROM '2025-01-01T00:00:00Z' TO '2025-06-30T00:00:00Z'");
+        assert_eq!(tokens, vec![
+            Token::Valid,
+            Token::From,
+            Token::StringLit("2025-01-01T00:00:00Z".into()),
+            Token::To,
+            Token::StringLit("2025-06-30T00:00:00Z".into()),
+        ]);
     }
 
     #[test]
