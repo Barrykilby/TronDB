@@ -42,6 +42,7 @@ sysinfo = "0.34"
 toml = "0.8"
 tokio-stream = "0.1"
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 
 [profile.release]
 lto = true
