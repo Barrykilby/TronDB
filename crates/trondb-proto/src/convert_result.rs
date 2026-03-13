@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::pb;
+use trondb_core::cost::{AcuEstimate, AcuLineItem};
 use trondb_core::result::{QueryMode, QueryResult, QueryStats, Row};
 use trondb_core::types::Value;
+use trondb_core::warning::{PlanWarning, WarningSeverity};
 
 // ---------------------------------------------------------------------------
 // Value helpers
@@ -60,6 +62,61 @@ fn proto_to_mode(proto: i32) -> Result<QueryMode, String> {
 }
 
 // ---------------------------------------------------------------------------
+// AcuEstimate helpers
+// ---------------------------------------------------------------------------
+
+fn acu_estimate_to_proto(est: &AcuEstimate) -> pb::AcuEstimateProto {
+    pb::AcuEstimateProto {
+        items: est.items.iter().map(|item| pb::AcuLineItemProto {
+            operation: item.operation.clone(),
+            count: item.count as u64,
+            unit_cost: item.unit_cost,
+            total: item.total,
+        }).collect(),
+        total_acu: est.total_acu,
+    }
+}
+
+fn proto_to_acu_estimate(proto: &pb::AcuEstimateProto) -> AcuEstimate {
+    AcuEstimate {
+        items: proto.items.iter().map(|item| AcuLineItem {
+            operation: item.operation.clone(),
+            count: item.count as usize,
+            unit_cost: item.unit_cost,
+            total: item.total,
+        }).collect(),
+        total_acu: proto.total_acu,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PlanWarning helpers
+// ---------------------------------------------------------------------------
+
+fn plan_warning_to_proto(w: &PlanWarning) -> pb::PlanWarningProto {
+    pb::PlanWarningProto {
+        severity: w.severity.to_string(),
+        message: w.message.clone(),
+        suggestion: w.suggestion.clone().unwrap_or_default(),
+        acu_impact: w.acu_impact.unwrap_or(0.0),
+    }
+}
+
+fn proto_to_plan_warning(proto: &pb::PlanWarningProto) -> PlanWarning {
+    let severity = match proto.severity.as_str() {
+        "WARN" => WarningSeverity::Warning,
+        "CRIT" => WarningSeverity::Critical,
+        _ => WarningSeverity::Info,
+    };
+    PlanWarning {
+        severity,
+        message: proto.message.clone(),
+        suggestion: if proto.suggestion.is_empty() { None } else { Some(proto.suggestion.clone()) },
+        acu_impact: if proto.acu_impact == 0.0 { None } else { Some(proto.acu_impact) },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // QueryResult -> QueryResponse
 // ---------------------------------------------------------------------------
 
@@ -86,6 +143,8 @@ impl From<&QueryResult> for pb::QueryResponse {
             entities_scanned: result.stats.entities_scanned as u64,
             mode: mode_to_proto(&result.stats.mode) as i32,
             tier: result.stats.tier.clone(),
+            cost: result.stats.cost.as_ref().map(acu_estimate_to_proto),
+            warnings: result.stats.warnings.iter().map(plan_warning_to_proto).collect(),
         };
 
         pb::QueryResponse {
@@ -129,8 +188,8 @@ impl TryFrom<pb::QueryResponse> for QueryResult {
             entities_scanned: stats_proto.entities_scanned as usize,
             mode: proto_to_mode(stats_proto.mode)?,
             tier: stats_proto.tier,
-            cost: None,
-            warnings: vec![],
+            cost: stats_proto.cost.as_ref().map(proto_to_acu_estimate),
+            warnings: stats_proto.warnings.iter().map(proto_to_plan_warning).collect(),
         };
 
         Ok(QueryResult {
@@ -235,5 +294,106 @@ mod tests {
         let proto: pb::QueryResponse = (&result).into();
         let restored = QueryResult::try_from(proto).unwrap();
         assert_eq!(restored.stats.elapsed.as_nanos() as u64, nanos);
+    }
+
+    #[test]
+    fn acu_estimate_round_trip() {
+        let mut est = AcuEstimate::zero();
+        est.add("search_hnsw", 1, 50.0);
+        est.add("fetch_hot", 10, 1.0);
+
+        let proto = acu_estimate_to_proto(&est);
+        let restored = proto_to_acu_estimate(&proto);
+
+        assert_eq!(restored.items.len(), 2);
+        assert!((restored.total_acu - 60.0).abs() < f64::EPSILON);
+        assert_eq!(restored.items[0].operation, "search_hnsw");
+        assert_eq!(restored.items[0].count, 1);
+        assert!((restored.items[0].unit_cost - 50.0).abs() < f64::EPSILON);
+        assert_eq!(restored.items[1].operation, "fetch_hot");
+        assert_eq!(restored.items[1].count, 10);
+    }
+
+    #[test]
+    fn plan_warning_round_trip() {
+        let warning = PlanWarning::warning("full scan on 10k entities")
+            .with_suggestion("add an index on 'city'")
+            .with_acu_impact(5000.0);
+
+        let proto = plan_warning_to_proto(&warning);
+        let restored = proto_to_plan_warning(&proto);
+
+        assert_eq!(restored.severity, WarningSeverity::Warning);
+        assert_eq!(restored.message, "full scan on 10k entities");
+        assert_eq!(restored.suggestion.as_deref(), Some("add an index on 'city'"));
+        assert!((restored.acu_impact.unwrap() - 5000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn plan_warning_info_no_suggestion_round_trip() {
+        let warning = PlanWarning::info("using over-fetch 4x for pre-filter");
+
+        let proto = plan_warning_to_proto(&warning);
+        let restored = proto_to_plan_warning(&proto);
+
+        assert_eq!(restored.severity, WarningSeverity::Info);
+        assert!(restored.suggestion.is_none());
+        assert!(restored.acu_impact.is_none());
+    }
+
+    #[test]
+    fn plan_warning_critical_round_trip() {
+        let warning = PlanWarning::critical("archive-only results")
+            .with_acu_impact(100.0);
+
+        let proto = plan_warning_to_proto(&warning);
+        let restored = proto_to_plan_warning(&proto);
+
+        assert_eq!(restored.severity, WarningSeverity::Critical);
+    }
+
+    #[test]
+    fn query_result_with_cost_and_warnings_round_trip() {
+        let mut cost = AcuEstimate::zero();
+        cost.add("search_hnsw", 1, 50.0);
+        cost.add("fetch_hot", 5, 1.0);
+
+        let warnings = vec![
+            PlanWarning::warning("large result set (k=100)")
+                .with_acu_impact(100.0),
+            PlanWarning::info("using ScalarPreFilter"),
+        ];
+
+        let result = QueryResult {
+            columns: vec!["name".into()],
+            rows: vec![Row {
+                values: HashMap::from([
+                    ("name".into(), Value::String("Alice".into())),
+                ]),
+                score: Some(0.95),
+            }],
+            stats: QueryStats {
+                elapsed: Duration::from_millis(150),
+                entities_scanned: 1000,
+                mode: QueryMode::Probabilistic,
+                tier: "hot".into(),
+                cost: Some(cost),
+                warnings,
+            },
+        };
+
+        let proto: pb::QueryResponse = (&result).into();
+        let restored = QueryResult::try_from(proto).unwrap();
+
+        // Verify cost round-trip
+        let restored_cost = restored.stats.cost.as_ref().expect("cost should be present");
+        assert!((restored_cost.total_acu - 55.0).abs() < f64::EPSILON);
+        assert_eq!(restored_cost.items.len(), 2);
+
+        // Verify warnings round-trip
+        assert_eq!(restored.stats.warnings.len(), 2);
+        assert_eq!(restored.stats.warnings[0].severity, WarningSeverity::Warning);
+        assert!(restored.stats.warnings[0].message.contains("large result set"));
+        assert_eq!(restored.stats.warnings[1].severity, WarningSeverity::Info);
     }
 }
