@@ -57,6 +57,7 @@ pub enum Plan {
     ExplainHistory(ExplainHistoryPlan),
     DropCollection(DropCollectionPlan),
     DropEdgeType(DropEdgeTypePlan),
+    Join(JoinPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +209,18 @@ pub struct DropCollectionPlan {
 #[derive(Debug, Clone)]
 pub struct DropEdgeTypePlan {
     pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinPlan {
+    pub fields: trondb_tql::JoinFieldList,
+    pub from_collection: String,
+    pub from_alias: String,
+    pub joins: Vec<trondb_tql::JoinClause>,
+    pub filter: Option<WhereClause>,
+    pub order_by: Vec<OrderByClause>,
+    pub limit: Option<usize>,
+    pub hints: Vec<QueryHint>,
 }
 
 // ---------------------------------------------------------------------------
@@ -490,10 +503,16 @@ pub fn plan(
             name: s.name.clone(),
         })),
 
-        // Phase 12b: JOIN execution — planner/executor implementation deferred to Chunk 3
-        Statement::FetchJoin(_) => Err(EngineError::InvalidQuery(
-            "JOIN queries are not yet supported by the executor".into(),
-        )),
+        Statement::FetchJoin(s) => Ok(Plan::Join(JoinPlan {
+            fields: s.fields.clone(),
+            from_collection: s.from_collection.clone(),
+            from_alias: s.from_alias.clone(),
+            joins: s.joins.clone(),
+            filter: s.filter.clone(),
+            order_by: s.order_by.clone(),
+            limit: s.limit,
+            hints: s.hints.clone(),
+        })),
     }
 }
 
@@ -1030,6 +1049,41 @@ mod tests {
                 assert!(sp.pre_filter.is_none());
             }
             _ => panic!("expected SearchPlan"),
+        }
+    }
+
+    #[test]
+    fn plan_join() {
+        use trondb_tql::{FetchJoinStmt, JoinClause, JoinFieldList, JoinType, QualifiedField};
+
+        let stmt = Statement::FetchJoin(FetchJoinStmt {
+            fields: JoinFieldList::Named(vec![
+                QualifiedField { alias: "e".into(), field: "name".into() },
+                QualifiedField { alias: "v".into(), field: "address".into() },
+            ]),
+            from_collection: "entities".into(),
+            from_alias: "e".into(),
+            joins: vec![JoinClause {
+                join_type: JoinType::Inner,
+                collection: "venues".into(),
+                alias: "v".into(),
+                on_left: QualifiedField { alias: "e".into(), field: "venue_id".into() },
+                on_right: QualifiedField { alias: "v".into(), field: "id".into() },
+                confidence_threshold: None,
+            }],
+            filter: None,
+            order_by: vec![],
+            limit: Some(10),
+            hints: vec![],
+        });
+        let p = plan(&stmt, &empty_schemas()).unwrap();
+        match p {
+            Plan::Join(jp) => {
+                assert_eq!(jp.from_collection, "entities");
+                assert_eq!(jp.joins.len(), 1);
+                assert_eq!(jp.limit, Some(10));
+            }
+            _ => panic!("expected JoinPlan"),
         }
     }
 }

@@ -2041,6 +2041,12 @@ impl Executor {
                     },
                 })
             }
+
+            Plan::Join(_p) => {
+                Err(EngineError::InvalidQuery(
+                    "JOIN execution not yet implemented".into(),
+                ))
+            }
         }
     }
 
@@ -3000,6 +3006,18 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("mode", "Deterministic".into()));
             props.push(("verb", "DROP EDGE TYPE".into()));
             props.push(("edge_type", p.name.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
+        Plan::Join(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "FETCH JOIN".into()));
+            props.push(("from_collection", p.from_collection.clone()));
+            props.push(("from_alias", p.from_alias.clone()));
+            let joins_str = p.joins.iter()
+                .map(|j| format!("{:?} {} AS {}", j.join_type, j.collection, j.alias))
+                .collect::<Vec<_>>()
+                .join(", ");
+            props.push(("joins", joins_str));
             props.push(("tier", "Fjall".into()));
         }
     }
