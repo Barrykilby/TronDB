@@ -70,6 +70,8 @@ message InsertPlan {
     repeated NamedVector vectors = 4;
     repeated string collocate_with = 5;    // empty if None
     optional string affinity_group = 6;
+    optional string valid_from = 7;
+    optional string valid_to = 8;
 }
 
 message FetchPlan {
@@ -81,6 +83,7 @@ message FetchPlan {
     string strategy_index_name = 6;    // carries index name for FieldIndexLookup/Range
     repeated OrderByClauseProto order_by = 7;
     repeated string hints = 8;
+    optional TemporalClauseProto temporal = 9;
 }
 
 message TwoPassConfigProto {
@@ -122,6 +125,8 @@ message InsertEdgePlan {
     string from_id = 2;
     string to_id = 3;
     repeated FieldAssignment metadata = 4;
+    optional string valid_from = 5;
+    optional string valid_to = 6;
 }
 
 message DeleteEntityPlan {
@@ -260,6 +265,7 @@ message TraverseMatchPlanProto {
     uint64 max_depth = 4;
     optional double confidence_threshold = 5;
     optional uint64 limit = 6;
+    optional TemporalClauseProto temporal = 7;
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +367,20 @@ message PreFilterProto {
 message OrderByClauseProto {
     string field = 1;
     string direction = 2;  // "ASC" or "DESC"
+}
+
+// Temporal clause for bi-temporal queries
+message TemporalClauseProto {
+    oneof clause {
+        string as_of = 1;                 // AS OF 'timestamp'
+        ValidDuringProto valid_during = 2; // VALID DURING 'start'..'end'
+        uint64 as_of_transaction = 3;      // AS OF TRANSACTION lsn
+    }
+}
+
+message ValidDuringProto {
+    string start = 1;
+    string end = 2;
 }
 
 // ---------------------------------------------------------------------------
