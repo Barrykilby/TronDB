@@ -48,6 +48,10 @@ pub struct Executor {
     inference_queue: Arc<DashSet<LogicalId>>,
     /// Cost provider for ACU estimation
     cost_provider: Arc<dyn CostProvider>,
+    /// Prometheus-compatible metrics
+    engine_metrics: Arc<crate::metrics::EngineMetrics>,
+    /// Slow query log
+    slow_log: Arc<crate::slow_log::SlowQueryLog>,
 }
 
 impl Executor {
@@ -73,6 +77,10 @@ impl Executor {
             inference_audit,
             inference_queue: Arc::new(DashSet::new()),
             cost_provider: Arc::new(ConstantCostProvider),
+            engine_metrics: Arc::new(crate::metrics::EngineMetrics::new()),
+            slow_log: Arc::new(crate::slow_log::SlowQueryLog::new(
+                crate::slow_log::SlowQueryConfig::default(),
+            )),
         }
     }
 
@@ -311,7 +319,9 @@ impl Executor {
             }
         };
 
-        match plan {
+        self.engine_metrics.inflight_queries.inc();
+
+        let result = match plan {
             Plan::CreateCollection(p) => {
                 // Validate no duplicate representation names
                 let mut repr_names = HashSet::new();
@@ -2449,8 +2459,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
-                        cost: cost_estimate,
-                        warnings: opt_warnings,
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -2643,7 +2653,34 @@ impl Executor {
                     },
                 })
             }
+        };
+
+        // Instrumentation (runs for every query path)
+        let elapsed = start.elapsed();
+        self.engine_metrics.inflight_queries.dec();
+        self.engine_metrics.queries_total.inc();
+        self.engine_metrics.query_duration_seconds.observe_duration(elapsed);
+
+        match &result {
+            Ok(_) => {
+                // Check for slow query
+                if let Some(ref est) = cost_estimate {
+                    self.slow_log.maybe_log(&format!("{:?}", plan), est, elapsed);
+                }
+                // Track inserts
+                match plan {
+                    Plan::Insert(_) | Plan::Upsert(_) => {
+                        self.engine_metrics.inserts_total.inc();
+                    }
+                    _ => {}
+                }
+            }
+            Err(_) => {
+                self.engine_metrics.queries_error_total.inc();
+            }
         }
+
+        result
     }
 
     pub fn entity_count(&self) -> usize {
@@ -2728,6 +2765,14 @@ impl Executor {
 
     pub fn inference_queue(&self) -> &Arc<DashSet<LogicalId>> {
         &self.inference_queue
+    }
+
+    pub fn engine_metrics(&self) -> &Arc<crate::metrics::EngineMetrics> {
+        &self.engine_metrics
+    }
+
+    pub fn slow_query_log(&self) -> &Arc<crate::slow_log::SlowQueryLog> {
+        &self.slow_log
     }
 
     /// Drain the inference work queue and run background inference for each entity.
@@ -9530,5 +9575,48 @@ mod tests {
         assert_eq!(result.rows.len(), 1);
         // Should return a row with checkpoint info
         assert!(result.rows[0].values.contains_key("checkpoint_lsn"));
+    }
+
+    #[tokio::test]
+    async fn metrics_incremented_on_query() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        insert_entity(
+            &exec,
+            "venues",
+            "v1",
+            vec![("name", Literal::String("A".into()))],
+            None,
+        )
+        .await;
+
+        // Execute a fetch
+        exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // queries_total should be at least 3 (create + insert + fetch)
+        assert!(
+            exec.engine_metrics().queries_total.get() >= 3,
+            "Expected queries_total >= 3, got {}",
+            exec.engine_metrics().queries_total.get()
+        );
+        // inserts_total should be at least 1
+        assert!(
+            exec.engine_metrics().inserts_total.get() >= 1,
+            "Expected inserts_total >= 1, got {}",
+            exec.engine_metrics().inserts_total.get()
+        );
+        // No queries should be inflight after completion
+        assert_eq!(exec.engine_metrics().inflight_queries.get(), 0);
     }
 }
