@@ -178,6 +178,38 @@ impl FjallStore {
         Ok(entities)
     }
 
+    /// Scan a collection with an optional limit on results.
+    /// When a limit is provided, iteration stops early once enough entities
+    /// have been collected, avoiding loading the entire collection into memory.
+    pub fn scan_with_limit(&self, collection: &str, limit: Option<usize>) -> Result<Vec<Entity>, EngineError> {
+        if !self.has_collection(collection) {
+            return Err(EngineError::CollectionNotFound(collection.to_owned()));
+        }
+
+        let partition = self
+            .keyspace
+            .open_partition(collection, PartitionCreateOptions::default())
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        let mut entities = Vec::new();
+        for item in partition.prefix(ENTITY_PREFIX) {
+            let (_k, v) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            if let Ok(entity) = rmp_serde::from_slice::<Entity>(&v) {
+                entities.push(entity);
+                if let Some(max) = limit {
+                    if entities.len() >= max {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(entities)
+    }
+
     // --- Edge Type methods ---
 
     pub fn create_edge_type(&self, edge_type: &crate::edge::EdgeType) -> Result<(), EngineError> {

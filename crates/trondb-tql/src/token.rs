@@ -1,8 +1,9 @@
 use logos::Logos;
 
-fn strip_quotes(lex: &mut logos::Lexer<Token>) -> String {
+fn strip_quotes_and_unescape(lex: &mut logos::Lexer<Token>) -> String {
     let slice = lex.slice();
-    slice[1..slice.len() - 1].to_string()
+    let inner = &slice[1..slice.len() - 1];
+    inner.replace("\\'", "'").replace("\\\\", "\\")
 }
 
 #[derive(Logos, Debug, Clone, PartialEq)]
@@ -328,8 +329,8 @@ pub enum Token {
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", priority = 1, callback = |lex| lex.slice().to_string())]
     Ident(String),
 
-    // String literals (strip quotes)
-    #[regex(r"'[^']*'", callback = strip_quotes)]
+    // String literals (strip quotes, support backslash escaping)
+    #[regex(r"'([^'\\]|\\.)*'", callback = strip_quotes_and_unescape)]
     StringLit(String),
 
     // Float literals (must be before int to match longer pattern)
@@ -906,5 +907,15 @@ mod tests {
     fn lex_checkpoint_keyword() {
         assert_eq!(lex("CHECKPOINT"), vec![Token::Checkpoint]);
         assert_eq!(lex("checkpoint"), vec![Token::Checkpoint]);
+    }
+
+    #[test]
+    fn lex_string_with_escaped_quote() {
+        assert_eq!(lex("'O\\'Brien'"), vec![Token::StringLit("O'Brien".into())]);
+    }
+
+    #[test]
+    fn lex_string_with_escaped_backslash() {
+        assert_eq!(lex("'path\\\\to'"), vec![Token::StringLit("path\\to".into())]);
     }
 }

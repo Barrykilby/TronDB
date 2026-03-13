@@ -4,7 +4,6 @@
 //! Exposes a `render()` method that produces Prometheus text format.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -100,7 +99,8 @@ pub struct Histogram {
     bounds: &'static [f64],
     /// Counts per bucket + one for +Inf.
     buckets: Vec<AtomicU64>,
-    sum: Mutex<f64>,
+    /// Stores f64 bits as u64 for lock-free atomic addition.
+    sum: AtomicU64,
     count: AtomicU64,
 }
 
@@ -120,16 +120,27 @@ impl Histogram {
             help,
             bounds,
             buckets,
-            sum: Mutex::new(0.0),
+            sum: AtomicU64::new(0u64), // 0.0f64 has bit pattern 0u64
             count: AtomicU64::new(0),
         }
     }
 
     pub fn observe(&self, value_secs: f64) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut s = self.sum.lock().unwrap();
-            *s += value_secs;
+        // CAS loop for lock-free atomic f64 addition
+        loop {
+            let current = self.sum.load(Ordering::Relaxed);
+            let current_f64 = f64::from_bits(current);
+            let new_f64 = current_f64 + value_secs;
+            match self.sum.compare_exchange_weak(
+                current,
+                new_f64.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
         }
         // Find the first bucket whose bound >= value and increment only that one.
         // The render() method computes cumulative sums across buckets.
@@ -169,7 +180,7 @@ impl Histogram {
             "{}_bucket{{le=\"+Inf\"}} {}\n",
             self.name, cumulative
         ));
-        let sum = *self.sum.lock().unwrap();
+        let sum = f64::from_bits(self.sum.load(Ordering::Relaxed));
         out.push_str(&format!("{}_sum {}\n", self.name, sum));
         out.push_str(&format!(
             "{}_count {}\n",
