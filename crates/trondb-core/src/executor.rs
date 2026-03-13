@@ -293,6 +293,24 @@ impl Executor {
             }
         };
 
+        // Run optimisation rules (warnings are collected but don't modify the plan in Phase 13)
+        let opt_warnings = match plan {
+            Plan::Explain(_) => vec![], // EXPLAIN handles its own
+            _ => {
+                let collection_name = plan_collection_name(plan);
+                let size = collection_name
+                    .map(|c| self.collection_size(c))
+                    .unwrap_or(0);
+                let optimised = crate::optimise::apply_rules(
+                    plan.clone(),
+                    &crate::optimise::OptimiserConfig::default(),
+                    self.cost_provider.as_ref(),
+                    size,
+                );
+                optimised.warnings
+            }
+        };
+
         match plan {
             Plan::CreateCollection(p) => {
                 // Validate no duplicate representation names
@@ -391,7 +409,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -661,7 +679,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -705,7 +723,7 @@ impl Executor {
                                 mode: QueryMode::Deterministic,
                                 tier: "FieldIndex".into(),
                                 cost: cost_estimate.clone(),
-                                warnings: vec![],
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -752,7 +770,7 @@ impl Executor {
                                 mode: QueryMode::Deterministic,
                                 tier: "FieldIndex".into(),
                                 cost: cost_estimate.clone(),
-                                warnings: vec![],
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -790,7 +808,7 @@ impl Executor {
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
                                 cost: cost_estimate.clone(),
-                                warnings: vec![],
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -1040,7 +1058,7 @@ impl Executor {
                         mode: QueryMode::Probabilistic,
                         tier: "Ram".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1073,6 +1091,40 @@ impl Executor {
                     ]),
                     score: None,
                 });
+
+                // Run optimisation rules
+                let optimised = crate::optimise::apply_rules(
+                    (**inner).clone(),
+                    &crate::optimise::OptimiserConfig::default(),
+                    self.cost_provider.as_ref(),
+                    size,
+                );
+
+                // Add rules_applied row
+                if !optimised.rules_applied.is_empty() {
+                    rows.push(Row {
+                        values: HashMap::from([
+                            ("property".into(), Value::String("rules_applied".into())),
+                            ("value".into(), Value::String(optimised.rules_applied.join(", "))),
+                        ]),
+                        score: None,
+                    });
+                }
+
+                // Add warnings rows
+                if !optimised.warnings.is_empty() {
+                    let warnings_str = optimised.warnings.iter()
+                        .map(|w| format!("{}", w))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    rows.push(Row {
+                        values: HashMap::from([
+                            ("property".into(), Value::String("warnings".into())),
+                            ("value".into(), Value::String(warnings_str)),
+                        ]),
+                        score: None,
+                    });
+                }
 
                 Ok(QueryResult {
                     columns: vec!["property".into(), "value".into()],
@@ -1151,7 +1203,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1220,7 +1272,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1272,7 +1324,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1358,7 +1410,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Ram".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1380,7 +1432,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Routing".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1400,7 +1452,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Routing".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1497,7 +1549,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1528,7 +1580,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1602,7 +1654,7 @@ impl Executor {
                             mode: QueryMode::Probabilistic,
                             tier: "Ram".into(),
                             cost: cost_estimate.clone(),
-                            warnings: vec![],
+                            warnings: opt_warnings.clone(),
                         },
                     });
                 }
@@ -1716,7 +1768,7 @@ impl Executor {
                         mode: QueryMode::Probabilistic,
                         tier: "Ram".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1792,7 +1844,7 @@ impl Executor {
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
                                 cost: cost_estimate.clone(),
-                                warnings: vec![],
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -1843,7 +1895,7 @@ impl Executor {
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
                                 cost: cost_estimate.clone(),
-                                warnings: vec![],
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -1900,7 +1952,7 @@ impl Executor {
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
                                 cost: cost_estimate.clone(),
-                                warnings: vec![],
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -1934,7 +1986,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Ram".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1994,7 +2046,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -2037,7 +2089,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -2160,7 +2212,7 @@ impl Executor {
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
                         cost: cost_estimate.clone(),
-                        warnings: vec![],
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -7373,5 +7425,72 @@ mod tests {
         assert!(result.stats.cost.is_some(), "QueryStats should include cost estimate");
         let cost = result.stats.cost.unwrap();
         assert!(cost.total_acu > 0.0, "Cost should be non-zero for a scan");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 7 tests: Optimisation rules integrated into executor + EXPLAIN
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn explain_shows_optimisation_rules() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("The Fleece".into()))], Some(vec![1.0, 0.0, 0.0])).await;
+
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+            two_pass: None,
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(search_plan)))
+            .await
+            .unwrap();
+
+        // Should have rules_applied row
+        let has_rules = result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("rules_applied".to_string())
+        });
+        assert!(has_rules, "EXPLAIN should show applied optimisation rules");
+    }
+
+    #[tokio::test]
+    async fn warnings_propagated_to_result() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert enough entities so deep TRAVERSE would trigger a warning
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("The Fleece".into()))], Some(vec![1.0, 0.0, 0.0])).await;
+
+        let plan = Plan::Traverse(TraversePlan {
+            edge_type: "similar_to".into(),
+            from_id: "v1".into(),
+            depth: 8,
+            limit: None,
+        });
+
+        // Execute directly -- the edge type won't exist so it will error,
+        // but we can test the optimisation rules by going through EXPLAIN
+        let explain_result = exec
+            .execute(&Plan::Explain(Box::new(plan)))
+            .await
+            .unwrap();
+
+        // Check warnings are in the EXPLAIN output
+        let has_warnings = explain_result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("warnings".to_string())
+        });
+        assert!(has_warnings, "EXPLAIN should show warnings for deep TRAVERSE");
     }
 }

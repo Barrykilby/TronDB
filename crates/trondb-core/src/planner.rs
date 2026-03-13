@@ -514,6 +514,8 @@ pub fn plan(
         Statement::DropEdgeType(s) => Ok(Plan::DropEdgeType(DropEdgeTypePlan {
             name: s.name.clone(),
         })),
+
+        _ => Err(EngineError::UnsupportedOperation("unsupported statement type".into())),
     }
 }
 
