@@ -10048,4 +10048,162 @@ mod tests {
         })).await.unwrap();
         assert_eq!(fetch.rows.len(), 2);
     }
+
+    /// End-to-end integration test exercising UPSERT, CHECKPOINT, ALTER COLLECTION,
+    /// and IMPORT — all Phase 15 operational features in a single workflow.
+    #[tokio::test]
+    async fn integration_phase15_upsert_checkpoint_alter_import() {
+        let (exec, dir) = setup_executor().await;
+
+        // Create a collection with fields for this test
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "test_p15".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl {
+                    name: "id".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+                trondb_tql::FieldDecl {
+                    name: "name".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+                trondb_tql::FieldDecl {
+                    name: "city".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        }))
+        .await
+        .unwrap();
+
+        // --- UPSERT (insert, entity doesn't exist yet) ---
+        exec.execute(&Plan::Upsert(UpsertPlan {
+            collection: "test_p15".into(),
+            fields: vec!["id".into(), "name".into(), "city".into()],
+            values: vec![
+                Literal::String("e1".into()),
+                Literal::String("First".into()),
+                Literal::String("London".into()),
+            ],
+            vectors: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // --- UPSERT (update, same ID → should overwrite) ---
+        exec.execute(&Plan::Upsert(UpsertPlan {
+            collection: "test_p15".into(),
+            fields: vec!["id".into(), "name".into(), "city".into()],
+            values: vec![
+                Literal::String("e1".into()),
+                Literal::String("Updated".into()),
+                Literal::String("Paris".into()),
+            ],
+            vectors: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Verify the update took effect
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_p15".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 1, "UPSERT should overwrite, not duplicate");
+        assert_eq!(
+            result.rows[0].values.get("name"),
+            Some(&Value::String("Updated".into()))
+        );
+        assert_eq!(
+            result.rows[0].values.get("city"),
+            Some(&Value::String("Paris".into()))
+        );
+
+        // --- CHECKPOINT ---
+        let ckpt = exec.execute(&Plan::Checkpoint(CheckpointPlan)).await.unwrap();
+        assert_eq!(ckpt.rows.len(), 1);
+        assert!(
+            ckpt.rows[0].values.contains_key("checkpoint_lsn"),
+            "CHECKPOINT should return checkpoint_lsn"
+        );
+
+        // --- ALTER COLLECTION RENAME FIELD ---
+        exec.execute(&Plan::AlterCollection(AlterCollectionPlan {
+            collection: "test_p15".into(),
+            operation: trondb_tql::AlterCollectionOp::RenameField {
+                old_name: "city".into(),
+                new_name: "location".into(),
+            },
+        }))
+        .await
+        .unwrap();
+
+        // Verify the rename: "city" no longer exists, "location" does
+        let after_rename = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_p15".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(after_rename.rows.len(), 1);
+        assert!(
+            after_rename.rows[0].values.get("city").is_none(),
+            "renamed field 'city' should no longer exist"
+        );
+        assert_eq!(
+            after_rename.rows[0].values.get("location"),
+            Some(&Value::String("Paris".into())),
+            "renamed field 'location' should have the old value"
+        );
+
+        // --- IMPORT ---
+        let import_path = dir.path().join("import.jsonl");
+        std::fs::write(&import_path, r#"{"id":"e2","name":"Imported1","location":"Berlin"}
+{"id":"e3","name":"Imported2","location":"Tokyo"}
+"#).unwrap();
+
+        let import_result = exec.execute(&Plan::Import(ImportPlan {
+            collection: "test_p15".into(),
+            path: import_path.to_string_lossy().to_string(),
+        })).await.unwrap();
+        assert_eq!(
+            import_result.rows[0].values.get("imported"),
+            Some(&Value::Int(2)),
+            "IMPORT should report 2 entities imported"
+        );
+
+        // Verify all 3 entities now exist
+        let final_fetch = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_p15".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(final_fetch.rows.len(), 3, "should have 3 entities total after import");
+
+        // --- Metrics verification ---
+        assert!(exec.engine_metrics().queries_total.get() > 0, "queries_total should be incremented");
+        assert!(exec.engine_metrics().inserts_total.get() > 0, "inserts_total should be incremented");
+    }
 }
