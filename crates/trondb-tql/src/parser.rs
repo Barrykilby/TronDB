@@ -137,6 +137,7 @@ impl Parser {
             Some(Token::Traverse) => self.parse_traverse(),
             Some(Token::Confirm) => self.parse_confirm_edge(),
             Some(Token::Infer) => self.parse_infer(),
+            Some(Token::Drop) => self.parse_drop(),
             Some(tok) => {
                 let tok_str = format!("{tok:?}");
                 let pos = self.tokens[self.pos].1.start;
@@ -1181,6 +1182,30 @@ impl Parser {
             confidence_floor,
         }))
     }
+
+    fn parse_drop(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // DROP
+        match self.peek() {
+            Some(Token::Collection) => {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::DropCollection(DropCollectionStmt { name }))
+            }
+            Some(Token::Edge) => {
+                self.advance(); // EDGE
+                self.expect(&Token::Type)?;
+                let name = self.expect_string_lit()?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::DropEdgeType(DropEdgeTypeStmt { name }))
+            }
+            other => Err(ParseError::UnexpectedToken {
+                pos: self.pos,
+                expected: "COLLECTION or EDGE".into(),
+                got: format!("{:?}", other),
+            }),
+        }
+    }
 }
 
 /// Parse a TQL statement from the given input string.
@@ -2153,6 +2178,28 @@ mod tests {
                 assert_eq!(f.limit, Some(5));
             }
             _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_collection() {
+        let stmt = parse("DROP COLLECTION venues;").unwrap();
+        match stmt {
+            Statement::DropCollection(d) => {
+                assert_eq!(d.name, "venues");
+            }
+            _ => panic!("expected DropCollection"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_edge_type() {
+        let stmt = parse("DROP EDGE TYPE 'performs_at';").unwrap();
+        match stmt {
+            Statement::DropEdgeType(d) => {
+                assert_eq!(d.name, "performs_at");
+            }
+            _ => panic!("expected DropEdgeType"),
         }
     }
 }

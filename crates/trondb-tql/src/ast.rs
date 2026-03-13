@@ -19,6 +19,8 @@ pub enum Statement {
     Infer(InferStmt),
     ConfirmEdge(ConfirmEdgeStmt),
     ExplainHistory(ExplainHistoryStmt),
+    DropCollection(DropCollectionStmt),
+    DropEdgeType(DropEdgeTypeStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -300,6 +302,16 @@ pub struct ConfirmEdgeStmt {
 pub struct ExplainHistoryStmt {
     pub entity_id: String,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropCollectionStmt {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropEdgeTypeStmt {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
