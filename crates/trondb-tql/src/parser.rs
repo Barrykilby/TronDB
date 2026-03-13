@@ -124,13 +124,65 @@ impl Parser {
             Some(Token::Promote) => self.parse_promote(),
             Some(Token::Alter) => {
                 self.advance(); // ALTER
-                self.expect(&Token::Entity)?;
-                let entity_id = self.expect_string_lit()?;
-                self.expect(&Token::Drop)?;
-                self.expect(&Token::Affinity)?;
-                self.expect(&Token::Group)?;
-                self.expect(&Token::Semicolon)?;
-                Ok(Statement::AlterEntityDropAffinity(AlterEntityDropAffinityStmt { entity_id }))
+                match self.peek() {
+                    Some(Token::Entity) => {
+                        self.advance(); // ENTITY
+                        let entity_id = self.expect_string_lit()?;
+                        self.expect(&Token::Drop)?;
+                        self.expect(&Token::Affinity)?;
+                        self.expect(&Token::Group)?;
+                        self.expect(&Token::Semicolon)?;
+                        Ok(Statement::AlterEntityDropAffinity(AlterEntityDropAffinityStmt { entity_id }))
+                    }
+                    Some(Token::Collection) => {
+                        self.advance(); // COLLECTION
+                        let collection = self.expect_ident()?;
+                        match self.peek() {
+                            Some(Token::Rename) => {
+                                self.advance(); // RENAME
+                                self.expect(&Token::Field)?;
+                                let old_name = self.expect_ident()?;
+                                self.expect(&Token::To)?;
+                                let new_name = self.expect_ident()?;
+                                self.expect(&Token::Semicolon)?;
+                                Ok(Statement::AlterCollection(AlterCollectionStmt {
+                                    collection,
+                                    operation: AlterCollectionOp::RenameField { old_name, new_name },
+                                }))
+                            }
+                            Some(Token::Drop) => {
+                                self.advance(); // DROP
+                                self.expect(&Token::Field)?;
+                                let field_name = self.expect_ident()?;
+                                self.expect(&Token::Semicolon)?;
+                                Ok(Statement::AlterCollection(AlterCollectionStmt {
+                                    collection,
+                                    operation: AlterCollectionOp::DropField { field_name },
+                                }))
+                            }
+                            Some(tok) => {
+                                let tok_str = format!("{tok:?}");
+                                let pos = self.tokens[self.pos].1.start;
+                                Err(ParseError::UnexpectedToken {
+                                    pos,
+                                    expected: "RENAME or DROP".into(),
+                                    got: tok_str,
+                                })
+                            }
+                            None => Err(ParseError::UnexpectedEof("expected RENAME or DROP".into())),
+                        }
+                    }
+                    Some(tok) => {
+                        let tok_str = format!("{tok:?}");
+                        let pos = self.tokens[self.pos].1.start;
+                        Err(ParseError::UnexpectedToken {
+                            pos,
+                            expected: "ENTITY or COLLECTION".into(),
+                            got: tok_str,
+                        })
+                    }
+                    None => Err(ParseError::UnexpectedEof("expected ENTITY or COLLECTION".into())),
+                }
             }
             Some(Token::Update) => self.parse_update(),
             Some(Token::Delete) => self.parse_delete(),
@@ -142,6 +194,29 @@ impl Parser {
                 self.advance(); // CHECKPOINT
                 self.expect(&Token::Semicolon)?;
                 Ok(Statement::Checkpoint(CheckpointStmt))
+            }
+            Some(Token::Backup) => {
+                self.advance(); // BACKUP
+                self.expect(&Token::To)?;
+                let path = self.expect_string_lit()?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::Backup(BackupStmt { path }))
+            }
+            Some(Token::Restore) => {
+                self.advance(); // RESTORE
+                self.expect(&Token::From)?;
+                let path = self.expect_string_lit()?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::Restore(RestoreStmt { path }))
+            }
+            Some(Token::Import) => {
+                self.advance(); // IMPORT
+                self.expect(&Token::Into)?;
+                let collection = self.expect_ident()?;
+                self.expect(&Token::From)?;
+                let path = self.expect_string_lit()?;
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::Import(ImportStmt { collection, path }))
             }
             Some(tok) => {
                 let tok_str = format!("{tok:?}");
@@ -2980,5 +3055,100 @@ mod tests {
     fn parse_checkpoint_case_insensitive() {
         let stmt = parse("checkpoint;").unwrap();
         assert!(matches!(stmt, Statement::Checkpoint(_)));
+    }
+
+    // --- BACKUP / RESTORE ---
+
+    #[test]
+    fn parse_backup() {
+        let stmt = parse("BACKUP TO '/tmp/backup';").unwrap();
+        match stmt {
+            Statement::Backup(b) => assert_eq!(b.path, "/tmp/backup"),
+            other => panic!("expected Backup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_restore() {
+        let stmt = parse("RESTORE FROM '/tmp/backup';").unwrap();
+        match stmt {
+            Statement::Restore(r) => assert_eq!(r.path, "/tmp/backup"),
+            other => panic!("expected Restore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_backup_case_insensitive() {
+        let stmt = parse("backup to '/tmp/backup';").unwrap();
+        assert!(matches!(stmt, Statement::Backup(_)));
+    }
+
+    #[test]
+    fn parse_restore_case_insensitive() {
+        let stmt = parse("restore from '/tmp/backup';").unwrap();
+        assert!(matches!(stmt, Statement::Restore(_)));
+    }
+
+    // --- ALTER COLLECTION ---
+
+    #[test]
+    fn parse_alter_collection_rename_field() {
+        let stmt = parse("ALTER COLLECTION venues RENAME FIELD old_name TO new_name;").unwrap();
+        match stmt {
+            Statement::AlterCollection(a) => {
+                assert_eq!(a.collection, "venues");
+                match a.operation {
+                    AlterCollectionOp::RenameField { old_name, new_name } => {
+                        assert_eq!(old_name, "old_name");
+                        assert_eq!(new_name, "new_name");
+                    }
+                    _ => panic!("expected RenameField"),
+                }
+            }
+            other => panic!("expected AlterCollection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_collection_drop_field() {
+        let stmt = parse("ALTER COLLECTION venues DROP FIELD status;").unwrap();
+        match stmt {
+            Statement::AlterCollection(a) => {
+                assert_eq!(a.collection, "venues");
+                match a.operation {
+                    AlterCollectionOp::DropField { field_name } => {
+                        assert_eq!(field_name, "status");
+                    }
+                    _ => panic!("expected DropField"),
+                }
+            }
+            other => panic!("expected AlterCollection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_entity_drop_affinity_still_works() {
+        let stmt = parse("ALTER ENTITY 'e1' DROP AFFINITY GROUP;").unwrap();
+        assert!(matches!(stmt, Statement::AlterEntityDropAffinity(_)));
+    }
+
+    // --- IMPORT ---
+
+    #[test]
+    fn parse_import() {
+        let stmt = parse("IMPORT INTO venues FROM '/data/venues.jsonl';").unwrap();
+        match stmt {
+            Statement::Import(i) => {
+                assert_eq!(i.collection, "venues");
+                assert_eq!(i.path, "/data/venues.jsonl");
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_import_case_insensitive() {
+        let stmt = parse("import into venues from '/data/venues.jsonl';").unwrap();
+        assert!(matches!(stmt, Statement::Import(_)));
     }
 }

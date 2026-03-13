@@ -2653,6 +2653,217 @@ impl Executor {
                     },
                 })
             }
+
+            Plan::Backup(p) => {
+                let backup_path = std::path::Path::new(&p.path);
+                let count = self.store.snapshot_to(backup_path)?;
+
+                Ok(QueryResult {
+                    columns: vec!["backed_up".into(), "path".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("backed_up".into(), Value::Int(count as i64)),
+                            ("path".into(), Value::String(p.path.clone())),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
+                    },
+                })
+            }
+
+            Plan::Restore(_p) => {
+                // Restore is a destructive operation -- return informational response.
+                // Full restore requires engine restart, so we return instructions.
+                Ok(QueryResult {
+                    columns: vec!["message".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("message".into(), Value::String(
+                                "RESTORE requires engine restart. Copy backup files to data dir and restart.".into()
+                            )),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
+                    },
+                })
+            }
+
+            Plan::AlterCollection(p) => {
+                let mut schema = self.store.get_collection_schema(&p.collection)?;
+
+                match &p.operation {
+                    trondb_tql::AlterCollectionOp::RenameField { old_name, new_name } => {
+                        // Find and rename the field in the schema
+                        let field = schema.fields.iter_mut()
+                            .find(|f| f.name == *old_name)
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                format!("field '{}' not found in collection '{}'", old_name, p.collection)
+                            ))?;
+                        field.name = new_name.clone();
+
+                        // Rename field in all entities
+                        let entities = self.store.scan(&p.collection)?;
+                        let tx_id = self.wal.next_tx_id();
+                        self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+
+                        for mut entity in entities {
+                            if let Some(value) = entity.metadata.remove(old_name) {
+                                entity.metadata.insert(new_name.clone(), value);
+                                let payload = rmp_serde::to_vec_named(&entity)
+                                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                                self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
+                                self.store.insert(&p.collection, entity)?;
+                            }
+                        }
+
+                        self.wal.commit(tx_id).await?;
+                    }
+                    trondb_tql::AlterCollectionOp::DropField { field_name } => {
+                        // Remove field from schema
+                        schema.fields.retain(|f| f.name != *field_name);
+
+                        // Remove field value from all entities
+                        let entities = self.store.scan(&p.collection)?;
+                        let tx_id = self.wal.next_tx_id();
+                        self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+
+                        for mut entity in entities {
+                            if entity.metadata.remove(field_name).is_some() {
+                                let payload = rmp_serde::to_vec_named(&entity)
+                                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                                self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
+                                self.store.insert(&p.collection, entity)?;
+                            }
+                        }
+
+                        self.wal.commit(tx_id).await?;
+                    }
+                }
+
+                // Update schema in store and cache
+                self.store.update_collection_schema(&schema)?;
+                self.schemas.insert(p.collection.clone(), schema);
+
+                Ok(QueryResult {
+                    columns: vec!["message".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("message".into(), Value::String(format!("collection '{}' altered", p.collection))),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
+                    },
+                })
+            }
+
+            Plan::Import(p) => {
+                // Validate collection exists
+                let _schema = self.schemas.get(&p.collection)
+                    .ok_or_else(|| EngineError::CollectionNotFound(p.collection.clone()))?
+                    .clone();
+
+                // Read JSONL file line by line
+                let content = std::fs::read_to_string(&p.path)
+                    .map_err(|e| EngineError::Storage(format!("import read: {e}")))?;
+
+                let mut imported = 0i64;
+
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let obj: serde_json::Value = serde_json::from_str(line)
+                        .map_err(|e| EngineError::Storage(format!("import parse: {e}")))?;
+
+                    let map = obj.as_object()
+                        .ok_or_else(|| EngineError::Storage("import: each line must be a JSON object".into()))?;
+
+                    // Extract id or generate one
+                    let entity_id = map.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| LogicalId::from_string(s))
+                        .unwrap_or_default();
+
+                    let mut entity = Entity::new(entity_id.clone());
+                    for (key, value) in map {
+                        if key == "id" {
+                            continue;
+                        }
+                        let val = match value {
+                            serde_json::Value::String(s) => Value::String(s.clone()),
+                            serde_json::Value::Number(n) => {
+                                if let Some(i) = n.as_i64() {
+                                    Value::Int(i)
+                                } else if let Some(f) = n.as_f64() {
+                                    Value::Float(f)
+                                } else {
+                                    Value::Null
+                                }
+                            }
+                            serde_json::Value::Bool(b) => Value::Bool(*b),
+                            serde_json::Value::Null => Value::Null,
+                            _ => Value::String(value.to_string()),
+                        };
+                        entity.metadata.insert(key.clone(), val);
+                    }
+
+                    // WAL + Fjall insert
+                    let tx_id = self.wal.next_tx_id();
+                    self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
+                    let payload = rmp_serde::to_vec_named(&entity)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    self.wal.append(RecordType::EntityWrite, &p.collection, tx_id, 1, payload);
+                    self.wal.commit(tx_id).await?;
+                    self.store.insert(&p.collection, entity)?;
+
+                    self.entity_collections.insert(entity_id, p.collection.clone());
+                    imported += 1;
+                }
+
+                self.store.persist()?;
+
+                Ok(QueryResult {
+                    columns: vec!["imported".into(), "collection".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("imported".into(), Value::Int(imported)),
+                            ("collection".into(), Value::String(p.collection.clone())),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
+                    },
+                })
+            }
         };
 
         // Instrumentation (runs for every query path)
@@ -3580,6 +3791,8 @@ fn plan_collection_name(plan: &Plan) -> Option<&str> {
         Plan::ExplainTiers(p) => Some(&p.collection),
         Plan::Join(p) => Some(&p.from_collection),
         Plan::Upsert(p) => Some(&p.collection),
+        Plan::AlterCollection(p) => Some(&p.collection),
+        Plan::Import(p) => Some(&p.collection),
         _ => None,
     }
 }
@@ -3799,6 +4012,32 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("verb", "CHECKPOINT".into()));
             props.push(("tier", "WAL".into()));
         }
+        Plan::Backup(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "BACKUP".into()));
+            props.push(("path", p.path.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
+        Plan::Restore(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "RESTORE".into()));
+            props.push(("path", p.path.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
+        Plan::AlterCollection(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "ALTER COLLECTION".into()));
+            props.push(("collection", p.collection.clone()));
+            props.push(("operation", format!("{:?}", p.operation)));
+            props.push(("tier", "Fjall".into()));
+        }
+        Plan::Import(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "IMPORT".into()));
+            props.push(("collection", p.collection.clone()));
+            props.push(("path", p.path.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
     }
 
     props
@@ -3822,7 +4061,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{CheckpointPlan, ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraverseMatchPlan, TraversePlan, UpsertPlan};
+    use crate::planner::{AlterCollectionPlan, BackupPlan, CheckpointPlan, ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, ImportPlan, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraverseMatchPlan, TraversePlan, UpsertPlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -9618,5 +9857,190 @@ mod tests {
         );
         // No queries should be inflight after completion
         assert_eq!(exec.engine_metrics().inflight_queries.get(), 0);
+    }
+
+    // --- BACKUP / RESTORE ---
+
+    #[tokio::test]
+    async fn execute_backup_creates_files() {
+        let (exec, dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("A".into()))], None).await;
+
+        let backup_dir = dir.path().join("backup");
+        let result = exec.execute(&Plan::Backup(BackupPlan {
+            path: backup_dir.to_string_lossy().to_string(),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(backup_dir.join("schemas.jsonl").exists());
+        assert!(backup_dir.join("venues.jsonl").exists());
+        // backed_up count: 1 schema + 1 entity = 2
+        assert_eq!(result.rows[0].values.get("backed_up"), Some(&Value::Int(2)));
+    }
+
+    #[tokio::test]
+    async fn execute_restore_returns_message() {
+        let (exec, _dir) = setup_executor().await;
+
+        let result = exec.execute(&Plan::Restore(crate::planner::RestorePlan {
+            path: "/tmp/nonexistent".into(),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].values.get("message").is_some());
+    }
+
+    // --- ALTER COLLECTION ---
+
+    #[tokio::test]
+    async fn execute_alter_collection_rename_field() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "test_alter".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![trondb_tql::FieldDecl {
+                name: "old_name".into(),
+                field_type: trondb_tql::FieldType::Text,
+            }],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Insert an entity with the old field name
+        insert_entity(&exec, "test_alter", "e1", vec![("old_name", Literal::String("value".into()))], None).await;
+
+        // Rename field
+        exec.execute(&Plan::AlterCollection(AlterCollectionPlan {
+            collection: "test_alter".into(),
+            operation: trondb_tql::AlterCollectionOp::RenameField {
+                old_name: "old_name".into(),
+                new_name: "new_name".into(),
+            },
+        })).await.unwrap();
+
+        // Verify entity has renamed field
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_alter".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].values.contains_key("new_name"));
+        assert!(!result.rows[0].values.contains_key("old_name"));
+    }
+
+    #[tokio::test]
+    async fn execute_alter_collection_drop_field() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "test_drop".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl {
+                    name: "keep_me".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+                trondb_tql::FieldDecl {
+                    name: "drop_me".into(),
+                    field_type: trondb_tql::FieldType::Text,
+                },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Insert an entity with both fields
+        insert_entity(
+            &exec, "test_drop", "e1",
+            vec![
+                ("keep_me", Literal::String("stays".into())),
+                ("drop_me", Literal::String("goes".into())),
+            ],
+            None,
+        ).await;
+
+        // Drop field
+        exec.execute(&Plan::AlterCollection(AlterCollectionPlan {
+            collection: "test_drop".into(),
+            operation: trondb_tql::AlterCollectionOp::DropField {
+                field_name: "drop_me".into(),
+            },
+        })).await.unwrap();
+
+        // Verify entity has only keep_me
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "test_drop".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].values.contains_key("keep_me"));
+        assert!(!result.rows[0].values.contains_key("drop_me"));
+    }
+
+    // --- IMPORT ---
+
+    #[tokio::test]
+    async fn execute_import_jsonl() {
+        let (exec, dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Create a JSONL file
+        let import_path = dir.path().join("import.jsonl");
+        std::fs::write(&import_path, r#"{"id":"v1","name":"Venue A"}
+{"id":"v2","name":"Venue B"}
+"#).unwrap();
+
+        let result = exec.execute(&Plan::Import(ImportPlan {
+            collection: "venues".into(),
+            path: import_path.to_string_lossy().to_string(),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("imported"),
+            Some(&Value::Int(2))
+        );
+
+        // Verify entities exist
+        let fetch = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(fetch.rows.len(), 2);
     }
 }

@@ -747,6 +747,14 @@ impl From<&Plan> for pb::PlanRequest {
                         affinity_group: None,
                     })
                 }
+
+                // BACKUP/RESTORE/ALTER COLLECTION/IMPORT are local-only operations.
+                // Transport as dummy explain over the wire.
+                Plan::Backup(_) | Plan::Restore(_) | Plan::AlterCollection(_) | Plan::Import(_) => {
+                    PP::Explain(Box::new(pb::ExplainPlan {
+                        inner: None,
+                    }))
+                }
             }),
         }
     }
