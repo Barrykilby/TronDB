@@ -492,6 +492,108 @@ pub fn plan(
     }
 }
 
+use crate::cost::{AcuEstimate, CostProvider};
+
+// ---------------------------------------------------------------------------
+// Cost estimation
+// ---------------------------------------------------------------------------
+
+/// Estimate the ACU cost of a plan. `collection_size` is the approximate
+/// number of entities in the target collection (0 if unknown or not applicable).
+pub fn estimate_plan_cost(
+    plan: &Plan,
+    cost: &dyn CostProvider,
+    collection_size: usize,
+) -> AcuEstimate {
+    match plan {
+        Plan::Fetch(p) => {
+            let mut est = AcuEstimate::zero();
+            match &p.strategy {
+                FetchStrategy::FullScan => {
+                    est.add("full_scan", collection_size, cost.full_scan_per_entity_acu());
+                }
+                FetchStrategy::FieldIndexLookup(_) => {
+                    est.add("field_index_lookup", 1, cost.field_index_lookup_acu());
+                }
+                FetchStrategy::FieldIndexRange(_) => {
+                    est.add("field_index_lookup", 1, cost.field_index_lookup_acu());
+                }
+            }
+            est
+        }
+        Plan::Search(p) => {
+            let mut est = AcuEstimate::zero();
+            match &p.strategy {
+                SearchStrategy::Hnsw => {
+                    est.add("search_hnsw", 1, cost.search_hnsw_acu());
+                }
+                SearchStrategy::Sparse => {
+                    est.add("search_sparse", 1, cost.search_sparse_acu());
+                }
+                SearchStrategy::Hybrid => {
+                    est.add("search_hybrid", 1, cost.search_hybrid_acu());
+                }
+                SearchStrategy::NaturalLanguage => {
+                    est.add("search_natural_language", 1, cost.search_natural_language_acu());
+                }
+            }
+            if p.pre_filter.is_some() {
+                est.add("pre_filter", 1, cost.pre_filter_acu());
+            }
+            // Post-search: fetching k result entities from hot tier
+            est.add("fetch_hot", p.k, cost.fetch_hot_acu());
+            est
+        }
+        Plan::Traverse(p) => {
+            let mut est = AcuEstimate::zero();
+            est.add("traverse_hop", p.depth, cost.traverse_hop_acu());
+            est
+        }
+        Plan::Infer(_) => {
+            AcuEstimate::single("infer", 1, cost.infer_acu())
+        }
+        // Write operations
+        Plan::Insert(_) | Plan::CreateCollection(_) | Plan::CreateEdgeType(_)
+        | Plan::InsertEdge(_) | Plan::DeleteEntity(_) | Plan::DeleteEdge(_)
+        | Plan::CreateAffinityGroup(_) | Plan::AlterEntityDropAffinity(_)
+        | Plan::Demote(_) | Plan::Promote(_) | Plan::UpdateEntity(_)
+        | Plan::ConfirmEdge(_) | Plan::DropCollection(_) | Plan::DropEdgeType(_) => {
+            AcuEstimate::single("write", 1, cost.write_base_acu())
+        }
+        // Metadata / explain operations are free
+        Plan::Explain(_) | Plan::ExplainTiers(_) | Plan::ExplainHistory(_) => {
+            AcuEstimate::zero()
+        }
+    }
+}
+
+/// Extract MAX_ACU hint from a plan's hint list.
+fn extract_max_acu(plan: &Plan) -> Option<f64> {
+    let hints = match plan {
+        Plan::Fetch(p) => &p.hints,
+        Plan::Search(p) => &p.hints,
+        _ => return None,
+    };
+    hints.iter().find_map(|h| match h {
+        QueryHint::MaxAcu(v) => Some(*v),
+        _ => None,
+    })
+}
+
+/// Check if the estimated cost exceeds the MAX_ACU budget (if set).
+/// Returns Ok(()) if within budget or no budget set.
+pub fn check_acu_budget(plan: &Plan, estimate: &AcuEstimate) -> Result<(), EngineError> {
+    if let Some(budget) = extract_max_acu(plan) {
+        if estimate.total_acu > budget {
+            return Err(EngineError::AcuBudgetExceeded {
+                estimated: estimate.total_acu,
+                budget,
+            });
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1026,5 +1128,158 @@ mod tests {
             }
             _ => panic!("expected SearchPlan"),
         }
+    }
+
+    use crate::cost::ConstantCostProvider;
+
+    #[test]
+    fn estimate_fetch_full_scan_cost() {
+        let provider = ConstantCostProvider;
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        });
+        let est = estimate_plan_cost(&plan, &provider, 1000);
+        // FullScan on 1000 entities: 1000 * 0.5 = 500 ACU
+        assert!((est.total_acu - 500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_fetch_field_index_cost() {
+        let provider = ConstantCostProvider;
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+            hints: vec![],
+        });
+        let est = estimate_plan_cost(&plan, &provider, 1000);
+        // FieldIndexLookup: 2.0 ACU
+        assert!((est.total_acu - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_search_hnsw_cost() {
+        let provider = ConstantCostProvider;
+        let plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.8,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+        });
+        let est = estimate_plan_cost(&plan, &provider, 1000);
+        // HNSW search: 50.0 + fetch k results: 10 * 1.0 = 60.0 ACU
+        assert!((est.total_acu - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_search_with_pre_filter_cost() {
+        let provider = ConstantCostProvider;
+        let plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            pre_filter: Some(PreFilter {
+                index_name: "idx_city".into(),
+                clause: WhereClause::Eq("city".into(), Literal::String("London".into())),
+            }),
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+        });
+        let est = estimate_plan_cost(&plan, &provider, 1000);
+        // HNSW: 50 + pre_filter: 5 + fetch k: 10*1 = 65 ACU
+        assert!((est.total_acu - 65.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimate_traverse_cost() {
+        let provider = ConstantCostProvider;
+        let plan = Plan::Traverse(TraversePlan {
+            edge_type: "similar_to".into(),
+            from_id: "v1".into(),
+            depth: 3,
+            limit: None,
+        });
+        let est = estimate_plan_cost(&plan, &provider, 0);
+        // 3 hops * 3.0 ACU = 9.0 ACU
+        assert!((est.total_acu - 9.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn max_acu_budget_enforced() {
+        let provider = ConstantCostProvider;
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![QueryHint::MaxAcu(10.0)],
+        });
+        let est = estimate_plan_cost(&plan, &provider, 1000);
+        let result = check_acu_budget(&plan, &est);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::AcuBudgetExceeded { estimated, budget } => {
+                assert!((estimated - 500.0).abs() < f64::EPSILON);
+                assert!((budget - 10.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected AcuBudgetExceeded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn max_acu_budget_within_limit_passes() {
+        let provider = ConstantCostProvider;
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
+            hints: vec![QueryHint::MaxAcu(10.0)],
+        });
+        let est = estimate_plan_cost(&plan, &provider, 1000);
+        let result = check_acu_budget(&plan, &est);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn estimate_write_plans_have_base_cost() {
+        let provider = ConstantCostProvider;
+        let plan = Plan::Insert(InsertPlan {
+            collection: "venues".into(),
+            fields: vec![],
+            values: vec![],
+            vectors: vec![],
+            collocate_with: None,
+            affinity_group: None,
+        });
+        let est = estimate_plan_cost(&plan, &provider, 0);
+        assert!((est.total_acu - 5.0).abs() < f64::EPSILON);
     }
 }

@@ -66,6 +66,9 @@ pub enum EngineError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("ACU budget exceeded: estimated {estimated:.1} ACU, budget {budget:.1} ACU")]
+    AcuBudgetExceeded { estimated: f64, budget: f64 },
 }
 
 #[cfg(test)]
