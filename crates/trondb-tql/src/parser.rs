@@ -743,8 +743,34 @@ impl Parser {
         Ok(pairs)
     }
 
+    fn parse_hints(&mut self) -> Vec<QueryHint> {
+        let mut hints = Vec::new();
+        while let Some(Token::Hint(raw)) = self.peek() {
+            let raw = raw.clone();
+            self.advance();
+            match raw.trim() {
+                "NO_PROMOTE" => hints.push(QueryHint::NoPromote),
+                "NO_PREFILTER" => hints.push(QueryHint::NoPrefilter),
+                "FORCE_FULL_SCAN" => hints.push(QueryHint::ForceFullScan),
+                s if s.starts_with("MAX_ACU(") && s.ends_with(')') => {
+                    if let Ok(v) = s[8..s.len()-1].parse::<f64>() {
+                        hints.push(QueryHint::MaxAcu(v));
+                    }
+                }
+                s if s.starts_with("TIMEOUT(") && s.ends_with(')') => {
+                    if let Ok(v) = s[8..s.len()-1].parse::<u64>() {
+                        hints.push(QueryHint::Timeout(v));
+                    }
+                }
+                _ => {} // unknown hints are ignored (advisory)
+            }
+        }
+        hints
+    }
+
     fn parse_fetch(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // FETCH
+        let hints = self.parse_hints();
         let fields = self.parse_field_list()?;
         self.expect(&Token::From)?;
         let collection = self.expect_ident()?;
@@ -777,6 +803,7 @@ impl Parser {
             filter,
             order_by,
             limit,
+            hints,
         }))
     }
 
@@ -802,6 +829,7 @@ impl Parser {
 
     fn parse_search(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // SEARCH
+        let hints = self.parse_hints();
         let collection = self.expect_ident()?;
 
         // Optional WHERE clause (ScalarPreFilter)
@@ -886,6 +914,7 @@ impl Parser {
             limit,
             query_text,
             using_repr,
+            hints,
         }))
     }
 
@@ -1461,6 +1490,7 @@ mod tests {
                 filter: None,
                 order_by: vec![],
                 limit: None,
+                hints: vec![],
             })
         );
     }
@@ -2200,6 +2230,74 @@ mod tests {
                 assert_eq!(d.name, "performs_at");
             }
             _ => panic!("expected DropEdgeType"),
+        }
+    }
+
+    #[test]
+    fn parse_fetch_with_no_promote_hint() {
+        let stmt = parse("FETCH /*+ NO_PROMOTE */ * FROM venues WHERE id = 'v1';").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.hints, vec![QueryHint::NoPromote]);
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_search_with_no_prefilter_hint() {
+        let stmt = parse("SEARCH /*+ NO_PREFILTER */ venues NEAR VECTOR [1.0, 0.0] LIMIT 10;").unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert_eq!(s.hints, vec![QueryHint::NoPrefilter]);
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_hints() {
+        let stmt = parse("FETCH /*+ NO_PROMOTE */ /*+ FORCE_FULL_SCAN */ * FROM venues;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.hints.len(), 2);
+                assert!(f.hints.contains(&QueryHint::NoPromote));
+                assert!(f.hints.contains(&QueryHint::ForceFullScan));
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_hint_max_acu() {
+        let stmt = parse("FETCH /*+ MAX_ACU(200) */ * FROM venues;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert_eq!(f.hints, vec![QueryHint::MaxAcu(200.0)]);
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn parse_hint_timeout() {
+        let stmt = parse("SEARCH /*+ TIMEOUT(5000) */ venues NEAR VECTOR [1.0, 0.0] LIMIT 5;").unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert_eq!(s.hints, vec![QueryHint::Timeout(5000)]);
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_no_hints_gives_empty_vec() {
+        let stmt = parse("FETCH * FROM venues;").unwrap();
+        match stmt {
+            Statement::Fetch(f) => {
+                assert!(f.hints.is_empty());
+            }
+            _ => panic!("expected Fetch"),
         }
     }
 }

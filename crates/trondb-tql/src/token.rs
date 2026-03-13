@@ -8,7 +8,15 @@ fn strip_quotes(lex: &mut logos::Lexer<Token>) -> String {
 #[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\r\n\f]+")]
 #[logos(skip r"--[^\n]*")]
+#[logos(skip r"/\*[^+]([^*]|\*[^/])*\*/")]
 pub enum Token {
+    // Query hints: /*+ HINT_NAME [VALUE] */
+    #[regex(r"/\*\+[^*]*\*/", priority = 5, callback = |lex| {
+        let s = lex.slice();
+        s[3..s.len()-2].trim().to_string()
+    })]
+    Hint(String),
+
     // Keywords — priority 10 so they beat Ident
     #[token("FETCH", priority = 10, ignore(ascii_case))]
     Fetch,
@@ -637,5 +645,27 @@ mod tests {
     fn lex_desc_keyword() {
         let tokens = lex("DESC");
         assert_eq!(tokens, vec![Token::Desc]);
+    }
+
+    #[test]
+    fn lex_hint_token() {
+        let tokens = lex("FETCH /*+ NO_PROMOTE */ * FROM venues;");
+        assert_eq!(tokens[0], Token::Fetch);
+        assert_eq!(tokens[1], Token::Hint("NO_PROMOTE".into()));
+        assert_eq!(tokens[2], Token::Star);
+    }
+
+    #[test]
+    fn lex_hint_with_value() {
+        let tokens = lex("/*+ MAX_ACU(200) */");
+        assert_eq!(tokens[0], Token::Hint("MAX_ACU(200)".into()));
+    }
+
+    #[test]
+    fn lex_block_comment_skipped() {
+        let tokens = lex("FETCH /* this is a comment */ * FROM venues;");
+        assert_eq!(tokens[0], Token::Fetch);
+        assert_eq!(tokens[1], Token::Star);
+        assert_eq!(tokens[2], Token::From);
     }
 }

@@ -55,6 +55,8 @@ pub enum Plan {
     Infer(InferPlan),
     ConfirmEdge(ConfirmEdgePlan),
     ExplainHistory(ExplainHistoryPlan),
+    DropCollection(DropCollectionPlan),
+    DropEdgeType(DropEdgeTypePlan),
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +196,16 @@ pub struct ConfirmEdgePlan {
 pub struct ExplainHistoryPlan {
     pub entity_id: String,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropCollectionPlan {
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropEdgeTypePlan {
+    pub name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -459,10 +471,12 @@ pub fn plan(
             limit: s.limit,
         })),
 
-        // DROP statements — plan types not yet implemented (Task 9)
-        Statement::DropCollection(_) | Statement::DropEdgeType(_) => {
-            Err(EngineError::InvalidQuery("DROP statements not yet implemented".into()))
-        }
+        Statement::DropCollection(s) => Ok(Plan::DropCollection(DropCollectionPlan {
+            name: s.name.clone(),
+        })),
+        Statement::DropEdgeType(s) => Ok(Plan::DropEdgeType(DropEdgeTypePlan {
+            name: s.name.clone(),
+        })),
     }
 }
 
@@ -487,6 +501,7 @@ mod tests {
             filter: None,
             order_by: vec![],
             limit: Some(5),
+            hints: vec![],
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -511,8 +526,9 @@ mod tests {
             filter: None,
             confidence: Some(0.8),
             limit: Some(5),
-        query_text: None,
-        using_repr: None,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -535,6 +551,7 @@ mod tests {
             filter: None,
             order_by: vec![],
             limit: None,
+            hints: vec![],
         })));
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -559,8 +576,9 @@ mod tests {
             filter: None,
             confidence: None,
             limit: Some(10),
-        query_text: None,
-        using_repr: None,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -581,8 +599,9 @@ mod tests {
             filter: None,
             confidence: None,
             limit: Some(10),
-        query_text: None,
-        using_repr: None,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -628,8 +647,9 @@ mod tests {
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
             confidence: None,
             limit: Some(10),
-        query_text: None,
-        using_repr: None,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
         });
         let p = plan(&stmt, &schemas).unwrap();
         match p {
@@ -669,8 +689,9 @@ mod tests {
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
             confidence: None,
             limit: Some(10),
-        query_text: None,
-        using_repr: None,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
         });
         let result = plan(&stmt, &schemas);
         assert!(result.is_err());
@@ -713,6 +734,7 @@ mod tests {
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
             order_by: vec![],
             limit: Some(10),
+            hints: vec![],
         });
         let p = plan(&stmt, &schemas).unwrap();
         match p {
@@ -757,6 +779,7 @@ mod tests {
             filter: Some(WhereClause::Gt("score".into(), Literal::Int(50))),
             order_by: vec![],
             limit: None,
+            hints: vec![],
         });
         let p = plan(&stmt, &schemas).unwrap();
         match p {
@@ -799,6 +822,7 @@ mod tests {
             limit: Some(5),
             query_text: Some("live jazz in Bristol".into()),
             using_repr: Some("semantic".into()),
+            hints: vec![],
         });
         let p = plan(&stmt, &empty_schemas()).unwrap();
         match p {
@@ -845,6 +869,7 @@ mod tests {
             filter: Some(WhereClause::Gte("score".into(), Literal::Int(80))),
             order_by: vec![],
             limit: None,
+            hints: vec![],
         });
         let p = plan(&stmt, &schemas).unwrap();
         match p {

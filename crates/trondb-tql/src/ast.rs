@@ -117,6 +117,17 @@ pub struct OrderByClause {
     pub direction: SortDirection,
 }
 
+// --- Query Hints ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryHint {
+    NoPromote,          // /*+ NO_PROMOTE */
+    NoPrefilter,        // /*+ NO_PREFILTER */
+    ForceFullScan,      // /*+ FORCE_FULL_SCAN */
+    MaxAcu(f64),        // /*+ MAX_ACU(200) */
+    Timeout(u64),       // /*+ TIMEOUT(5000) */
+}
+
 // --- FETCH ---
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +137,7 @@ pub struct FetchStmt {
     pub filter: Option<WhereClause>,
     pub order_by: Vec<OrderByClause>,
     pub limit: Option<usize>,
+    pub hints: Vec<QueryHint>,
 }
 
 // --- SEARCH (expanded) ---
@@ -141,6 +153,7 @@ pub struct SearchStmt {
     pub limit: Option<usize>,
     pub query_text: Option<String>,
     pub using_repr: Option<String>,
+    pub hints: Vec<QueryHint>,
 }
 
 // --- Common types ---
