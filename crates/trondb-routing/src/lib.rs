@@ -100,6 +100,7 @@ mod tests {
             collection: "nonexistent".into(),
             fields: trondb_tql::FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
         });
@@ -136,6 +137,7 @@ mod tests {
             collection: "test".into(),
             fields: trondb_tql::FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
         });
@@ -184,6 +186,7 @@ mod tests {
             collection: "nonexistent".into(),
             fields: trondb_tql::FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
         });
@@ -229,6 +232,7 @@ mod tests {
             collection: "nonexistent".into(),
             fields: trondb_tql::FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
         });
@@ -273,6 +277,7 @@ mod tests {
             collection: "nonexistent".into(),
             fields: trondb_tql::FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: Some(10),
             strategy: trondb_core::planner::FetchStrategy::FullScan,
         });

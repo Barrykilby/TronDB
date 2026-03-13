@@ -120,6 +120,7 @@ async fn loopback_create_insert_fetch() {
         collection: "loopback_coll".into(),
         fields: FieldList::All,
         filter: None,
+        order_by: vec![],
         limit: Some(10),
         strategy: FetchStrategy::FullScan,
     });

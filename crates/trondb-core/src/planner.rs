@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use crate::edge::InferenceConfig;
 use crate::error::EngineError;
 use crate::types::CollectionSchema;
-use trondb_tql::{FieldList, Literal, Statement, VectorLiteral, WhereClause};
+use trondb_tql::{FieldList, Literal, OrderByClause, Statement, VectorLiteral, WhereClause};
 
 // ---------------------------------------------------------------------------
 // Strategy enums
@@ -81,6 +81,7 @@ pub struct FetchPlan {
     pub collection: String,
     pub fields: FieldList,
     pub filter: Option<WhereClause>,
+    pub order_by: Vec<OrderByClause>,
     pub limit: Option<usize>,
     pub strategy: FetchStrategy,
 }
@@ -326,6 +327,7 @@ pub fn plan(
                 collection: s.collection.clone(),
                 fields: s.fields.clone(),
                 filter: s.filter.clone(),
+                order_by: s.order_by.clone(),
                 limit: s.limit,
                 strategy,
             }))
@@ -456,6 +458,11 @@ pub fn plan(
             entity_id: s.entity_id.clone(),
             limit: s.limit,
         })),
+
+        // DROP statements — plan types not yet implemented (Task 9)
+        Statement::DropCollection(_) | Statement::DropEdgeType(_) => {
+            Err(EngineError::InvalidQuery("DROP statements not yet implemented".into()))
+        }
     }
 }
 

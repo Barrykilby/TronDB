@@ -623,6 +623,7 @@ impl Executor {
                                 rows.push(entity_to_row(&entity, &p.fields));
                             }
                         }
+                        sort_rows(&mut rows, &p.order_by);
                         if let Some(limit) = p.limit {
                             rows.truncate(limit);
                         }
@@ -667,6 +668,7 @@ impl Executor {
                                 }
                             }
                         }
+                        sort_rows(&mut rows, &p.order_by);
                         if let Some(limit) = p.limit {
                             rows.truncate(limit);
                         }
@@ -700,6 +702,7 @@ impl Executor {
                             .map(|e| entity_to_row(e, &p.fields))
                             .collect();
 
+                        sort_rows(&mut rows, &p.order_by);
                         if let Some(limit) = p.limit {
                             rows.truncate(limit);
                         }
@@ -2646,6 +2649,52 @@ fn pick_tighter_upper(a: &[Value], b: &[Value]) -> Vec<Value> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ORDER BY helpers
+// ---------------------------------------------------------------------------
+
+fn sort_rows(rows: &mut [Row], order_by: &[trondb_tql::OrderByClause]) {
+    if order_by.is_empty() {
+        return;
+    }
+    rows.sort_by(|a, b| {
+        for clause in order_by {
+            let a_val = a.values.get(&clause.field);
+            let b_val = b.values.get(&clause.field);
+            let cmp = compare_values(a_val, b_val);
+            let cmp = match clause.direction {
+                trondb_tql::SortDirection::Asc => cmp,
+                trondb_tql::SortDirection::Desc => cmp.reverse(),
+            };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) | (Some(Value::Null), Some(Value::Null)) => std::cmp::Ordering::Equal,
+        (None | Some(Value::Null), _) => std::cmp::Ordering::Greater, // NULLs sort last
+        (_, None | Some(Value::Null)) => std::cmp::Ordering::Less,
+        (Some(Value::Int(x)), Some(Value::Int(y))) => x.cmp(y),
+        (Some(Value::Float(x)), Some(Value::Float(y))) => {
+            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Some(Value::Int(x)), Some(Value::Float(y))) => {
+            (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Some(Value::Float(x)), Some(Value::Int(y))) => {
+            x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
+        (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
 fn explain_plan(plan: &Plan) -> Vec<Row> {
     let mut props: Vec<(&str, String)> = Vec::new();
 
@@ -2667,6 +2716,16 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
                     props.push(("strategy", format!("FieldIndexRange ({})", index_name)));
                     props.push(("tier", "FieldIndex".into()));
                 }
+            }
+            if !p.order_by.is_empty() {
+                let order_str = p.order_by.iter()
+                    .map(|o| format!("{} {}", o.field, match o.direction {
+                        trondb_tql::SortDirection::Asc => "ASC",
+                        trondb_tql::SortDirection::Desc => "DESC",
+                    }))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                props.push(("order_by", order_str));
             }
             if let Some(limit) = p.limit {
                 props.push(("limit", limit.to_string()));
@@ -2898,6 +2957,7 @@ mod tests {
                 collection: "venues".into(),
                 fields: FieldList::All,
                 filter: None,
+                order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
             }))
@@ -2943,6 +3003,7 @@ mod tests {
                     "city".into(),
                     Literal::String("London".into()),
                 )),
+                order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
             }))
@@ -2964,6 +3025,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         });
@@ -3315,6 +3377,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
         })).await.unwrap();
@@ -3373,6 +3436,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Gte("score".into(), Literal::Int(30))),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
         })).await.unwrap();
@@ -3439,6 +3503,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Gt("score".into(), Literal::Int(30))),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
         })).await.unwrap();
@@ -3505,6 +3570,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(filter),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
         })).await.unwrap();
@@ -3567,6 +3633,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Lt("score".into(), Literal::Int(30))),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
         })).await.unwrap();
@@ -3629,6 +3696,7 @@ mod tests {
             collection: "items".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Lte("score".into(), Literal::Int(30))),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
         })).await.unwrap();
@@ -3687,6 +3755,7 @@ mod tests {
             collection: "scores".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Gte("score".into(), Literal::Int(30))),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         })).await.unwrap();
@@ -3969,6 +4038,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Eq("city".into(), Literal::String("London".into()))),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
         });
@@ -4415,6 +4485,7 @@ mod tests {
                 collection: "venues".into(),
                 fields: FieldList::All,
                 filter: None,
+                order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
             }))
@@ -4442,6 +4513,7 @@ mod tests {
                 collection: "venues".into(),
                 fields: FieldList::All,
                 filter: None,
+                order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FullScan,
             }))
@@ -4650,6 +4722,7 @@ mod tests {
                     "city".into(),
                     Literal::String("London".into()),
                 )),
+                order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
             }))
@@ -4674,6 +4747,7 @@ mod tests {
                     "city".into(),
                     Literal::String("London".into()),
                 )),
+                order_by: vec![],
                 limit: None,
                 strategy: FetchStrategy::FieldIndexLookup("idx_city".into()),
             }))
@@ -6331,6 +6405,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Neq("status".into(), Literal::String("archived".into()))),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         })).await.unwrap();
@@ -6348,6 +6423,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::IsNull("name".into())),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         })).await.unwrap();
@@ -6366,6 +6442,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::IsNotNull("name".into())),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         })).await.unwrap();
@@ -6388,6 +6465,7 @@ mod tests {
                 Literal::String("music".into()),
                 Literal::String("theatre".into()),
             ])),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         })).await.unwrap();
@@ -6406,6 +6484,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: Some(WhereClause::Like("name".into(), "Jazz%".into())),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         })).await.unwrap();
@@ -6425,10 +6504,62 @@ mod tests {
             filter: Some(WhereClause::Not(Box::new(
                 WhereClause::Eq("active".into(), Literal::Bool(true))
             ))),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         })).await.unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].values.get("id").unwrap(), &Value::String("v2".into()));
+    }
+
+    #[tokio::test]
+    async fn fetch_order_by_asc() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("Charlie".into()))], None).await;
+        insert_entity(&exec, "venues", "v2", vec![("name", Literal::String("Alpha".into()))], None).await;
+        insert_entity(&exec, "venues", "v3", vec![("name", Literal::String("Bravo".into()))], None).await;
+
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![trondb_tql::OrderByClause {
+                field: "name".into(),
+                direction: trondb_tql::SortDirection::Asc,
+            }],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0].values.get("name").unwrap(), &Value::String("Alpha".into()));
+        assert_eq!(result.rows[1].values.get("name").unwrap(), &Value::String("Bravo".into()));
+        assert_eq!(result.rows[2].values.get("name").unwrap(), &Value::String("Charlie".into()));
+    }
+
+    #[tokio::test]
+    async fn fetch_order_by_desc_with_limit() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("score", Literal::Int(10))], None).await;
+        insert_entity(&exec, "venues", "v2", vec![("score", Literal::Int(30))], None).await;
+        insert_entity(&exec, "venues", "v3", vec![("score", Literal::Int(20))], None).await;
+
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![trondb_tql::OrderByClause {
+                field: "score".into(),
+                direction: trondb_tql::SortDirection::Desc,
+            }],
+            limit: Some(2),
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values.get("score").unwrap(), &Value::Int(30));
+        assert_eq!(result.rows[1].values.get("score").unwrap(), &Value::Int(20));
     }
 }

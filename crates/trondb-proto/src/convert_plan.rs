@@ -615,6 +615,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                 collection: fp.collection,
                 fields: proto_to_field_list(&fp.fields.ok_or("missing fields")?),
                 filter: fp.filter.as_ref().map(proto_to_where_clause).transpose()?,
+                order_by: vec![],
                 limit: fp.limit.map(|l| l as usize),
                 strategy: proto_to_fetch_strategy(fp.strategy, &fp.strategy_index_name),
             })),
@@ -789,6 +790,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: Some(10),
             strategy: FetchStrategy::FullScan,
         });
@@ -869,6 +871,7 @@ mod tests {
             collection: "venues".into(),
             fields: FieldList::All,
             filter: None,
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         });
@@ -912,6 +915,7 @@ mod tests {
                 Box::new(WhereClause::Gte("score".into(), Literal::Int(50))),
                 Box::new(WhereClause::Lt("score".into(), Literal::Int(100))),
             )),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FieldIndexRange("idx_score".into()),
         });
@@ -1165,6 +1169,7 @@ mod tests {
                 Box::new(WhereClause::Eq("city".into(), Literal::String("London".into()))),
                 Box::new(WhereClause::Eq("city".into(), Literal::String("Paris".into()))),
             )),
+            order_by: vec![],
             limit: None,
             strategy: FetchStrategy::FullScan,
         });
