@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 15: Operational Excellence.
+Inference-first storage engine. Phase 16: Query Composition.
 
 ## Project Structure
 
@@ -247,3 +247,15 @@ Inference-first storage engine. Phase 15: Operational Excellence.
     - Future OTel export via tracing subscriber layer (OTEL_EXPORTER_OTLP_ENDPOINT)
   - Proto/gRPC: proper proto messages for UPSERT, CHECKPOINT, BACKUP, RESTORE, ALTER COLLECTION, IMPORT
   - Benchmark suite: criterion benches for INSERT throughput, FETCH full scan, point lookup
+- Query Composition (Phase 16)
+  - WITHIN clause on SEARCH: scope vector search to a graph subgraph
+    - Syntax: SEARCH ... NEAR ... USING ... WITHIN (TRAVERSE FROM 'id' MATCH pattern DEPTH min..max) LIMIT k
+    - All TRAVERSE features available inside WITHIN (direction, confidence, temporal, edge type filter)
+    - Orthogonal modifier: works with Hnsw, Sparse, Hybrid, NaturalLanguage strategies
+  - Two execution approaches, auto-selected at runtime:
+    - BruteForceSubgraph (candidate set < 500): bypass HNSW, fetch vectors, compute cosine/inner-product directly
+    - IndexPostFilter (candidate set >= 500): HNSW search with adaptive over-fetch, post-filter against candidate set
+  - Combined WHERE + WITHIN: candidate sets intersected
+  - WITHIN subquery shown in EXPLAIN output
+  - Proto/gRPC: TraverseMatchPlanProto within field (field 16) on SearchPlan
+  - execute_traverse_match_plan() extracted as reusable helper
