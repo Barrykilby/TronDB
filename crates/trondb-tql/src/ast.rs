@@ -24,6 +24,7 @@ pub enum Statement {
     FetchJoin(FetchJoinStmt),
     TraverseMatch(TraverseMatchStmt),
     Upsert(UpsertStmt),
+    Checkpoint(CheckpointStmt),
 }
 
 // --- CREATE COLLECTION (expanded) ---
@@ -295,6 +296,11 @@ pub struct UpdateStmt {
     pub collection: String,
     pub assignments: Vec<(String, Literal)>,
 }
+
+// --- CHECKPOINT ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointStmt;
 
 // --- UPSERT (INSERT OR UPDATE) ---
 

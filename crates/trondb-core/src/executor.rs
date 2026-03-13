@@ -2426,6 +2426,35 @@ impl Executor {
                 })
             }
 
+            Plan::Checkpoint(_) => {
+                // Trigger WAL checkpoint — writes a 0xFF record and snapshots location table
+                let snapshot_path = std::path::Path::new("checkpoint");
+                let checkpoint_lsn = self.wal.checkpoint(snapshot_path).await?;
+
+                // Snapshot the location table
+                let _snapshot_bytes = self.location.snapshot(checkpoint_lsn)
+                    .map_err(|e| EngineError::Storage(format!("location snapshot failed: {e}")))?;
+
+                Ok(QueryResult {
+                    columns: vec!["checkpoint_lsn".into(), "message".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([
+                            ("checkpoint_lsn".into(), Value::Int(checkpoint_lsn as i64)),
+                            ("message".into(), Value::String("checkpoint complete".into())),
+                        ]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                        cost: cost_estimate,
+                        warnings: opt_warnings,
+                    },
+                })
+            }
+
             Plan::Upsert(p) => {
                 // UPSERT is semantically identical to INSERT —
                 // our INSERT already overwrites on duplicate ID.
@@ -3720,6 +3749,11 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("collection", p.collection.clone()));
             props.push(("tier", "Fjall".into()));
         }
+        Plan::Checkpoint(_) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "CHECKPOINT".into()));
+            props.push(("tier", "WAL".into()));
+        }
     }
 
     props
@@ -3743,7 +3777,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraverseMatchPlan, TraversePlan, UpsertPlan};
+    use crate::planner::{CheckpointPlan, ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, JoinPlan, PreFilter, SearchPlan, TraverseMatchPlan, TraversePlan, UpsertPlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -9485,5 +9519,16 @@ mod tests {
             result.rows[0].values.get("name"),
             Some(&Value::String("New".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn execute_checkpoint() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        let result = exec.execute(&Plan::Checkpoint(CheckpointPlan)).await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        // Should return a row with checkpoint info
+        assert!(result.rows[0].values.contains_key("checkpoint_lsn"));
     }
 }

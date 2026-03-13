@@ -60,6 +60,7 @@ pub enum Plan {
     Join(JoinPlan),
     TraverseMatch(TraverseMatchPlan),
     Upsert(UpsertPlan),
+    Checkpoint(CheckpointPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +195,9 @@ pub struct UpdateEntityPlan {
     pub collection: String,
     pub assignments: Vec<(String, trondb_tql::Literal)>,
 }
+
+#[derive(Debug, Clone)]
+pub struct CheckpointPlan;
 
 #[derive(Debug, Clone)]
 pub struct UpsertPlan {
@@ -568,6 +572,8 @@ pub fn plan(
             limit: s.limit,
         })),
 
+        Statement::Checkpoint(_) => Ok(Plan::Checkpoint(CheckpointPlan)),
+
         Statement::Upsert(s) => Ok(Plan::Upsert(UpsertPlan {
             collection: s.collection.clone(),
             fields: s.fields.clone(),
@@ -665,7 +671,8 @@ pub fn estimate_plan_cost(
             AcuEstimate::single("write", 1, cost.write_base_acu())
         }
         // Metadata / explain operations are free
-        Plan::Explain(_) | Plan::ExplainTiers(_) | Plan::ExplainHistory(_) => {
+        Plan::Explain(_) | Plan::ExplainTiers(_) | Plan::ExplainHistory(_)
+        | Plan::Checkpoint(_) => {
             AcuEstimate::zero()
         }
     }

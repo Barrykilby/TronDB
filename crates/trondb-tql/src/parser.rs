@@ -138,6 +138,11 @@ impl Parser {
             Some(Token::Confirm) => self.parse_confirm_edge(),
             Some(Token::Infer) => self.parse_infer(),
             Some(Token::Drop) => self.parse_drop(),
+            Some(Token::Checkpoint) => {
+                self.advance(); // CHECKPOINT
+                self.expect(&Token::Semicolon)?;
+                Ok(Statement::Checkpoint(CheckpointStmt))
+            }
             Some(tok) => {
                 let tok_str = format!("{tok:?}");
                 let pos = self.tokens[self.pos].1.start;
@@ -2963,5 +2968,17 @@ mod tests {
     fn parse_insert_without_or_update_still_works() {
         let stmt = parse("INSERT INTO venues (id, name) VALUES ('v1', 'Venue');").unwrap();
         assert!(matches!(stmt, Statement::Insert(_)));
+    }
+
+    #[test]
+    fn parse_checkpoint() {
+        let stmt = parse("CHECKPOINT;").unwrap();
+        assert!(matches!(stmt, Statement::Checkpoint(_)));
+    }
+
+    #[test]
+    fn parse_checkpoint_case_insensitive() {
+        let stmt = parse("checkpoint;").unwrap();
+        assert!(matches!(stmt, Statement::Checkpoint(_)));
     }
 }
