@@ -1287,6 +1287,7 @@ impl Parser {
             query_text,
             using_repr,
             hints,
+            within: None,
         }))
     }
 
