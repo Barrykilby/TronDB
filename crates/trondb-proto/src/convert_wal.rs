@@ -33,6 +33,8 @@ fn record_type_to_proto(rt: RecordType) -> pb::RecordTypeProto {
         RecordType::AffinityGroupRemove => pb::RecordTypeProto::RecordTypeAffinityGroupRemove,
         RecordType::TierMigration => pb::RecordTypeProto::RecordTypeTierMigration,
         RecordType::Checkpoint => pb::RecordTypeProto::RecordTypeCheckpoint,
+        RecordType::SchemaDropColl => pb::RecordTypeProto::RecordTypeSchemaDropColl,
+        RecordType::SchemaDropEdgeType => pb::RecordTypeProto::RecordTypeSchemaDropEdgeType,
     }
 }
 
@@ -68,6 +70,10 @@ fn proto_to_record_type(proto: i32) -> Result<RecordType, String> {
         }
         Ok(pb::RecordTypeProto::RecordTypeTierMigration) => Ok(RecordType::TierMigration),
         Ok(pb::RecordTypeProto::RecordTypeCheckpoint) => Ok(RecordType::Checkpoint),
+        Ok(pb::RecordTypeProto::RecordTypeSchemaDropColl) => Ok(RecordType::SchemaDropColl),
+        Ok(pb::RecordTypeProto::RecordTypeSchemaDropEdgeType) => {
+            Ok(RecordType::SchemaDropEdgeType)
+        }
         Err(_) => Err(format!("unknown RecordTypeProto value: {proto}")),
     }
 }
@@ -178,6 +184,8 @@ mod tests {
             RecordType::AffinityGroupRemove,
             RecordType::TierMigration,
             RecordType::Checkpoint,
+            RecordType::SchemaDropColl,
+            RecordType::SchemaDropEdgeType,
         ];
         for rt in &variants {
             let record = WalRecord {

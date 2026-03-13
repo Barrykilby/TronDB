@@ -19,6 +19,8 @@ pub enum RecordType {
     LocationUpdate       = 0x40,
     SchemaCreateColl     = 0x50,
     SchemaCreateEdgeType = 0x51,
+    SchemaDropColl       = 0x52,
+    SchemaDropEdgeType   = 0x53,
     AffinityGroupCreate  = 0x60,
     AffinityGroupMember  = 0x61,
     AffinityGroupRemove  = 0x62,

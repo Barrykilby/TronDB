@@ -310,6 +310,85 @@ impl FjallStore {
         Ok(())
     }
 
+    /// Drop a collection: remove schema metadata, main partition, field index
+    /// partitions, and warm/archive tier partitions.
+    pub fn drop_collection(&self, name: &str) -> Result<(), EngineError> {
+        // 1. Delete schema metadata from meta partition
+        let meta_key = format!("{COLLECTION_PREFIX}{name}");
+        // Read the schema first so we can clean up index partitions
+        let schema = self.get_collection_schema(name)?;
+        self.meta
+            .remove(&meta_key)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?;
+
+        // 2. Delete the main entity partition
+        if let Ok(partition) = self
+            .keyspace
+            .open_partition(name, PartitionCreateOptions::default())
+        {
+            let _ = self.keyspace.delete_partition(partition);
+        }
+
+        // 3. Delete field index partitions
+        for idx in &schema.indexes {
+            let partition_name = format!("{name}.idx.{}", idx.name);
+            if let Ok(partition) = self
+                .keyspace
+                .open_partition(&partition_name, PartitionCreateOptions::default())
+            {
+                let _ = self.keyspace.delete_partition(partition);
+            }
+        }
+
+        // 4. Delete warm tier partition
+        let warm_name = format!("warm.{name}");
+        if let Ok(partition) = self
+            .keyspace
+            .open_partition(&warm_name, PartitionCreateOptions::default())
+        {
+            let _ = self.keyspace.delete_partition(partition);
+        }
+
+        // 5. Delete archive tier partition
+        let archive_name = format!("archive.{name}");
+        if let Ok(partition) = self
+            .keyspace
+            .open_partition(&archive_name, PartitionCreateOptions::default())
+        {
+            let _ = self.keyspace.delete_partition(partition);
+        }
+
+        self.keyspace
+            .persist(PersistMode::SyncAll)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Drop an edge type: remove edge type metadata and the edge partition.
+    pub fn drop_edge_type(&self, name: &str) -> Result<(), EngineError> {
+        // 1. Delete edge type metadata from meta partition
+        let meta_key = format!("{EDGE_TYPE_PREFIX}{name}");
+        self.meta
+            .remove(&meta_key)
+            .map_err(|e: fjall::Error| EngineError::Storage(e.to_string()))?;
+
+        // 2. Delete the edge partition
+        let partition_name = format!("edges.{name}");
+        if let Ok(partition) = self
+            .keyspace
+            .open_partition(&partition_name, PartitionCreateOptions::default())
+        {
+            let _ = self.keyspace.delete_partition(partition);
+        }
+
+        self.keyspace
+            .persist(PersistMode::SyncAll)
+            .map_err(|e| EngineError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
     pub fn persist(&self) -> Result<(), EngineError> {
         self.keyspace
             .persist(PersistMode::SyncAll)

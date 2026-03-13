@@ -240,6 +240,12 @@ impl AdjacencyIndex {
         (forward_edges, backward_edges)
     }
 
+    /// Remove all adjacency entries for a given edge type.
+    pub fn remove_edge_type(&self, edge_type: &str) {
+        self.forward.retain(|k, _| k.1 != edge_type);
+        self.backward.retain(|k, _| k.1 != edge_type);
+    }
+
     pub fn len(&self) -> usize {
         self.forward.iter().map(|e| e.value().len()).sum()
     }

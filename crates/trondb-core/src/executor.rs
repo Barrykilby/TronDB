@@ -171,6 +171,39 @@ impl Executor {
                     self.store.delete_edge(&payload.edge_type, &payload.from_id, &payload.to_id)?;
                     replayed += 1;
                 }
+                RecordType::SchemaDropColl => {
+                    let coll_name: String = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    if self.store.has_collection(&coll_name) {
+                        self.store.drop_collection(&coll_name)?;
+                        replayed += 1;
+                    }
+                    self.schemas.remove(&coll_name);
+                    // Clean up HNSW indexes, sparse indexes, field indexes
+                    let prefix = format!("{coll_name}:");
+                    self.indexes.retain(|k, _| !k.starts_with(&prefix));
+                    self.sparse_indexes.retain(|k, _| !k.starts_with(&prefix));
+                    self.field_indexes.retain(|k, _| !k.starts_with(&prefix));
+                    // Clean up entity_collections + location entries
+                    self.entity_collections.retain(|entity_id, coll| {
+                        if coll.as_str() == coll_name {
+                            self.location.remove_entity(entity_id);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                RecordType::SchemaDropEdgeType => {
+                    let et_name: String = rmp_serde::from_slice(&record.payload)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    if self.store.has_edge_type(&et_name) {
+                        self.store.drop_edge_type(&et_name)?;
+                        replayed += 1;
+                    }
+                    self.edge_types.remove(&et_name);
+                    self.adjacency.remove_edge_type(&et_name);
+                }
                 RecordType::ReprDirty => {
                     // Payload is a serialized ReprKey (entity_id + repr_index)
                     let repr_key: ReprKey = rmp_serde::from_slice(&record.payload)
@@ -1789,6 +1822,105 @@ impl Executor {
                 })
             }
 
+            Plan::DropCollection(p) => {
+                // Step 1: Validate collection exists
+                if !self.schemas.contains_key(&p.name) {
+                    return Err(EngineError::CollectionNotFound(p.name.clone()));
+                }
+
+                // Step 2: WAL log
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.name, tx_id, 1, vec![]);
+                let payload = rmp_serde::to_vec_named(&p.name)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::SchemaDropColl, &p.name, tx_id, 1, payload);
+                self.wal.commit(tx_id).await?;
+
+                // Step 3: Remove HNSW indexes
+                let hnsw_prefix = format!("{}:", p.name);
+                self.indexes.retain(|k, _| !k.starts_with(&hnsw_prefix));
+
+                // Step 4: Remove sparse indexes
+                self.sparse_indexes.retain(|k, _| !k.starts_with(&hnsw_prefix));
+
+                // Step 5: Remove field indexes
+                self.field_indexes.retain(|k, _| !k.starts_with(&hnsw_prefix));
+
+                // Step 6: Remove location table entries for entities in this collection
+                self.entity_collections.retain(|entity_id, coll| {
+                    if coll.as_str() == p.name {
+                        self.location.remove_entity(entity_id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                // Step 7: Drop from Fjall store
+                self.store.drop_collection(&p.name)?;
+
+                // Step 8: Remove from schemas
+                self.schemas.remove(&p.name);
+
+                Ok(QueryResult {
+                    columns: vec!["result".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([(
+                            "result".into(),
+                            Value::String(format!("Collection '{}' dropped", p.name)),
+                        )]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                    },
+                })
+            }
+
+            Plan::DropEdgeType(p) => {
+                // Step 1: Validate edge type exists
+                if !self.edge_types.contains_key(&p.name) {
+                    return Err(EngineError::EdgeTypeNotFound(p.name.clone()));
+                }
+
+                // Step 2: WAL log
+                let tx_id = self.wal.next_tx_id();
+                self.wal.append(RecordType::TxBegin, &p.name, tx_id, 1, vec![]);
+                let payload = rmp_serde::to_vec_named(&p.name)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
+                self.wal.append(RecordType::SchemaDropEdgeType, &p.name, tx_id, 1, payload);
+                self.wal.commit(tx_id).await?;
+
+                // Step 3: Remove adjacency entries
+                self.adjacency.remove_edge_type(&p.name);
+
+                // Step 4: Drop from Fjall store
+                self.store.drop_edge_type(&p.name)?;
+
+                // Step 5: Remove from edge_types
+                self.edge_types.remove(&p.name);
+
+                Ok(QueryResult {
+                    columns: vec!["result".into()],
+                    rows: vec![Row {
+                        values: HashMap::from([(
+                            "result".into(),
+                            Value::String(format!("Edge type '{}' dropped", p.name)),
+                        )]),
+                        score: None,
+                    }],
+                    stats: QueryStats {
+                        elapsed: start.elapsed(),
+                        entities_scanned: 0,
+                        mode: QueryMode::Deterministic,
+                        tier: "Fjall".into(),
+                    },
+                })
+            }
+
             Plan::UpdateEntity(p) => {
                 let entity_id = LogicalId::from_string(&p.entity_id);
 
@@ -2844,6 +2976,18 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("verb", "EXPLAIN HISTORY".into()));
             props.push(("entity_id", p.entity_id.clone()));
         }
+        Plan::DropCollection(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "DROP COLLECTION".into()));
+            props.push(("collection", p.name.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
+        Plan::DropEdgeType(p) => {
+            props.push(("mode", "Deterministic".into()));
+            props.push(("verb", "DROP EDGE TYPE".into()));
+            props.push(("edge_type", p.name.clone()));
+            props.push(("tier", "Fjall".into()));
+        }
     }
 
     props
@@ -2867,7 +3011,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::location::LocationTable;
-    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
+    use crate::planner::{ConfirmEdgePlan, CreateCollectionPlan, CreateEdgeTypePlan, DeleteEntityPlan, DropCollectionPlan, DropEdgeTypePlan, ExplainHistoryPlan, FetchPlan, FetchStrategy, InferPlan, InsertEdgePlan, InsertPlan, PreFilter, SearchPlan, TraversePlan};
     use trondb_tql::Literal;
     use trondb_wal::WalConfig;
 
@@ -6561,5 +6705,159 @@ mod tests {
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0].values.get("score").unwrap(), &Value::Int(30));
         assert_eq!(result.rows[1].values.get("score").unwrap(), &Value::Int(20));
+    }
+
+    #[tokio::test]
+    async fn drop_collection_removes_everything() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert entities
+        insert_entity(
+            &exec,
+            "venues",
+            "v1",
+            vec![("name", Literal::String("Venue A".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        )
+        .await;
+        insert_entity(
+            &exec,
+            "venues",
+            "v2",
+            vec![("name", Literal::String("Venue B".into()))],
+            Some(vec![0.0, 1.0, 0.0]),
+        )
+        .await;
+
+        // Verify entities exist
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        // DROP COLLECTION
+        let result = exec
+            .execute(&Plan::DropCollection(DropCollectionPlan {
+                name: "venues".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.rows[0]
+            .values
+            .get("result")
+            .unwrap()
+            .to_string()
+            .contains("dropped"));
+
+        // Verify FETCH returns CollectionNotFound
+        let err = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "venues".into(),
+                fields: FieldList::All,
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+            }))
+            .await;
+        assert!(err.is_err());
+        match err.unwrap_err() {
+            EngineError::CollectionNotFound(name) => assert_eq!(name, "venues"),
+            other => panic!("expected CollectionNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_edge_type_removes_edges() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create two collections
+        create_collection(&exec, "people", 3).await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert entities
+        insert_entity(
+            &exec,
+            "people",
+            "p1",
+            vec![("name", Literal::String("Alice".into()))],
+            Some(vec![1.0, 0.0, 0.0]),
+        )
+        .await;
+        insert_entity(
+            &exec,
+            "venues",
+            "v1",
+            vec![("name", Literal::String("Venue A".into()))],
+            Some(vec![0.0, 1.0, 0.0]),
+        )
+        .await;
+
+        // Create edge type
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "visits".into(),
+            from_collection: "people".into(),
+            to_collection: "venues".into(),
+            decay_config: None,
+            inference_config: None,
+        }))
+        .await
+        .unwrap();
+
+        // Insert an edge
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "visits".into(),
+            from_id: "p1".into(),
+            to_id: "v1".into(),
+            metadata: vec![],
+        }))
+        .await
+        .unwrap();
+
+        // Verify traverse works
+        let result = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "visits".into(),
+                from_id: "p1".into(),
+                depth: 1,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        // DROP EDGE TYPE
+        let result = exec
+            .execute(&Plan::DropEdgeType(DropEdgeTypePlan {
+                name: "visits".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(result.rows[0]
+            .values
+            .get("result")
+            .unwrap()
+            .to_string()
+            .contains("dropped"));
+
+        // Verify traverse now returns error (edge type not found)
+        let err = exec
+            .execute(&Plan::Traverse(TraversePlan {
+                edge_type: "visits".into(),
+                from_id: "p1".into(),
+                depth: 1,
+                limit: None,
+            }))
+            .await;
+        assert!(err.is_err());
     }
 }

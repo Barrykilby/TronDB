@@ -49,6 +49,8 @@ message PlanRequest {
         InferPlanProto infer = 17;
         ConfirmEdgePlanProto confirm_edge = 18;
         ExplainHistoryPlanProto explain_history = 19;
+        DropCollectionPlanProto drop_collection = 20;
+        DropEdgeTypePlanProto drop_edge_type = 21;
     }
 }
 
@@ -175,6 +177,14 @@ message ConfirmEdgePlanProto {
 message ExplainHistoryPlanProto {
     string entity_id = 1;
     optional uint64 limit = 2;
+}
+
+message DropCollectionPlanProto {
+    string name = 1;
+}
+
+message DropEdgeTypePlanProto {
+    string name = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +409,8 @@ enum RecordTypeProto {
     RECORD_TYPE_AFFINITY_GROUP_REMOVE = 17;
     RECORD_TYPE_TIER_MIGRATION = 18;
     RECORD_TYPE_CHECKPOINT = 19;
+    RECORD_TYPE_SCHEMA_DROP_COLL = 20;
+    RECORD_TYPE_SCHEMA_DROP_EDGE_TYPE = 21;
 }
 
 // ---------------------------------------------------------------------------

@@ -548,7 +548,15 @@ impl From<&Plan> for pb::PlanRequest {
                 Plan::ExplainHistory(p) => PP::ExplainHistory(pb::ExplainHistoryPlanProto {
                     entity_id: p.entity_id.clone(),
                     limit: p.limit.map(|l| l as u64),
-                })
+                }),
+
+                Plan::DropCollection(p) => PP::DropCollection(pb::DropCollectionPlanProto {
+                    name: p.name.clone(),
+                }),
+
+                Plan::DropEdgeType(p) => PP::DropEdgeType(pb::DropEdgeTypePlanProto {
+                    name: p.name.clone(),
+                }),
             }),
         }
     }
@@ -765,6 +773,14 @@ impl TryFrom<pb::PlanRequest> for Plan {
             PP::ExplainHistory(p) => Ok(Plan::ExplainHistory(ExplainHistoryPlan {
                 entity_id: p.entity_id,
                 limit: p.limit.map(|l| l as usize),
+            })),
+
+            PP::DropCollection(p) => Ok(Plan::DropCollection(DropCollectionPlan {
+                name: p.name,
+            })),
+
+            PP::DropEdgeType(p) => Ok(Plan::DropEdgeType(DropEdgeTypePlan {
+                name: p.name,
             })),
         }
     }
