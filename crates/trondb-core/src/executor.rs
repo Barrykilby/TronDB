@@ -566,8 +566,19 @@ impl Executor {
                     entity.representations.push(repr);
                 }
 
+                // Apply temporal validity fields from INSERT ... VALID FROM/TO
+                if let Some(ref vf) = p.valid_from {
+                    entity.valid_from = Some(parse_temporal_timestamp(vf)?);
+                }
+                if let Some(ref vt) = p.valid_to {
+                    entity.valid_to = Some(parse_temporal_timestamp(vt)?);
+                }
+
                 // WAL: TX_BEGIN -> ENTITY_WRITE -> LOCATION_UPDATE(s) -> commit
                 let tx_id = self.wal.next_tx_id();
+
+                // Stamp tx_time with the tx_id (monotonically increasing, engine-controlled)
+                entity.tx_time = tx_id;
                 self.wal.append(RecordType::TxBegin, &p.collection, tx_id, 1, vec![]);
 
                 let entity_payload = rmp_serde::to_vec_named(&entity)
@@ -710,6 +721,12 @@ impl Executor {
                         let mut rows = Vec::new();
                         for eid in &entity_ids {
                             if let Ok(entity) = self.store.get(&p.collection, eid) {
+                                // Apply temporal filter
+                                if let Some(ref tc) = p.temporal {
+                                    if !entity_passes_temporal_filter(&entity, tc).unwrap_or(false) {
+                                        continue;
+                                    }
+                                }
                                 rows.push(entity_to_row(&entity, &p.fields));
                             }
                         }
@@ -756,6 +773,12 @@ impl Executor {
                             if let Ok(entity) = self.store.get(&p.collection, eid) {
                                 // Post-filter: entity_matches handles strict Gt/Lt boundary exclusion
                                 if p.filter.as_ref().map(|c| entity_matches(&entity, c)).unwrap_or(true) {
+                                    // Apply temporal filter
+                                    if let Some(ref tc) = p.temporal {
+                                        if !entity_passes_temporal_filter(&entity, tc).unwrap_or(false) {
+                                            continue;
+                                        }
+                                    }
                                     rows.push(entity_to_row(&entity, &p.fields));
                                 }
                             }
@@ -787,6 +810,10 @@ impl Executor {
                             .iter()
                             .filter(|e| match &p.filter {
                                 Some(clause) => entity_matches(e, clause),
+                                None => true,
+                            })
+                            .filter(|e| match &p.temporal {
+                                Some(clause) => entity_passes_temporal_filter(e, clause).unwrap_or(false),
                                 None => true,
                             })
                             .collect();
@@ -1233,6 +1260,16 @@ impl Executor {
                     .unwrap()
                     .as_millis() as u64;
 
+                // Apply temporal validity fields
+                let edge_valid_from = match &p.valid_from {
+                    Some(vf) => Some(parse_temporal_timestamp(vf)?),
+                    None => None,
+                };
+                let edge_valid_to = match &p.valid_to {
+                    Some(vt) => Some(parse_temporal_timestamp(vt)?),
+                    None => None,
+                };
+
                 let edge = Edge {
                     from_id: from_id.clone(),
                     to_id: to_id.clone(),
@@ -1241,8 +1278,8 @@ impl Executor {
                     metadata,
                     created_at: now_millis,
                     source: EdgeSource::Structural,
-                    valid_from: None,
-                    valid_to: None,
+                    valid_from: edge_valid_from,
+                    valid_to: edge_valid_to,
                 };
 
                 // WAL: TxBegin -> EdgeWrite -> commit
@@ -1258,7 +1295,7 @@ impl Executor {
                 self.store.persist()?;
 
                 // Apply to AdjacencyIndex
-                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0, now_millis, EdgeSource::Structural, None, None);
+                self.adjacency.insert(&from_id, &p.edge_type, &to_id, 1.0, now_millis, EdgeSource::Structural, edge_valid_from, edge_valid_to);
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
@@ -2482,6 +2519,12 @@ impl Executor {
                                 trondb_tql::EdgeDirection::Forward => {
                                     let entries = self.adjacency.get(node_id, &et.name);
                                     for entry in &entries {
+                                        // Apply temporal filter if present
+                                        if let Some(ref tc) = p.temporal {
+                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                                continue;
+                                            }
+                                        }
                                         let effective_conf = if entry.created_at > 0 {
                                             let now_ms = SystemTime::now()
                                                 .duration_since(UNIX_EPOCH)
@@ -2503,6 +2546,12 @@ impl Executor {
                                         let entries = self.adjacency.get(source_id, &et.name);
                                         for entry in &entries {
                                             if entry.to_id == *node_id {
+                                                // Apply temporal filter if present
+                                                if let Some(ref tc) = p.temporal {
+                                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                                        continue;
+                                                    }
+                                                }
                                                 let effective_conf = if entry.created_at > 0 {
                                                     let now_ms = SystemTime::now()
                                                         .duration_since(UNIX_EPOCH)
@@ -2524,6 +2573,12 @@ impl Executor {
                                     // Forward direction
                                     let entries = self.adjacency.get(node_id, &et.name);
                                     for entry in &entries {
+                                        // Apply temporal filter if present
+                                        if let Some(ref tc) = p.temporal {
+                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                                continue;
+                                            }
+                                        }
                                         let effective_conf = if entry.created_at > 0 {
                                             let now_ms = SystemTime::now()
                                                 .duration_since(UNIX_EPOCH)
@@ -2544,6 +2599,12 @@ impl Executor {
                                         let entries = self.adjacency.get(source_id, &et.name);
                                         for entry in &entries {
                                             if entry.to_id == *node_id {
+                                                // Apply temporal filter if present
+                                                if let Some(ref tc) = p.temporal {
+                                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                                        continue;
+                                                    }
+                                                }
                                                 let effective_conf = if entry.created_at > 0 {
                                                     let now_ms = SystemTime::now()
                                                         .duration_since(UNIX_EPOCH)
@@ -3127,6 +3188,17 @@ fn entity_to_row(entity: &Entity, fields: &FieldList) -> Row {
         }
     }
 
+    // Add temporal fields if present
+    if let Some(vf) = entity.valid_from {
+        values.insert("valid_from".into(), Value::Int(vf));
+    }
+    if let Some(vt) = entity.valid_to {
+        values.insert("valid_to".into(), Value::Int(vt));
+    }
+    if entity.tx_time > 0 {
+        values.insert("tx_time".into(), Value::Int(entity.tx_time as i64));
+    }
+
     Row {
         values,
         score: None,
@@ -3282,6 +3354,116 @@ fn value_lt(a: &Value, b: &Value) -> bool {
         (Value::Float(x), Value::Int(y)) => *x < (*y as f64),
         (Value::String(x), Value::String(y)) => x < y,
         _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a civil date to days since Unix epoch (1970-01-01).
+/// Algorithm from Howard Hinnant's date algorithms.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+/// Parse an ISO 8601 / date-like string into millis since epoch.
+/// Supports: 'YYYY-MM-DD', 'YYYY-MM-DDTHH:MM:SSZ', and millis-since-epoch as string.
+fn parse_temporal_timestamp(s: &str) -> Result<i64, EngineError> {
+    // Try parsing as integer millis first
+    if let Ok(ms) = s.parse::<i64>() {
+        return Ok(ms);
+    }
+
+    // Try ISO 8601 formats
+    // YYYY-MM-DDTHH:MM:SSZ
+    if s.len() == 20 && s.ends_with('Z') {
+        let parts: Vec<&str> = s[..19].split(|c| c == '-' || c == 'T' || c == ':').collect();
+        if parts.len() == 6 {
+            if let (Ok(y), Ok(m), Ok(d), Ok(hh), Ok(mm), Ok(ss)) = (
+                parts[0].parse::<i64>(), parts[1].parse::<u32>(), parts[2].parse::<u32>(),
+                parts[3].parse::<u32>(), parts[4].parse::<u32>(), parts[5].parse::<u32>(),
+            ) {
+                let days = days_from_civil(y, m, d);
+                let secs = days * 86400 + (hh as i64) * 3600 + (mm as i64) * 60 + (ss as i64);
+                return Ok(secs * 1000);
+            }
+        }
+    }
+
+    // YYYY-MM-DD
+    if s.len() == 10 {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() == 3 {
+            if let (Ok(y), Ok(m), Ok(d)) = (
+                parts[0].parse::<i64>(), parts[1].parse::<u32>(), parts[2].parse::<u32>(),
+            ) {
+                let days = days_from_civil(y, m, d);
+                return Ok(days * 86400 * 1000);
+            }
+        }
+    }
+
+    Err(EngineError::InvalidQuery(format!("cannot parse temporal timestamp: '{}'", s)))
+}
+
+/// Check if an entity is temporally visible given a TemporalClause.
+fn entity_passes_temporal_filter(
+    entity: &Entity,
+    clause: &trondb_tql::TemporalClause,
+) -> Result<bool, EngineError> {
+    match clause {
+        trondb_tql::TemporalClause::AsOf(ts_str) => {
+            let point = parse_temporal_timestamp(ts_str)?;
+            // Entity must be valid at this point in time
+            let from_ok = entity.valid_from.map_or(true, |from| from <= point);
+            let to_ok = entity.valid_to.map_or(true, |to| point < to);
+            Ok(from_ok && to_ok)
+        }
+        trondb_tql::TemporalClause::ValidDuring(start_str, end_str) => {
+            let range_start = parse_temporal_timestamp(start_str)?;
+            let range_end = parse_temporal_timestamp(end_str)?;
+            // Entity's valid interval must overlap with [range_start, range_end)
+            let entity_start = entity.valid_from.unwrap_or(i64::MIN);
+            let entity_end = entity.valid_to.unwrap_or(i64::MAX);
+            // Overlap: entity_start < range_end AND entity_end > range_start
+            Ok(entity_start < range_end && entity_end > range_start)
+        }
+        trondb_tql::TemporalClause::AsOfTransaction(lsn) => {
+            // Entity's tx_time must be <= the specified LSN
+            Ok(entity.tx_time <= *lsn)
+        }
+    }
+}
+
+/// Check if an edge is temporally visible given a TemporalClause.
+fn edge_passes_temporal_filter(
+    edge: &crate::edge::AdjEntry,
+    clause: &trondb_tql::TemporalClause,
+) -> Result<bool, EngineError> {
+    match clause {
+        trondb_tql::TemporalClause::AsOf(ts_str) => {
+            let point = parse_temporal_timestamp(ts_str)?;
+            let from_ok = edge.valid_from.map_or(true, |from| from <= point);
+            let to_ok = edge.valid_to.map_or(true, |to| point < to);
+            Ok(from_ok && to_ok)
+        }
+        trondb_tql::TemporalClause::ValidDuring(start_str, end_str) => {
+            let range_start = parse_temporal_timestamp(start_str)?;
+            let range_end = parse_temporal_timestamp(end_str)?;
+            let edge_start = edge.valid_from.unwrap_or(i64::MIN);
+            let edge_end = edge.valid_to.unwrap_or(i64::MAX);
+            Ok(edge_start < range_end && edge_end > range_start)
+        }
+        trondb_tql::TemporalClause::AsOfTransaction(_) => {
+            // Edge transaction time not tracked (only entity tx_time), pass all
+            Ok(true)
+        }
     }
 }
 
@@ -3553,6 +3735,19 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
                     .join(", ");
                 props.push(("hints", hints_str));
             }
+            if let Some(ref tc) = p.temporal {
+                match tc {
+                    trondb_tql::TemporalClause::AsOf(ts) => {
+                        props.push(("temporal", format!("AS OF '{}'", ts)));
+                    }
+                    trondb_tql::TemporalClause::ValidDuring(start, end) => {
+                        props.push(("temporal", format!("VALID DURING '{}'..'{}'", start, end)));
+                    }
+                    trondb_tql::TemporalClause::AsOfTransaction(lsn) => {
+                        props.push(("temporal", format!("AS OF TRANSACTION {}", lsn)));
+                    }
+                }
+            }
         }
         Plan::Search(p) => {
             props.push(("mode", "Probabilistic".into()));
@@ -3712,6 +3907,19 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("depth", format!("{}..{}", p.min_depth, p.max_depth)));
             if let Some(conf) = p.confidence_threshold {
                 props.push(("confidence_threshold", format!("{conf}")));
+            }
+            if let Some(ref tc) = p.temporal {
+                match tc {
+                    trondb_tql::TemporalClause::AsOf(ts) => {
+                        props.push(("temporal", format!("AS OF '{}'", ts)));
+                    }
+                    trondb_tql::TemporalClause::ValidDuring(start, end) => {
+                        props.push(("temporal", format!("VALID DURING '{}'..'{}'", start, end)));
+                    }
+                    trondb_tql::TemporalClause::AsOfTransaction(lsn) => {
+                        props.push(("temporal", format!("AS OF TRANSACTION {}", lsn)));
+                    }
+                }
             }
             props.push(("tier", "Ram".into()));
         }
@@ -9616,5 +9824,399 @@ mod tests {
         let result = exec.execute(&budget_plan).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), EngineError::AcuBudgetExceeded { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Temporal helper tests (Task 7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_temporal_iso8601() {
+        let ms = parse_temporal_timestamp("2025-01-01T00:00:00Z").unwrap();
+        assert_eq!(ms, 1735689600000); // 2025-01-01 00:00:00 UTC
+    }
+
+    #[test]
+    fn test_parse_temporal_date_only() {
+        let ms = parse_temporal_timestamp("2025-01-01").unwrap();
+        assert_eq!(ms, 1735689600000);
+    }
+
+    #[test]
+    fn test_parse_temporal_millis_string() {
+        let ms = parse_temporal_timestamp("1735689600000").unwrap();
+        assert_eq!(ms, 1735689600000);
+    }
+
+    #[test]
+    fn test_entity_temporal_as_of_visible() {
+        let mut entity = Entity::new(LogicalId::from_string("e1"));
+        entity.valid_from = Some(1704067200000); // 2024-01-01
+        entity.valid_to = Some(1735689600000);   // 2025-01-01
+
+        // Query at 2024-06-01 -- should be visible
+        let clause = trondb_tql::TemporalClause::AsOf("2024-06-01T00:00:00Z".into());
+        assert!(entity_passes_temporal_filter(&entity, &clause).unwrap());
+    }
+
+    #[test]
+    fn test_entity_temporal_as_of_invisible() {
+        let mut entity = Entity::new(LogicalId::from_string("e1"));
+        entity.valid_from = Some(1704067200000); // 2024-01-01
+        entity.valid_to = Some(1735689600000);   // 2025-01-01
+
+        // Query at 2025-06-01 -- should NOT be visible (past valid_to)
+        let clause = trondb_tql::TemporalClause::AsOf("2025-06-01T00:00:00Z".into());
+        assert!(!entity_passes_temporal_filter(&entity, &clause).unwrap());
+    }
+
+    #[test]
+    fn test_entity_temporal_as_of_transaction() {
+        let mut entity = Entity::new(LogicalId::from_string("e1"));
+        entity.tx_time = 100;
+
+        let clause = trondb_tql::TemporalClause::AsOfTransaction(150);
+        assert!(entity_passes_temporal_filter(&entity, &clause).unwrap());
+
+        let clause2 = trondb_tql::TemporalClause::AsOfTransaction(50);
+        assert!(!entity_passes_temporal_filter(&entity, &clause2).unwrap());
+    }
+
+    #[test]
+    fn test_entity_temporal_valid_during_overlap() {
+        let mut entity = Entity::new(LogicalId::from_string("e1"));
+        entity.valid_from = Some(1704067200000); // 2024-01-01
+        entity.valid_to = Some(1735689600000);   // 2025-01-01
+
+        // Query during 2024-06-01..2024-12-01 -- overlaps, should be visible
+        let clause = trondb_tql::TemporalClause::ValidDuring("2024-06-01".into(), "2024-12-01".into());
+        assert!(entity_passes_temporal_filter(&entity, &clause).unwrap());
+    }
+
+    #[test]
+    fn test_entity_temporal_valid_during_no_overlap() {
+        let mut entity = Entity::new(LogicalId::from_string("e1"));
+        entity.valid_from = Some(1704067200000); // 2024-01-01
+        entity.valid_to = Some(1719792000000);   // 2024-07-01
+
+        // Query during 2025-01-01..2025-06-01 -- no overlap
+        let clause = trondb_tql::TemporalClause::ValidDuring("2025-01-01".into(), "2025-06-01".into());
+        assert!(!entity_passes_temporal_filter(&entity, &clause).unwrap());
+    }
+
+    #[test]
+    fn test_entity_temporal_no_valid_time_always_visible() {
+        let entity = Entity::new(LogicalId::from_string("e1"));
+        // No valid_from/valid_to -- always visible
+        let clause = trondb_tql::TemporalClause::AsOf("2025-01-01T00:00:00Z".into());
+        assert!(entity_passes_temporal_filter(&entity, &clause).unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Temporal FETCH integration tests (Task 8)
+    // -----------------------------------------------------------------------
+
+    async fn insert_entity_with_temporal(
+        exec: &Executor,
+        collection: &str,
+        id: &str,
+        metadata: Vec<(&str, Literal)>,
+        vector: Option<Vec<f64>>,
+        valid_from: Option<String>,
+        valid_to: Option<String>,
+    ) {
+        let mut fields = vec!["id".to_string()];
+        let mut values = vec![Literal::String(id.into())];
+        for (k, v) in metadata {
+            fields.push(k.into());
+            values.push(v);
+        }
+        let vectors = match vector {
+            Some(v) => vec![("default".to_string(), VectorLiteral::Dense(v))],
+            None => vec![],
+        };
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: collection.into(),
+            fields,
+            values,
+            vectors,
+            collocate_with: None,
+            affinity_group: None,
+            valid_from,
+            valid_to,
+        }))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_as_of_filters_entities() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "events", 3).await;
+
+        // Insert two entities with different valid times
+        insert_entity_with_temporal(
+            &exec, "events", "e1",
+            vec![("name", Literal::String("Past Event".into()))],
+            None,
+            Some("2024-01-01T00:00:00Z".into()),
+            Some("2024-07-01T00:00:00Z".into()),
+        ).await;
+
+        insert_entity_with_temporal(
+            &exec, "events", "e2",
+            vec![("name", Literal::String("Current Event".into()))],
+            None,
+            Some("2024-06-01T00:00:00Z".into()),
+            None, // still valid
+        ).await;
+
+        // Query AS OF 2024-08-01 -- only e2 should be visible
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: Some(trondb_tql::TemporalClause::AsOf("2024-08-01T00:00:00Z".into())),
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values.get("name"), Some(&Value::String("Current Event".into())));
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_valid_during() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "events", 3).await;
+
+        insert_entity_with_temporal(
+            &exec, "events", "e1",
+            vec![("name", Literal::String("H1 Event".into()))],
+            None,
+            Some("2024-01-01T00:00:00Z".into()),
+            Some("2024-07-01T00:00:00Z".into()),
+        ).await;
+
+        insert_entity_with_temporal(
+            &exec, "events", "e2",
+            vec![("name", Literal::String("H2 Event".into()))],
+            None,
+            Some("2024-07-01T00:00:00Z".into()),
+            Some("2025-01-01T00:00:00Z".into()),
+        ).await;
+
+        // Query VALID DURING 2024-03-01..2024-09-01 -- overlaps with both
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: Some(trondb_tql::TemporalClause::ValidDuring("2024-03-01".into(), "2024-09-01".into())),
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_as_of_transaction() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "events", 3).await;
+
+        // Insert two entities -- they'll get different tx_time values
+        insert_entity(&exec, "events", "e1",
+            vec![("name", Literal::String("Early".into()))], None).await;
+
+        insert_entity(&exec, "events", "e2",
+            vec![("name", Literal::String("Late".into()))], None).await;
+
+        // Get the tx_time of the first entity by fetching it
+        let all = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: Some(trondb_tql::WhereClause::Eq("id".into(), trondb_tql::Literal::String("e1".into()))),
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+
+        let tx_time = match all.rows[0].values.get("tx_time") {
+            Some(Value::Int(t)) => *t as u64,
+            _ => panic!("expected tx_time"),
+        };
+
+        // Query AS OF TRANSACTION tx_time -- only e1 should be visible
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: Some(trondb_tql::TemporalClause::AsOfTransaction(tx_time)),
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values.get("name"), Some(&Value::String("Early".into())));
+    }
+
+    // -----------------------------------------------------------------------
+    // TRAVERSE MATCH temporal tests (Task 9)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_traverse_match_temporal_filter() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "people", 3).await;
+
+        // Insert entities
+        insert_entity(&exec, "people", "p1",
+            vec![("name", Literal::String("Alice".into()))], None).await;
+        insert_entity(&exec, "people", "p2",
+            vec![("name", Literal::String("Bob".into()))], None).await;
+        insert_entity(&exec, "people", "p3",
+            vec![("name", Literal::String("Charlie".into()))], None).await;
+
+        // Create edge type
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "knows".into(),
+            from_collection: "people".into(),
+            to_collection: "people".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Insert edges with temporal validity
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "p1".into(),
+            to_id: "p2".into(),
+            metadata: vec![],
+            valid_from: Some("2024-01-01T00:00:00Z".into()),
+            valid_to: Some("2024-07-01T00:00:00Z".into()),
+        })).await.unwrap();
+
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "knows".into(),
+            from_id: "p1".into(),
+            to_id: "p3".into(),
+            metadata: vec![],
+            valid_from: Some("2024-06-01T00:00:00Z".into()),
+            valid_to: None, // still valid
+        })).await.unwrap();
+
+        // Traverse AS OF 2024-08-01 -- only p1->p3 edge should be visible
+        let result = exec.execute(&Plan::TraverseMatch(TraverseMatchPlan {
+            from_id: "p1".into(),
+            pattern: trondb_tql::MatchPattern {
+                source_var: "a".into(),
+                edge: trondb_tql::EdgePattern {
+                    variable: Some("e".into()),
+                    edge_type: Some("knows".into()),
+                    direction: trondb_tql::EdgeDirection::Forward,
+                },
+                target_var: "b".into(),
+            },
+            min_depth: 1,
+            max_depth: 1,
+            confidence_threshold: None,
+            temporal: Some(trondb_tql::TemporalClause::AsOf("2024-08-01T00:00:00Z".into())),
+            limit: None,
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end integration tests (Task 11)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn e2e_fetch_as_of() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "events", 3).await;
+
+        // Insert with temporal bounds
+        insert_entity_with_temporal(
+            &exec, "events", "past",
+            vec![("name", Literal::String("Past".into()))],
+            None,
+            Some("2020-01-01T00:00:00Z".into()),
+            Some("2021-01-01T00:00:00Z".into()),
+        ).await;
+
+        insert_entity_with_temporal(
+            &exec, "events", "current",
+            vec![("name", Literal::String("Current".into()))],
+            None,
+            Some("2024-01-01T00:00:00Z".into()),
+            None,
+        ).await;
+
+        insert_entity_with_temporal(
+            &exec, "events", "future",
+            vec![("name", Literal::String("Future".into()))],
+            None,
+            Some("2030-01-01T00:00:00Z".into()),
+            None,
+        ).await;
+
+        // AS OF 2024-06-01 -- only "Current" visible
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: Some(trondb_tql::TemporalClause::AsOf("2024-06-01T00:00:00Z".into())),
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values.get("name"), Some(&Value::String("Current".into())));
+
+        // No temporal -- all three visible
+        let result_all = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })).await.unwrap();
+        assert_eq!(result_all.rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn e2e_explain_temporal() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "events", 3).await;
+
+        let result = exec.execute(&Plan::Explain(Box::new(Plan::Fetch(FetchPlan {
+            collection: "events".into(),
+            fields: FieldList::All,
+            filter: None,
+            temporal: Some(trondb_tql::TemporalClause::ValidDuring("2024-01-01".into(), "2024-12-31".into())),
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        })))).await.unwrap();
+
+        // EXPLAIN output should show the temporal clause
+        let temporal_shown = result.rows.iter().any(|r| {
+            r.values.get("property") == Some(&Value::String("temporal".into()))
+        });
+        assert!(temporal_shown, "EXPLAIN should show temporal clause");
     }
 }
