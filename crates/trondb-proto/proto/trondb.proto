@@ -83,6 +83,11 @@ message FetchPlan {
     repeated string hints = 8;
 }
 
+message TwoPassConfigProto {
+    uint64 first_pass_k = 1;
+    bool use_binary_first_pass = 2;
+}
+
 message SearchPlan {
     string collection = 1;
     FieldListProto fields = 2;
@@ -98,6 +103,7 @@ message SearchPlan {
     optional string query_text = 12;
     optional string using_repr = 13;
     repeated string hints = 14;
+    optional TwoPassConfigProto two_pass = 15;
 }
 
 message ExplainPlan {
@@ -432,11 +438,32 @@ message ValueMessage {
     }
 }
 
+message AcuLineItemProto {
+    string operation = 1;
+    uint64 count = 2;
+    double unit_cost = 3;
+    double total = 4;
+}
+
+message AcuEstimateProto {
+    repeated AcuLineItemProto items = 1;
+    double total_acu = 2;
+}
+
+message PlanWarningProto {
+    string severity = 1;     // "INFO", "WARN", "CRIT"
+    string message = 2;
+    string suggestion = 3;   // empty if none
+    double acu_impact = 4;   // 0 if none
+}
+
 message QueryStatsMessage {
     uint64 elapsed_nanos = 1;
     uint64 entities_scanned = 2;
     QueryModeProto mode = 3;
     string tier = 4;
+    optional AcuEstimateProto cost = 10;
+    repeated PlanWarningProto warnings = 11;
 }
 
 enum QueryModeProto {

@@ -442,6 +442,20 @@ fn proto_to_edge_direction(val: i32) -> trondb_tql::EdgeDirection {
     }
 }
 
+fn two_pass_config_to_proto(tp: &TwoPassConfig) -> pb::TwoPassConfigProto {
+    pb::TwoPassConfigProto {
+        first_pass_k: tp.first_pass_k as u64,
+        use_binary_first_pass: tp.use_binary_first_pass,
+    }
+}
+
+fn proto_to_two_pass_config(proto: &pb::TwoPassConfigProto) -> TwoPassConfig {
+    TwoPassConfig {
+        first_pass_k: proto.first_pass_k as usize,
+        use_binary_first_pass: proto.use_binary_first_pass,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plan -> Proto
 // ---------------------------------------------------------------------------
@@ -517,6 +531,7 @@ impl From<&Plan> for pb::PlanRequest {
                     query_text: sp.query_text.clone(),
                     using_repr: sp.using_repr.clone(),
                     hints: sp.hints.iter().map(hint_to_proto).collect(),
+                    two_pass: sp.two_pass.as_ref().map(two_pass_config_to_proto),
                 }),
 
                 Plan::Explain(inner) => PP::Explain(Box::new(pb::ExplainPlan {
@@ -809,6 +824,7 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     query_text: sp.query_text,
                     using_repr: sp.using_repr,
                     hints: sp.hints.iter().filter_map(|s| proto_to_hint(s)).collect(),
+                    two_pass: sp.two_pass.as_ref().map(proto_to_two_pass_config),
                 }))
             }
 
@@ -1064,6 +1080,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1370,6 +1387,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1680,6 +1698,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![QueryHint::NoPrefilter, QueryHint::Timeout(5000)],
+            two_pass: None,
         });
         let restored = round_trip(plan);
         match restored {
@@ -1786,6 +1805,37 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_search_with_two_pass() {
+        let plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 100,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+            two_pass: Some(TwoPassConfig {
+                first_pass_k: 300,
+                use_binary_first_pass: true,
+            }),
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Search(sp) => {
+                let tp = sp.two_pass.expect("two_pass should be present");
+                assert_eq!(tp.first_pass_k, 300);
+                assert!(tp.use_binary_first_pass);
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
     fn round_trip_traverse_match_forward() {
         use trondb_tql::{EdgeDirection, EdgePattern, MatchPattern};
 
@@ -1888,6 +1938,32 @@ mod tests {
                 assert_eq!(tp.limit, Some(10));
             }
             _ => panic!("expected TraverseMatch"),
+        }
+    }
+
+    #[test]
+    fn round_trip_search_without_two_pass() {
+        let plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 5,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+            two_pass: None,
+        });
+        let restored = round_trip(plan);
+        match restored {
+            Plan::Search(sp) => {
+                assert!(sp.two_pass.is_none());
+            }
+            _ => panic!("expected Search"),
         }
     }
 }

@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 12: Query Language Completions.
+Inference-first storage engine. Phase 13: Planner & Cost Model.
 
 ## Project Structure
 
@@ -164,7 +164,7 @@ Inference-first storage engine. Phase 12: Query Language Completions.
     - NO_PROMOTE: skip warm→hot promotion on access
     - NO_PREFILTER: skip scalar pre-filter on SEARCH WHERE
     - FORCE_FULL_SCAN: bypass field index lookup
-    - MAX_ACU(n): ACU budget (future use, Phase 13)
+    - MAX_ACU(n): ACU budget (enforced, Phase 13)
     - TIMEOUT(ms): query timeout (future use)
     - Hints shown in EXPLAIN output
   - JOINs: structural and probabilistic joins across edge-linked collections
@@ -189,3 +189,19 @@ Inference-first storage engine. Phase 12: Query Language Completions.
     - New AST types: TraverseMatchStmt, MatchPattern, EdgePattern, EdgeDirection
     - New Plan type: Plan::TraverseMatch(TraverseMatchPlan)
     - New tokens: Match, Arrow (->), DotDot (..), Dash (-)
+- Planner & Cost Model (Phase 13)
+  - ACU (Abstract Cost Unit): base calibration 1 hot-tier FETCH = 1.0 ACU
+  - CostProvider trait: per-operation ACU costs (fetch_hot, fetch_warm, search_hnsw, etc.)
+  - ConstantCostProvider: hardcoded defaults, ships as sole implementation
+  - AcuEstimate: itemised cost breakdown attached to every query result
+  - PlanWarning: severity (Info/Warning/Critical), message, suggestion, ACU impact
+  - MAX_ACU query hint enforced: estimated cost > budget → AcuBudgetExceeded error
+  - EXPLAIN shows: estimated_acu, cost_breakdown, rules_applied, warnings
+  - Five optimisation rules (all enabled by default, individually disableable):
+    - ScalarPreFilter: ACU integration, warns on unindexed SEARCH WHERE
+    - ConfidencePushdown: advisory for high-confidence early termination
+    - TraverseHopReorder: warns on deep TRAVERSE, future edge reordering
+    - OnDemandPromotion: respects NO_PROMOTE hint, warns on suppressed promotion
+    - BatchedFetchAfterSearch: warns on large result sets (k > 50)
+  - Two-pass query strategy: selected for k >= 50, first pass over-fetches 3x, structural infrastructure for future Int8/Binary first pass
+  - OptimiserConfig: per-rule enable/disable

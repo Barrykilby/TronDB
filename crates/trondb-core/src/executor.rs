@@ -12,6 +12,7 @@ use crate::inference::{InferenceAuditBuffer, InferenceAuditEntry, InferenceCandi
 use crate::location::{
     Encoding, LocState, LocationDescriptor, LocationTable, NodeAddress, ReprKey, Tier,
 };
+use crate::cost::{ConstantCostProvider, CostProvider};
 use crate::planner::{FetchStrategy, Plan, SearchStrategy};
 use crate::result::{QueryMode, QueryResult, QueryStats, Row};
 use crate::sparse_index::SparseIndex;
@@ -45,6 +46,8 @@ pub struct Executor {
     inference_audit: Arc<InferenceAuditBuffer>,
     /// RAM-only work queue of entity IDs pending background inference
     inference_queue: Arc<DashSet<LogicalId>>,
+    /// Cost provider for ACU estimation
+    cost_provider: Arc<dyn CostProvider>,
 }
 
 impl Executor {
@@ -69,6 +72,7 @@ impl Executor {
             entity_collections: DashMap::new(),
             inference_audit,
             inference_queue: Arc::new(DashSet::new()),
+            cost_provider: Arc::new(ConstantCostProvider),
         }
     }
 
@@ -259,8 +263,53 @@ impl Executor {
         Ok((replayed, unhandled))
     }
 
+    /// Approximate collection size for cost estimation.
+    /// Fast path: check HNSW index len (hot tier, O(1)).
+    /// Slow path: Fjall scan count.
+    fn collection_size(&self, collection: &str) -> usize {
+        let prefix = format!("{collection}:");
+        for entry in self.indexes.iter() {
+            if entry.key().starts_with(&prefix) {
+                return entry.value().len();
+            }
+        }
+        self.store.scan(collection).map(|v| v.len()).unwrap_or(0)
+    }
+
     pub async fn execute(&self, plan: &Plan) -> Result<QueryResult, EngineError> {
         let start = Instant::now();
+
+        // Cost estimation + budget check (skip for EXPLAIN -- it reports cost, doesn't enforce)
+        let cost_estimate = match plan {
+            Plan::Explain(_) => None,
+            _ => {
+                let collection_name = plan_collection_name(plan);
+                let size = collection_name
+                    .map(|c| self.collection_size(c))
+                    .unwrap_or(0);
+                let est = crate::planner::estimate_plan_cost(plan, self.cost_provider.as_ref(), size);
+                crate::planner::check_acu_budget(plan, &est)?;
+                Some(est)
+            }
+        };
+
+        // Run optimisation rules (warnings are collected but don't modify the plan in Phase 13)
+        let opt_warnings = match plan {
+            Plan::Explain(_) => vec![], // EXPLAIN handles its own
+            _ => {
+                let collection_name = plan_collection_name(plan);
+                let size = collection_name
+                    .map(|c| self.collection_size(c))
+                    .unwrap_or(0);
+                let optimised = crate::optimise::apply_rules(
+                    plan.clone(),
+                    &crate::optimise::OptimiserConfig::default(),
+                    self.cost_provider.as_ref(),
+                    size,
+                );
+                optimised.warnings
+            }
+        };
 
         match plan {
             Plan::CreateCollection(p) => {
@@ -359,6 +408,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -627,6 +678,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -669,6 +722,8 @@ impl Executor {
                                 entities_scanned: entity_ids.len(),
                                 mode: QueryMode::Deterministic,
                                 tier: "FieldIndex".into(),
+                                cost: cost_estimate.clone(),
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -714,6 +769,8 @@ impl Executor {
                                 entities_scanned: entity_ids.len(),
                                 mode: QueryMode::Deterministic,
                                 tier: "FieldIndex".into(),
+                                cost: cost_estimate.clone(),
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -750,6 +807,8 @@ impl Executor {
                                 entities_scanned: scanned,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
+                                cost: cost_estimate.clone(),
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -800,7 +859,17 @@ impl Executor {
                             ))?;
                         let hnsw = self.indexes.get(&hnsw_key).unwrap();
                         let query_f32: Vec<f32> = query.iter().map(|x| *x as f32).collect();
-                        let mut raw = hnsw.search(&query_f32, fetch_k);
+                        let mut raw = if let Some(ref tp) = p.two_pass {
+                            // Two-pass: over-fetch in first pass, then rescore.
+                            // Phase 13: both passes use the same HNSW index.
+                            // Future: first pass uses Int8/Binary index, second pass rescores.
+                            let first_pass = hnsw.search(&query_f32, tp.first_pass_k);
+                            let mut rescored = first_pass;
+                            rescored.truncate(p.k);
+                            rescored
+                        } else {
+                            hnsw.search(&query_f32, fetch_k)
+                        };
                         // Confidence threshold only for HNSW (cosine similarity is meaningful)
                         if p.confidence_threshold > 0.0 {
                             raw.retain(|(_, score)| (*score as f64) >= p.confidence_threshold);
@@ -903,7 +972,14 @@ impl Executor {
                                 "no HNSW index for {}", hnsw_key
                             )))?;
 
-                        let mut raw = hnsw.search(&query_f32, fetch_k);
+                        let mut raw = if let Some(ref tp) = p.two_pass {
+                            let first_pass = hnsw.search(&query_f32, tp.first_pass_k);
+                            let mut rescored = first_pass;
+                            rescored.truncate(p.k);
+                            rescored
+                        } else {
+                            hnsw.search(&query_f32, fetch_k)
+                        };
                         if p.confidence_threshold > 0.0 {
                             raw.retain(|(_, score)| (*score as f64) >= p.confidence_threshold);
                         }
@@ -981,12 +1057,75 @@ impl Executor {
                         entities_scanned: final_results.len(),
                         mode: QueryMode::Probabilistic,
                         tier: "Ram".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
 
             Plan::Explain(inner) => {
-                let rows = explain_plan(inner);
+                let collection_name = plan_collection_name(inner);
+                let size = collection_name
+                    .map(|c| self.collection_size(c))
+                    .unwrap_or(0);
+                let est = crate::planner::estimate_plan_cost(inner, self.cost_provider.as_ref(), size);
+
+                let mut rows = explain_plan(inner);
+
+                // Add cost breakdown rows
+                rows.push(Row {
+                    values: HashMap::from([
+                        ("property".into(), Value::String("estimated_acu".into())),
+                        ("value".into(), Value::String(format!("{:.1}", est.total_acu))),
+                    ]),
+                    score: None,
+                });
+                let breakdown_str = est.items.iter()
+                    .map(|item| format!("{}x {} @ {:.1} = {:.1}", item.count, item.operation, item.unit_cost, item.total))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                rows.push(Row {
+                    values: HashMap::from([
+                        ("property".into(), Value::String("cost_breakdown".into())),
+                        ("value".into(), Value::String(breakdown_str)),
+                    ]),
+                    score: None,
+                });
+
+                // Run optimisation rules
+                let optimised = crate::optimise::apply_rules(
+                    (**inner).clone(),
+                    &crate::optimise::OptimiserConfig::default(),
+                    self.cost_provider.as_ref(),
+                    size,
+                );
+
+                // Add rules_applied row
+                if !optimised.rules_applied.is_empty() {
+                    rows.push(Row {
+                        values: HashMap::from([
+                            ("property".into(), Value::String("rules_applied".into())),
+                            ("value".into(), Value::String(optimised.rules_applied.join(", "))),
+                        ]),
+                        score: None,
+                    });
+                }
+
+                // Add warnings rows
+                if !optimised.warnings.is_empty() {
+                    let warnings_str = optimised.warnings.iter()
+                        .map(|w| format!("{}", w))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    rows.push(Row {
+                        values: HashMap::from([
+                            ("property".into(), Value::String("warnings".into())),
+                            ("value".into(), Value::String(warnings_str)),
+                        ]),
+                        score: None,
+                    });
+                }
+
                 Ok(QueryResult {
                     columns: vec!["property".into(), "value".into()],
                     rows,
@@ -995,6 +1134,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: Some(est),
+                        warnings: vec![],
                     },
                 })
             }
@@ -1061,6 +1202,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1128,6 +1271,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1178,6 +1323,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1262,6 +1409,8 @@ impl Executor {
                         entities_scanned: scanned,
                         mode: QueryMode::Deterministic,
                         tier: "Ram".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1282,6 +1431,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Routing".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1300,6 +1451,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Routing".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1395,6 +1548,8 @@ impl Executor {
                         entities_scanned: 1,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1424,6 +1579,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1496,6 +1653,8 @@ impl Executor {
                             entities_scanned: 0,
                             mode: QueryMode::Probabilistic,
                             tier: "Ram".into(),
+                            cost: cost_estimate.clone(),
+                            warnings: opt_warnings.clone(),
                         },
                     });
                 }
@@ -1608,6 +1767,8 @@ impl Executor {
                         entities_scanned: all_candidates.len(),
                         mode: QueryMode::Probabilistic,
                         tier: "Ram".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1682,6 +1843,8 @@ impl Executor {
                                 entities_scanned: 0,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
+                                cost: cost_estimate.clone(),
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -1731,6 +1894,8 @@ impl Executor {
                                 entities_scanned: 0,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
+                                cost: cost_estimate.clone(),
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -1786,6 +1951,8 @@ impl Executor {
                                 entities_scanned: 0,
                                 mode: QueryMode::Deterministic,
                                 tier: "Fjall".into(),
+                                cost: cost_estimate.clone(),
+                                warnings: opt_warnings.clone(),
                             },
                         })
                     }
@@ -1818,6 +1985,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Ram".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1876,6 +2045,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -1917,6 +2088,8 @@ impl Executor {
                         entities_scanned: 0,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -2038,6 +2211,8 @@ impl Executor {
                         entities_scanned: 1,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -2245,6 +2420,8 @@ impl Executor {
                         entities_scanned: scanned,
                         mode: QueryMode::Deterministic,
                         tier: "Fjall".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -2416,6 +2593,8 @@ impl Executor {
                         entities_scanned: scanned,
                         mode: QueryMode::Deterministic,
                         tier: "Ram".into(),
+                        cost: cost_estimate.clone(),
+                        warnings: opt_warnings.clone(),
                     },
                 })
             }
@@ -3298,6 +3477,22 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     }
 }
 
+/// Extract the primary collection name from a plan (for cost estimation).
+fn plan_collection_name(plan: &Plan) -> Option<&str> {
+    match plan {
+        Plan::Fetch(p) => Some(&p.collection),
+        Plan::Search(p) => Some(&p.collection),
+        Plan::Insert(p) => Some(&p.collection),
+        Plan::DeleteEntity(p) => Some(&p.collection),
+        Plan::UpdateEntity(p) => Some(&p.collection),
+        Plan::Demote(p) => Some(&p.collection),
+        Plan::Promote(p) => Some(&p.collection),
+        Plan::ExplainTiers(p) => Some(&p.collection),
+        Plan::Join(p) => Some(&p.from_collection),
+        _ => None,
+    }
+}
+
 fn explain_plan(plan: &Plan) -> Vec<Row> {
     let mut props: Vec<(&str, String)> = Vec::new();
 
@@ -3357,6 +3552,9 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
             props.push(("confidence_threshold", p.confidence_threshold.to_string()));
             if let Some(pf) = &p.pre_filter {
                 props.push(("pre_filter", format!("ScalarPreFilter ({})", pf.index_name)));
+            }
+            if let Some(ref tp) = p.two_pass {
+                props.push(("two_pass", format!("first_pass_k={}, binary={}", tp.first_pass_k, tp.use_binary_first_pass)));
             }
             if !p.hints.is_empty() {
                 let hints_str = p.hints.iter()
@@ -4489,6 +4687,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 2);
@@ -4567,6 +4766,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         })).await.unwrap();
 
         // Both entities should appear, d1 should rank higher (matches both dense and sparse)
@@ -4647,6 +4847,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         })).await.unwrap();
 
         // Only London entities should be returned
@@ -4673,6 +4874,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = exec
@@ -4752,6 +4954,7 @@ mod tests {
             query_text: None,
             using_repr: None,
             hints: vec![],
+            two_pass: None,
         });
 
         let result = exec
@@ -5348,6 +5551,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5376,6 +5580,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5550,6 +5755,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5578,6 +5784,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5612,6 +5819,7 @@ mod tests {
                 query_text: None,
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5734,6 +5942,7 @@ mod tests {
                 query_text: Some("jazz".into()),
                 using_repr: Some("semantic".into()),
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5761,6 +5970,7 @@ mod tests {
                 query_text: Some("rock".into()),
                 using_repr: Some("semantic".into()),
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -5834,6 +6044,7 @@ mod tests {
                 query_text: Some("jazz".into()),
                 using_repr: None,
                 hints: vec![],
+                two_pass: None,
             }))
             .await
             .unwrap();
@@ -8930,5 +9141,253 @@ mod tests {
         // IDs should be present
         assert!(row.values.contains_key("i.id"));
         assert!(row.values.contains_key("c.id"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4 tests: Executor cost threading + EXPLAIN enhancement
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn explain_shows_cost_breakdown() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert a few entities so we have a non-zero collection size
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("The Fleece".into()))], Some(vec![1.0, 0.0, 0.0])).await;
+        insert_entity(&exec, "venues", "v2", vec![("name", Literal::String("The Exchange".into()))], Some(vec![0.0, 1.0, 0.0])).await;
+
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+            two_pass: None,
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(search_plan)))
+            .await
+            .unwrap();
+
+        // Should have cost-related rows in the EXPLAIN output
+        let has_cost_row = result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("estimated_acu".to_string())
+        });
+        assert!(has_cost_row, "EXPLAIN should include estimated_acu");
+
+        let has_breakdown = result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("cost_breakdown".to_string())
+        });
+        assert!(has_breakdown, "EXPLAIN should include cost_breakdown");
+    }
+
+    #[tokio::test]
+    async fn max_acu_rejects_expensive_query() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert enough entities that a full scan is expensive
+        for i in 0..50 {
+            insert_entity(
+                &exec,
+                "venues",
+                &format!("v{i}"),
+                vec![("name", Literal::String(format!("Venue {i}")))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![trondb_tql::QueryHint::MaxAcu(5.0)], // budget of 5 ACU, but scan will cost 50*0.5=25 ACU
+        });
+        let result = exec.execute(&plan).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::AcuBudgetExceeded { .. } => {}
+            other => panic!("expected AcuBudgetExceeded, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_result_includes_cost() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("The Fleece".into()))], Some(vec![1.0, 0.0, 0.0])).await;
+
+        let plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        });
+        let result = exec.execute(&plan).await.unwrap();
+        assert!(result.stats.cost.is_some(), "QueryStats should include cost estimate");
+        let cost = result.stats.cost.unwrap();
+        assert!(cost.total_acu > 0.0, "Cost should be non-zero for a scan");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 7 tests: Optimisation rules integrated into executor + EXPLAIN
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn explain_shows_optimisation_rules() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("The Fleece".into()))], Some(vec![1.0, 0.0, 0.0])).await;
+
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+            two_pass: None,
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(search_plan)))
+            .await
+            .unwrap();
+
+        // Should have rules_applied row
+        let has_rules = result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("rules_applied".to_string())
+        });
+        assert!(has_rules, "EXPLAIN should show applied optimisation rules");
+    }
+
+    #[tokio::test]
+    async fn warnings_propagated_to_result() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert enough entities so deep TRAVERSE would trigger a warning
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("The Fleece".into()))], Some(vec![1.0, 0.0, 0.0])).await;
+
+        let plan = Plan::Traverse(TraversePlan {
+            edge_type: "similar_to".into(),
+            from_id: "v1".into(),
+            depth: 8,
+            limit: None,
+        });
+
+        // Execute directly -- the edge type won't exist so it will error,
+        // but we can test the optimisation rules by going through EXPLAIN
+        let explain_result = exec
+            .execute(&Plan::Explain(Box::new(plan)))
+            .await
+            .unwrap();
+
+        // Check warnings are in the EXPLAIN output
+        let has_warnings = explain_result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("warnings".to_string())
+        });
+        assert!(has_warnings, "EXPLAIN should show warnings for deep TRAVERSE");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 9 tests: End-to-end integration test for the cost model
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn end_to_end_cost_model_flow() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+
+        // Insert entities
+        for i in 0..20 {
+            insert_entity(
+                &exec,
+                "venues",
+                &format!("v{i}"),
+                vec![("name", Literal::String(format!("Venue {i}")))],
+                Some(vec![1.0, 0.0, 0.0]),
+            )
+            .await;
+        }
+
+        // 1. FETCH with full scan -- should have cost
+        let fetch_plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![],
+        });
+        let result = exec.execute(&fetch_plan).await.unwrap();
+        assert!(result.stats.cost.is_some());
+        let cost = result.stats.cost.as_ref().unwrap();
+        assert!(cost.total_acu > 0.0);
+
+        // 2. SEARCH -- should have cost
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 5,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: None,
+            hints: vec![],
+            two_pass: None,
+        });
+        let result = exec.execute(&search_plan).await.unwrap();
+        assert!(result.stats.cost.is_some());
+
+        // 3. EXPLAIN shows cost breakdown
+        let explain_result = exec
+            .execute(&Plan::Explain(Box::new(search_plan.clone())))
+            .await
+            .unwrap();
+        let has_acu = explain_result.rows.iter().any(|r| {
+            r.values.get("property").map(|v| v.to_string()) == Some("estimated_acu".into())
+        });
+        assert!(has_acu);
+
+        // 4. MAX_ACU enforcement
+        let budget_plan = Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: None,
+            order_by: vec![],
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+            hints: vec![trondb_tql::QueryHint::MaxAcu(1.0)], // 1 ACU budget vs 20 * 0.5 = 10 ACU
+        });
+        let result = exec.execute(&budget_plan).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), EngineError::AcuBudgetExceeded { .. }));
     }
 }
