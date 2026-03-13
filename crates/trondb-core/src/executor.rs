@@ -2470,12 +2470,86 @@ fn entity_matches(entity: &Entity, clause: &WhereClause) -> bool {
         }
         WhereClause::And(a, b) => entity_matches(entity, a) && entity_matches(entity, b),
         WhereClause::Or(a, b) => entity_matches(entity, a) || entity_matches(entity, b),
-        WhereClause::Neq(_, _) => false, // TODO: Task 3
-        WhereClause::Not(_) => false, // TODO: Task 3
-        WhereClause::IsNull(_) => false, // TODO: Task 3
-        WhereClause::IsNotNull(_) => false, // TODO: Task 3
-        WhereClause::In(_, _) => false, // TODO: Task 3
-        WhereClause::Like(_, _) => false, // TODO: Task 3
+        WhereClause::Neq(field, lit) => {
+            let expected = literal_to_value(lit);
+            if field == "id" {
+                return Value::String(entity.id.to_string()) != expected;
+            }
+            entity
+                .metadata
+                .get(field)
+                .map(|v| *v != expected)
+                .unwrap_or(true) // missing field != value is true
+        }
+        WhereClause::Not(inner) => !entity_matches(entity, inner),
+        WhereClause::IsNull(field) => {
+            if field == "id" {
+                return false; // id is never null
+            }
+            !entity.metadata.contains_key(field)
+                || entity.metadata.get(field) == Some(&Value::Null)
+        }
+        WhereClause::IsNotNull(field) => {
+            if field == "id" {
+                return true;
+            }
+            entity
+                .metadata
+                .get(field)
+                .map(|v| *v != Value::Null)
+                .unwrap_or(false)
+        }
+        WhereClause::In(field, values) => {
+            let entity_val = if field == "id" {
+                Value::String(entity.id.to_string())
+            } else {
+                match entity.metadata.get(field) {
+                    Some(v) => v.clone(),
+                    None => return false,
+                }
+            };
+            values.iter().any(|lit| literal_to_value(lit) == entity_val)
+        }
+        WhereClause::Like(field, pattern) => {
+            let val = if field == "id" {
+                entity.id.to_string()
+            } else {
+                match entity.metadata.get(field) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => return false,
+                }
+            };
+            like_match(&val, pattern)
+        }
+    }
+}
+
+/// SQL LIKE pattern matching. `%` = any sequence, `_` = any single character.
+fn like_match(value: &str, pattern: &str) -> bool {
+    let v: Vec<char> = value.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    like_match_recursive(&v, 0, &p, 0)
+}
+
+fn like_match_recursive(value: &[char], vi: usize, pattern: &[char], pi: usize) -> bool {
+    if pi == pattern.len() {
+        return vi == value.len();
+    }
+    match pattern[pi] {
+        '%' => {
+            for i in vi..=value.len() {
+                if like_match_recursive(value, i, pattern, pi + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        '_' => vi < value.len() && like_match_recursive(value, vi + 1, pattern, pi + 1),
+        c => {
+            vi < value.len()
+                && value[vi] == c
+                && like_match_recursive(value, vi + 1, pattern, pi + 1)
+        }
     }
 }
 
@@ -6243,5 +6317,118 @@ mod tests {
         // Edges should still be there
         let edges_after = exec.adjacency().get(&LogicalId::from_string("artist1"), "performs_at");
         assert_eq!(edges_before.len(), edges_after.len(), "edges should remain unchanged");
+    }
+
+    #[tokio::test]
+    async fn fetch_where_neq() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("status", Literal::String("active".into()))], None).await;
+        insert_entity(&exec, "venues", "v2", vec![("status", Literal::String("archived".into()))], None).await;
+        insert_entity(&exec, "venues", "v3", vec![("status", Literal::String("active".into()))], None).await;
+
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Neq("status".into(), Literal::String("archived".into()))),
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_where_is_null() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("Blue Note".into()))], None).await;
+        insert_entity(&exec, "venues", "v2", vec![], None).await;
+
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::IsNull("name".into())),
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values.get("id").unwrap(), &Value::String("v2".into()));
+    }
+
+    #[tokio::test]
+    async fn fetch_where_is_not_null() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("Blue Note".into()))], None).await;
+        insert_entity(&exec, "venues", "v2", vec![], None).await;
+
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::IsNotNull("name".into())),
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values.get("id").unwrap(), &Value::String("v1".into()));
+    }
+
+    #[tokio::test]
+    async fn fetch_where_in() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("category", Literal::String("music".into()))], None).await;
+        insert_entity(&exec, "venues", "v2", vec![("category", Literal::String("theatre".into()))], None).await;
+        insert_entity(&exec, "venues", "v3", vec![("category", Literal::String("food".into()))], None).await;
+
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::In("category".into(), vec![
+                Literal::String("music".into()),
+                Literal::String("theatre".into()),
+            ])),
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_where_like() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("name", Literal::String("Jazz Cafe".into()))], None).await;
+        insert_entity(&exec, "venues", "v2", vec![("name", Literal::String("Jazz Club Bristol".into()))], None).await;
+        insert_entity(&exec, "venues", "v3", vec![("name", Literal::String("Rock Bar".into()))], None).await;
+
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Like("name".into(), "Jazz%".into())),
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_where_not() {
+        let (exec, _dir) = setup_executor().await;
+        create_collection(&exec, "venues", 3).await;
+        insert_entity(&exec, "venues", "v1", vec![("active", Literal::Bool(true))], None).await;
+        insert_entity(&exec, "venues", "v2", vec![("active", Literal::Bool(false))], None).await;
+
+        let result = exec.execute(&Plan::Fetch(FetchPlan {
+            collection: "venues".into(),
+            fields: FieldList::All,
+            filter: Some(WhereClause::Not(Box::new(
+                WhereClause::Eq("active".into(), Literal::Bool(true))
+            ))),
+            limit: None,
+            strategy: FetchStrategy::FullScan,
+        })).await.unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values.get("id").unwrap(), &Value::String("v2".into()));
     }
 }
