@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 13: Planner & Cost Model.
+Inference-first storage engine. Phase 14: Bi-Temporal Model.
 
 ## Project Structure
 
@@ -205,3 +205,19 @@ Inference-first storage engine. Phase 13: Planner & Cost Model.
     - BatchedFetchAfterSearch: warns on large result sets (k > 50)
   - Two-pass query strategy: selected for k >= 50, first pass over-fetches 3x, structural infrastructure for future Int8/Binary first pass
   - OptimiserConfig: per-rule enable/disable
+- Bi-Temporal Model (Phase 14)
+  - Three time axes: Valid Time (when fact was true), Transaction Time (when TronDB learned it), Vector Time (when embedding was computed)
+  - Entity: valid_from/valid_to (application-controlled, Option<i64> millis), tx_time (WAL tx_id, engine-controlled)
+  - Representation: computed_at (u64 millis), model_version (String)
+  - Edge: valid_from/valid_to (application-controlled, Option<i64> millis)
+  - Query modifiers: AS OF 'timestamp', VALID DURING 'start'..'end', AS OF TRANSACTION lsn
+  - INSERT temporal: VALID FROM 'timestamp' [TO 'timestamp']
+  - INSERT EDGE temporal: VALID FROM 'timestamp' [TO 'timestamp']
+  - Temporal filtering on FETCH (all strategies: FullScan, FieldIndexLookup, FieldIndexRange)
+  - Temporal filtering on TRAVERSE MATCH (edge valid_from/valid_to)
+  - Temporal fields in EXPLAIN output
+  - Backward compatible: #[serde(default)] on all new fields
+  - New tokens: Of, Transaction, Valid, During
+  - AST: TemporalClause enum (AsOf, ValidDuring, AsOfTransaction)
+  - Proto: TemporalClauseProto, ValidDuringProto messages
+  - Timestamp parsing: ISO 8601 (YYYY-MM-DDTHH:MM:SSZ), date-only (YYYY-MM-DD), millis-as-string
