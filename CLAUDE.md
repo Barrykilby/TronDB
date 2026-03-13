@@ -1,6 +1,6 @@
 # TronDB
 
-Inference-first storage engine. Phase 11: Inference Pipeline.
+Inference-first storage engine. Phase 12: Query Language Completions.
 
 ## Project Structure
 
@@ -150,3 +150,20 @@ Inference-first storage engine. Phase 11: Inference Pipeline.
   - InferenceConfig on EdgeType: auto, confidence_floor, limit with #[serde(default)]
   - WAL record types: EdgeInferred (0x31), EdgeConfidenceUpdate (0x32), EdgeConfirm (0x33), EdgeDelete (0x34)
   - Proto/gRPC: InferPlanProto, ConfirmEdgePlanProto, ExplainHistoryPlanProto messages
+- Query Language Completions (Phase 12)
+  - Advanced WHERE: NOT, IS NULL, IS NOT NULL, IN (list), LIKE (pattern), != (not equal)
+  - LIKE uses SQL semantics: % = any sequence, _ = any single character
+  - WHERE evaluation: all operators in entity_matches() with recursive descent
+  - ORDER BY: multi-field sort with ASC/DESC, NULL-last semantics
+    - Syntax: FETCH ... ORDER BY field [ASC|DESC], ... [LIMIT n]
+    - Applied after filtering, before LIMIT truncation
+  - DROP COLLECTION: cascading cleanup (HNSW, sparse, field indexes, location table, Fjall, schema)
+  - DROP EDGE TYPE: cascading cleanup (adjacency index, Fjall edge partition, edge type metadata)
+  - WAL record types: SchemaDropColl (0x52), SchemaDropEdgeType (0x53)
+  - Query hints: /*+ HINT */ syntax, advisory to planner
+    - NO_PROMOTE: skip warm→hot promotion on access
+    - NO_PREFILTER: skip scalar pre-filter on SEARCH WHERE
+    - FORCE_FULL_SCAN: bypass field index lookup
+    - MAX_ACU(n): ACU budget (future use, Phase 13)
+    - TIMEOUT(ms): query timeout (future use)
+    - Hints shown in EXPLAIN output

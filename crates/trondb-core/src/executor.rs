@@ -6950,4 +6950,173 @@ mod tests {
             .await;
         assert!(err.is_err());
     }
+
+    #[tokio::test]
+    async fn end_to_end_phase_12_query_language() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with indexed field
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "events".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "default".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+                trondb_tql::FieldDecl { name: "category".into(), field_type: trondb_tql::FieldType::Text },
+                trondb_tql::FieldDecl { name: "score".into(), field_type: trondb_tql::FieldType::Int },
+            ],
+            indexes: vec![trondb_tql::IndexDecl {
+                name: "idx_category".into(),
+                fields: vec!["category".into()],
+                partial_condition: None,
+            }],
+            vectoriser_config: None,
+        }))
+        .await
+        .unwrap();
+
+        // Insert test data
+        insert_entity(
+            &exec,
+            "events",
+            "e1",
+            vec![
+                ("name", Literal::String("Jazz Night".into())),
+                ("category", Literal::String("music".into())),
+                ("score", Literal::Int(90)),
+            ],
+            None,
+        )
+        .await;
+        insert_entity(
+            &exec,
+            "events",
+            "e2",
+            vec![
+                ("name", Literal::String("Comedy Hour".into())),
+                ("category", Literal::String("comedy".into())),
+                ("score", Literal::Int(75)),
+            ],
+            None,
+        )
+        .await;
+        insert_entity(
+            &exec,
+            "events",
+            "e3",
+            vec![
+                ("name", Literal::String("Jazz Festival".into())),
+                ("category", Literal::String("music".into())),
+                ("score", Literal::Int(95)),
+            ],
+            None,
+        )
+        .await;
+        insert_entity(
+            &exec,
+            "events",
+            "e4",
+            vec![
+                ("name", Literal::String("Rock Concert".into())),
+                ("category", Literal::String("music".into())),
+                ("score", Literal::Int(80)),
+            ],
+            None,
+        )
+        .await;
+
+        // Test 1: IN operator — all 4 entities match music or comedy
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "events".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::In(
+                    "category".into(),
+                    vec![
+                        Literal::String("music".into()),
+                        Literal::String("comedy".into()),
+                    ],
+                )),
+                order_by: vec![],
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+                hints: vec![],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 4);
+
+        // Test 2: LIKE + ORDER BY DESC + LIMIT
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "events".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::Like("name".into(), "Jazz%".into())),
+                order_by: vec![trondb_tql::OrderByClause {
+                    field: "score".into(),
+                    direction: trondb_tql::SortDirection::Desc,
+                }],
+                limit: Some(1),
+                strategy: FetchStrategy::FullScan,
+                hints: vec![],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].values.get("name").unwrap(),
+            &Value::String("Jazz Festival".into())
+        );
+
+        // Test 3: NOT + != combined — exclude comedy AND names starting with Rock
+        let result = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "events".into(),
+                fields: FieldList::All,
+                filter: Some(WhereClause::And(
+                    Box::new(WhereClause::Neq(
+                        "category".into(),
+                        Literal::String("comedy".into()),
+                    )),
+                    Box::new(WhereClause::Not(Box::new(WhereClause::Like(
+                        "name".into(),
+                        "Rock%".into(),
+                    )))),
+                )),
+                order_by: vec![],
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+                hints: vec![],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 2); // Jazz Night + Jazz Festival
+
+        // Test 4: DROP COLLECTION
+        exec.execute(&Plan::DropCollection(DropCollectionPlan {
+            name: "events".into(),
+        }))
+        .await
+        .unwrap();
+
+        // Verify collection is gone — FETCH should error
+        let err = exec
+            .execute(&Plan::Fetch(FetchPlan {
+                collection: "events".into(),
+                fields: FieldList::All,
+                filter: None,
+                order_by: vec![],
+                limit: None,
+                strategy: FetchStrategy::FullScan,
+                hints: vec![],
+            }))
+            .await;
+        assert!(err.is_err());
+    }
 }
