@@ -972,7 +972,7 @@ impl Executor {
                 }
 
                 // Step 1: Pre-filter — resolve candidate IDs from FieldIndex if present
-                let pre_filter_ids: Option<HashSet<LogicalId>> = if let Some(pf) = &p.pre_filter {
+                let mut pre_filter_ids: Option<HashSet<LogicalId>> = if let Some(pf) = &p.pre_filter {
                     let fidx_key = format!("{}:{}", p.collection, pf.index_name);
                     let fidx = self.field_indexes.get(&fidx_key)
                         .ok_or_else(|| EngineError::InvalidQuery(
@@ -989,6 +989,53 @@ impl Executor {
                 } else {
                     None
                 };
+
+                // Step 1b: WITHIN — resolve graph subgraph candidate set
+                const BRUTE_FORCE_SUBGRAPH_THRESHOLD: usize = 500;
+
+                if let Some(ref within_plan) = p.within {
+                    let traverse_result = self.execute_traverse_match_plan(within_plan).await?;
+                    let within_ids: HashSet<LogicalId> = traverse_result.rows.iter()
+                        .filter_map(|row| row.values.get("id").map(|v| {
+                            match v {
+                                Value::String(s) => LogicalId::from_string(s),
+                                _ => LogicalId::from_string(&v.to_string()),
+                            }
+                        }))
+                        .collect();
+
+                    // Intersect with WHERE pre-filter if present
+                    let final_candidates = match pre_filter_ids.take() {
+                        Some(pf) => pf.intersection(&within_ids).cloned().collect::<HashSet<_>>(),
+                        None => within_ids,
+                    };
+
+                    // Short-circuit on empty candidate set
+                    if final_candidates.is_empty() {
+                        return Ok(QueryResult {
+                            columns: vec![],
+                            rows: vec![],
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: 0,
+                                mode: QueryMode::Probabilistic,
+                                tier: "Ram".into(),
+                                cost: cost_estimate.clone(),
+                                warnings: opt_warnings.clone(),
+                            },
+                        });
+                    }
+
+                    if final_candidates.len() < BRUTE_FORCE_SUBGRAPH_THRESHOLD {
+                        // BruteForceSubgraph path — bypass HNSW, compute cosine directly
+                        return self.execute_brute_force_subgraph(
+                            p, &final_candidates, start, &cost_estimate, &opt_warnings,
+                        ).await;
+                    } else {
+                        // Large subgraph: fall through to existing HNSW with post-filter
+                        pre_filter_ids = Some(final_candidates);
+                    }
+                }
 
                 // Step 2: Over-fetch when pre-filtering
                 let fetch_k = if pre_filter_ids.is_some() { p.k * 4 } else { p.k };
@@ -3540,6 +3587,132 @@ impl Executor {
                 tier: "Ram".into(),
                 cost: cost_estimate,
                 warnings: opt_warnings,
+            },
+        })
+    }
+
+    /// Brute-force vector search over a small subgraph (<500 entities).
+    /// Bypasses HNSW index and computes cosine similarity directly.
+    async fn execute_brute_force_subgraph(
+        &self,
+        plan: &crate::planner::SearchPlan,
+        candidates: &HashSet<LogicalId>,
+        start: std::time::Instant,
+        cost_estimate: &Option<crate::cost::AcuEstimate>,
+        warnings: &[crate::warning::PlanWarning],
+    ) -> Result<QueryResult, EngineError> {
+        let repr_name = plan.using_repr.as_ref()
+            .ok_or_else(|| EngineError::InvalidQuery(
+                "WITHIN brute-force requires USING repr_name".into(),
+            ))?;
+
+        // Resolve the query vector
+        let query_vec: Vec<f32> = if let Some(ref dv) = plan.dense_vector {
+            dv.iter().map(|&x| x as f32).collect()
+        } else if let Some(ref qt) = plan.query_text {
+            // NaturalLanguage: encode query text via vectoriser
+            let vectoriser = self.vectoriser_registry
+                .get(&plan.collection, repr_name)
+                .ok_or_else(|| EngineError::InvalidQuery(
+                    format!("no vectoriser registered for {}:{}", plan.collection, repr_name),
+                ))?;
+            match vectoriser.encode_query(qt).await
+                .map_err(|e| EngineError::Storage(format!("encode_query failed: {e}")))? {
+                VectorData::Dense(v) => v,
+                _ => return Err(EngineError::InvalidQuery(
+                    "expected dense vector from encode_query".into(),
+                )),
+            }
+        } else {
+            return Err(EngineError::InvalidQuery(
+                "WITHIN brute-force requires a dense vector or query text".into(),
+            ));
+        };
+
+        // Compute query norm
+        let query_norm: f32 = query_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if query_norm == 0.0 {
+            return Err(EngineError::InvalidQuery("zero-norm query vector".into()));
+        }
+
+        // Find repr index in schema for location table lookups
+        let repr_idx: Option<u32> = self.schemas.get(&plan.collection)
+            .and_then(|schema| {
+                schema.representations.iter()
+                    .position(|r| r.name == *repr_name)
+                    .map(|idx| idx as u32)
+            });
+
+        // Score each candidate by cosine similarity
+        let mut scored: Vec<(LogicalId, f32)> = Vec::with_capacity(candidates.len());
+
+        for cid in candidates {
+            // Fetch entity from store
+            let entity = match self.store.get(&plan.collection, cid) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            // Find the matching representation
+            let repr = match entity.representations.iter().find(|r| r.name == *repr_name) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Check for Dirty state on the representation itself
+            if repr.state == ReprState::Dirty {
+                continue;
+            }
+
+            // Check location table for Dirty/Recomputing
+            if let Some(ridx) = repr_idx {
+                let rk = ReprKey { entity_id: cid.clone(), repr_index: ridx };
+                if let Some(loc) = self.location.get(&rk) {
+                    if loc.state == LocState::Dirty || loc.state == LocState::Recomputing {
+                        continue;
+                    }
+                }
+            }
+
+            // Extract dense vector
+            let vec_data = match &repr.vector {
+                VectorData::Dense(v) => v,
+                _ => continue,
+            };
+
+            // Cosine similarity
+            let dot: f32 = query_vec.iter().zip(vec_data.iter()).map(|(a, b)| a * b).sum();
+            let cand_norm: f32 = vec_data.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if cand_norm == 0.0 { continue; }
+            let score = dot / (query_norm * cand_norm);
+            scored.push((cid.clone(), score));
+        }
+
+        // Sort by score descending, take top-k
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(plan.k);
+
+        // Build result rows
+        let mut rows = Vec::new();
+        for (id, score) in &scored {
+            if let Ok(entity) = self.store.get(&plan.collection, id) {
+                let mut row = entity_to_row(&entity, &plan.fields);
+                row.score = Some(*score);
+                rows.push(row);
+            }
+        }
+
+        let columns = build_columns(&rows, &plan.fields);
+        Ok(QueryResult {
+            columns,
+            rows,
+            stats: QueryStats {
+                elapsed: start.elapsed(),
+                entities_scanned: scored.len(),
+                mode: QueryMode::Probabilistic,
+                tier: "Ram".into(),
+                cost: cost_estimate.clone(),
+                warnings: warnings.to_vec(),
             },
         })
     }
@@ -11482,5 +11655,199 @@ mod tests {
         let schema = exec.schemas.get("replay_idem").unwrap();
         assert!(schema.fields.iter().any(|f| f.name == "already_renamed"));
         assert!(!schema.fields.iter().any(|f| f.name == "something"));
+    }
+
+    #[tokio::test]
+    async fn search_within_traverse_brute_force() {
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a dense representation (3 dims)
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "dense".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "link".into(),
+            from_collection: "items".into(),
+            to_collection: "items".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Insert 5 entities with known vectors
+        for (id, vec) in &[
+            ("a", vec![1.0_f64, 0.0, 0.0]),
+            ("b", vec![0.9_f64, 0.1, 0.0]),
+            ("c", vec![0.8_f64, 0.2, 0.0]),
+            ("d", vec![0.0_f64, 0.0, 1.0]),
+            ("e", vec![0.0_f64, 1.0, 0.0]),
+        ] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(id.to_string())],
+                vectors: vec![("dense".into(), trondb_tql::VectorLiteral::Dense(vec.clone()))],
+                collocate_with: None,
+                affinity_group: None,
+                valid_from: None,
+                valid_to: None,
+            })).await.unwrap();
+        }
+
+        // Create edges: a->b, b->c
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "link".into(),
+            from_id: "a".into(),
+            to_id: "b".into(),
+            metadata: vec![],
+            valid_from: None,
+            valid_to: None,
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "link".into(),
+            from_id: "b".into(),
+            to_id: "c".into(),
+            metadata: vec![],
+            valid_from: None,
+            valid_to: None,
+        })).await.unwrap();
+
+        // SEARCH WITHIN TRAVERSE: should find b and c (1-2 hops from a), ranked by similarity to [1,0,0]
+        let result = exec.execute(&Plan::Search(SearchPlan {
+            collection: "items".into(),
+            fields: trondb_tql::FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: Some("dense".into()),
+            hints: vec![],
+            two_pass: None,
+            within: Some(Box::new(TraverseMatchPlan {
+                from_id: "a".into(),
+                pattern: MatchPattern {
+                    source_var: "a".into(),
+                    edge: EdgePattern {
+                        variable: Some("e".into()),
+                        edge_type: Some("link".into()),
+                        direction: EdgeDirection::Forward,
+                    },
+                    target_var: "b".into(),
+                },
+                min_depth: 1,
+                max_depth: 2,
+                confidence_threshold: None,
+                temporal: None,
+                limit: None,
+            })),
+        })).await.unwrap();
+
+        // Should return exactly b and c (not a, d, or e)
+        let ids: Vec<String> = result.rows.iter()
+            .filter_map(|r| r.values.get("id").map(|v| v.to_string()))
+            .collect();
+        assert_eq!(ids.len(), 2, "expected 2 results (b and c), got: {:?}", ids);
+        assert!(ids.contains(&"b".to_string()), "expected b in results");
+        assert!(ids.contains(&"c".to_string()), "expected c in results");
+        // b should rank higher (closer to [1,0,0])
+        assert_eq!(ids[0], "b", "b should rank first (highest cosine similarity to [1,0,0])");
+    }
+
+    #[tokio::test]
+    async fn search_within_empty_subgraph() {
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items2".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "dense".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "link2".into(),
+            from_collection: "items2".into(),
+            to_collection: "items2".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "items2".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("x".into()), Literal::String("x".into())],
+            vectors: vec![("dense".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
+            valid_from: None,
+            valid_to: None,
+        })).await.unwrap();
+
+        // TRAVERSE from non-existent entity — empty subgraph
+        let result = exec.execute(&Plan::Search(SearchPlan {
+            collection: "items2".into(),
+            fields: trondb_tql::FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: Some("dense".into()),
+            hints: vec![],
+            two_pass: None,
+            within: Some(Box::new(TraverseMatchPlan {
+                from_id: "nonexistent".into(),
+                pattern: MatchPattern {
+                    source_var: "a".into(),
+                    edge: EdgePattern {
+                        variable: None,
+                        edge_type: Some("link2".into()),
+                        direction: EdgeDirection::Forward,
+                    },
+                    target_var: "b".into(),
+                },
+                min_depth: 1,
+                max_depth: 1,
+                confidence_threshold: None,
+                temporal: None,
+                limit: None,
+            })),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 0, "expected 0 results for empty subgraph");
     }
 }
