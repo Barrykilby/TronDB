@@ -1100,9 +1100,10 @@ def cmd_bench_retrieval():
     tron_times_s4 = []
 
     for i, (seed_id, content, seed_emb_str) in enumerate(scope_seeds):
-        seed_emb = seed_emb_str.strip("[]")
-        seed_emb_json = json.dumps([float(x) for x in seed_emb.split(",")])
-        seed_emb_tql = "[" + seed_emb + "]"
+        seed_emb_floats = [float(x) for x in seed_emb_str.strip("[]").split(",")]
+        seed_emb_json = json.dumps(seed_emb_floats)
+        # Use %g to avoid scientific notation (e.g. 3.17e-33 → 0.0)
+        seed_emb_tql = "[" + ", ".join(f"{v:.10f}" for v in seed_emb_floats) + "]"
 
         # DuckDB: CTE to find 2-hop neighbourhood, then rank by cosine similarity
         t0 = time.time()
@@ -1131,7 +1132,7 @@ def cmd_bench_retrieval():
         # TronDB: SEARCH WITHIN (TRAVERSE ...) — single query graph-scoped vector search
         t0 = time.time()
         tron_out = tql(
-            f"SEARCH memory_cards NEAR VECTOR {seed_emb_tql} USING embedding "
+            f"SEARCH memory_cards NEAR VECTOR {seed_emb_tql} USING dense "
             f"WITHIN (TRAVERSE FROM '{seed_id}' MATCH (a)-[e:semantic_link]->(b) DEPTH 1..2) LIMIT 10;"
         )
         tron_time = time.time() - t0
