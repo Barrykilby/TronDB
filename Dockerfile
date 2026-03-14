@@ -1,5 +1,5 @@
-# Builder stage
-FROM rust:1.88-bookworm AS builder
+# Builder stage (trixie for glibc 2.41 — ort_sys ONNX C++ needs C23 functions)
+FROM rust:1.88-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*
 
@@ -9,8 +9,8 @@ COPY crates/ crates/
 
 RUN cargo build --release -p trondb-server
 
-# Runtime stage
-FROM debian:bookworm-slim
+# Runtime stage (must match builder glibc)
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
