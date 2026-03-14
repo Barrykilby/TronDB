@@ -1,2 +1,4 @@
 /target
 .worktrees/
+trondb_data/
+models/

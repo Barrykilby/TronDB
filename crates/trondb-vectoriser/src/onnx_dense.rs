@@ -6,7 +6,9 @@ use trondb_core::types::VectorData;
 use trondb_core::vectoriser::{FieldSet, VectorKind, Vectoriser, VectoriserError};
 
 #[cfg(feature = "onnx")]
-use ort::Session;
+use ort::session::Session;
+#[cfg(feature = "onnx")]
+use ort::value::TensorRef;
 #[cfg(feature = "onnx")]
 use tokenizers::Tokenizer;
 
@@ -14,7 +16,7 @@ use tokenizers::Tokenizer;
 pub struct OnnxDenseVectoriser {
     id: String,
     model_id: String,
-    session: Session,
+    session: std::sync::Mutex<Session>,
     tokenizer: Tokenizer,
     dimensions: usize,
 }
@@ -38,7 +40,7 @@ impl OnnxDenseVectoriser {
         Ok(Self {
             id: format!("onnx-dense:{model_id}"),
             model_id: model_id.to_string(),
-            session,
+            session: std::sync::Mutex::new(session),
             tokenizer,
             dimensions,
         })
@@ -52,39 +54,42 @@ impl OnnxDenseVectoriser {
         let attention_mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
         let seq_len = input_ids.len();
 
-        let input_ids_array = ndarray::Array2::from_shape_vec((1, seq_len), input_ids)
+        let id_tensor = TensorRef::from_array_view(([1, seq_len], &*input_ids))
             .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
-        let attention_mask_array = ndarray::Array2::from_shape_vec((1, seq_len), attention_mask)
-            .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
-
-        let outputs = self.session.run(ort::inputs![
-            "input_ids" => input_ids_array,
-            "attention_mask" => attention_mask_array,
-        ].map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?)
+        let mask_tensor = TensorRef::from_array_view(([1, seq_len], &*attention_mask))
             .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
 
-        let embeddings = outputs[0].try_extract_tensor::<f32>()
+        let mut session = self.session.lock()
+            .map_err(|e| VectoriserError::EncodeFailed(format!("session lock poisoned: {e}")))?;
+        let outputs = session.run(ort::inputs![
+            "input_ids" => id_tensor,
+            "attention_mask" => mask_tensor,
+        ]).map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
+
+        let (shape, data) = outputs[0].try_extract_tensor::<f32>()
             .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
 
-        let view = embeddings.view();
-        let shape = view.shape();
+        // Shape derefs to [i64]
+        let dims_slice: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
 
-        let vector = if shape.len() == 3 {
+        let vector = if dims_slice.len() == 3 {
             // (batch, seq_len, dims) — mean pool
-            let dims = shape[2];
+            let token_count = dims_slice[1];
+            let dims = dims_slice[2];
             let mut pooled = vec![0.0f32; dims];
-            let token_count = shape[1] as f32;
-            for t in 0..shape[1] {
+            for t in 0..token_count {
                 for d in 0..dims {
-                    pooled[d] += view[[0, t, d]];
+                    pooled[d] += data[t * dims + d];
                 }
             }
-            for d in &mut pooled { *d /= token_count; }
+            let tc = token_count as f32;
+            for d in &mut pooled { *d /= tc; }
             pooled
-        } else if shape.len() == 2 {
-            view.row(0).to_vec()
+        } else if dims_slice.len() == 2 {
+            let dims = dims_slice[1];
+            data[..dims].to_vec()
         } else {
-            return Err(VectoriserError::EncodeFailed(format!("unexpected output shape: {shape:?}")));
+            return Err(VectoriserError::EncodeFailed(format!("unexpected output shape: {dims_slice:?}")));
         };
 
         // L2 normalise

@@ -6,7 +6,9 @@ use trondb_core::types::VectorData;
 use trondb_core::vectoriser::{FieldSet, VectorKind, Vectoriser, VectoriserError};
 
 #[cfg(feature = "onnx")]
-use ort::Session;
+use ort::session::Session;
+#[cfg(feature = "onnx")]
+use ort::value::TensorRef;
 #[cfg(feature = "onnx")]
 use tokenizers::Tokenizer;
 
@@ -17,7 +19,7 @@ const MIN_WEIGHT: f32 = 0.001;
 pub struct OnnxSparseVectoriser {
     id: String,
     model_id: String,
-    session: Session,
+    session: std::sync::Mutex<Session>,
     tokenizer: Tokenizer,
     vocab_size: usize,
 }
@@ -39,7 +41,7 @@ impl OnnxSparseVectoriser {
         Ok(Self {
             id: format!("onnx-sparse:{model_id}"),
             model_id: model_id.to_string(),
-            session,
+            session: std::sync::Mutex::new(session),
             tokenizer,
             vocab_size,
         })
@@ -52,38 +54,41 @@ impl OnnxSparseVectoriser {
         let attention_mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
         let seq_len = input_ids.len();
 
-        let input_ids_array = ndarray::Array2::from_shape_vec((1, seq_len), input_ids)
+        let id_tensor = TensorRef::from_array_view(([1, seq_len], &*input_ids))
             .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
-        let attention_mask_array = ndarray::Array2::from_shape_vec((1, seq_len), attention_mask)
-            .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
-
-        let outputs = self.session.run(ort::inputs![
-            "input_ids" => input_ids_array,
-            "attention_mask" => attention_mask_array,
-        ].map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?)
+        let mask_tensor = TensorRef::from_array_view(([1, seq_len], &*attention_mask))
             .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
 
-        let logits = outputs[0].try_extract_tensor::<f32>()
+        let mut session = self.session.lock()
+            .map_err(|e| VectoriserError::EncodeFailed(format!("session lock poisoned: {e}")))?;
+        let outputs = session.run(ort::inputs![
+            "input_ids" => id_tensor,
+            "attention_mask" => mask_tensor,
+        ]).map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
+
+        let (shape, data) = outputs[0].try_extract_tensor::<f32>()
             .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
-        let view = logits.view();
-        let shape = view.shape();
+
+        // Shape derefs to [i64]
+        let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
 
         // ReLU + log1p, then max-pool over tokens
-        let vocab_dim = if shape.len() == 3 { shape[2] } else { shape[1] };
+        let vocab_dim = if dims.len() == 3 { dims[2] } else { dims[1] };
         let mut pooled = vec![0.0f32; vocab_dim];
 
-        if shape.len() == 3 {
-            for t in 0..shape[1] {
+        if dims.len() == 3 {
+            let token_count = dims[1];
+            for t in 0..token_count {
                 for d in 0..vocab_dim {
-                    let val = view[[0, t, d]].max(0.0); // ReLU
-                    let val = (1.0 + val).ln(); // log1p
+                    let val = data[t * vocab_dim + d].max(0.0_f32); // ReLU
+                    let val = (1.0_f32 + val).ln(); // log1p
                     pooled[d] = pooled[d].max(val); // max-pool
                 }
             }
         } else {
             for d in 0..vocab_dim {
-                let val = view[[0, d]].max(0.0);
-                pooled[d] = (1.0 + val).ln();
+                let val = data[d].max(0.0_f32);
+                pooled[d] = (1.0_f32 + val).ln();
             }
         }
 
