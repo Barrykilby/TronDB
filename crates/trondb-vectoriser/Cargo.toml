@@ -28,7 +28,7 @@ optional = true
 version = "0.21"
 optional = true
 default-features = false
-features = ["onig"]
+features = ["fancy-regex"]
 
 [dependencies.serde_json]
 workspace = true
