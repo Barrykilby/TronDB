@@ -1,0 +1,18 @@
+services:
+  trondb:
+    build: .
+    container_name: trondb
+    environment:
+      TRONDB_NODE_ID: primary
+      TRONDB_ROLE: primary
+      TRONDB_BIND_ADDR: "0.0.0.0:9400"
+      RUST_LOG: "info"
+    volumes:
+      - trondb-data:/data/trondb
+      - ./models/embeddings:/models/bge-small-en-v1.5:ro
+    ports:
+      - "9400:9400"
+    restart: unless-stopped
+
+volumes:
+  trondb-data:
