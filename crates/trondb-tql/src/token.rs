@@ -49,6 +49,9 @@ pub enum Token {
     #[token("WITH", priority = 10, ignore(ascii_case))]
     With,
 
+    #[token("WITHIN", priority = 10, ignore(ascii_case))]
+    Within,
+
     #[token("DIMENSIONS", priority = 10, ignore(ascii_case))]
     Dimensions,
 
@@ -334,7 +337,8 @@ pub enum Token {
     StringLit(String),
 
     // Float literals (must be before int to match longer pattern)
-    #[regex(r"-?[0-9]+\.[0-9]+", priority = 3, callback = |lex| lex.slice().parse::<f64>().unwrap())]
+    // Supports scientific notation: 1.23e-05, -3.14E+10, 0.5e3
+    #[regex(r"-?[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", priority = 3, callback = |lex| lex.slice().parse::<f64>().unwrap())]
     FloatLit(f64),
 
     // Int literals
@@ -917,5 +921,23 @@ mod tests {
     #[test]
     fn lex_string_with_escaped_backslash() {
         assert_eq!(lex("'path\\\\to'"), vec![Token::StringLit("path\\to".into())]);
+    }
+
+    #[test]
+    fn lex_scientific_notation_floats() {
+        assert_eq!(lex("3.14e-05"), vec![Token::FloatLit(3.14e-05)]);
+        assert_eq!(lex("-1.5E+10"), vec![Token::FloatLit(-1.5e10)]);
+        assert_eq!(lex("0.5e3"), vec![Token::FloatLit(0.5e3)]);
+        // In a vector context
+        let tokens = lex("[1.0, 2.5e-33, -3.0E5]");
+        assert_eq!(tokens, vec![
+            Token::LBracket,
+            Token::FloatLit(1.0),
+            Token::Comma,
+            Token::FloatLit(2.5e-33),
+            Token::Comma,
+            Token::FloatLit(-3.0e5),
+            Token::RBracket,
+        ]);
     }
 }

@@ -972,7 +972,7 @@ impl Executor {
                 }
 
                 // Step 1: Pre-filter — resolve candidate IDs from FieldIndex if present
-                let pre_filter_ids: Option<HashSet<LogicalId>> = if let Some(pf) = &p.pre_filter {
+                let mut pre_filter_ids: Option<HashSet<LogicalId>> = if let Some(pf) = &p.pre_filter {
                     let fidx_key = format!("{}:{}", p.collection, pf.index_name);
                     let fidx = self.field_indexes.get(&fidx_key)
                         .ok_or_else(|| EngineError::InvalidQuery(
@@ -989,6 +989,53 @@ impl Executor {
                 } else {
                     None
                 };
+
+                // Step 1b: WITHIN — resolve graph subgraph candidate set
+                const BRUTE_FORCE_SUBGRAPH_THRESHOLD: usize = 500;
+
+                if let Some(ref within_plan) = p.within {
+                    let traverse_result = self.execute_traverse_match_plan(within_plan).await?;
+                    let within_ids: HashSet<LogicalId> = traverse_result.rows.iter()
+                        .filter_map(|row| row.values.get("id").map(|v| {
+                            match v {
+                                Value::String(s) => LogicalId::from_string(s),
+                                _ => LogicalId::from_string(&v.to_string()),
+                            }
+                        }))
+                        .collect();
+
+                    // Intersect with WHERE pre-filter if present
+                    let final_candidates = match pre_filter_ids.take() {
+                        Some(pf) => pf.intersection(&within_ids).cloned().collect::<HashSet<_>>(),
+                        None => within_ids,
+                    };
+
+                    // Short-circuit on empty candidate set
+                    if final_candidates.is_empty() {
+                        return Ok(QueryResult {
+                            columns: vec![],
+                            rows: vec![],
+                            stats: QueryStats {
+                                elapsed: start.elapsed(),
+                                entities_scanned: 0,
+                                mode: QueryMode::Probabilistic,
+                                tier: "Ram".into(),
+                                cost: cost_estimate.clone(),
+                                warnings: opt_warnings.clone(),
+                            },
+                        });
+                    }
+
+                    if final_candidates.len() < BRUTE_FORCE_SUBGRAPH_THRESHOLD {
+                        // BruteForceSubgraph path — bypass HNSW, compute cosine directly
+                        return self.execute_brute_force_subgraph(
+                            p, &final_candidates, start, &cost_estimate, &opt_warnings,
+                        ).await;
+                    } else {
+                        // Large subgraph: fall through to existing HNSW with post-filter
+                        pre_filter_ids = Some(final_candidates);
+                    }
+                }
 
                 // Step 2: Over-fetch when pre-filtering
                 let fetch_k = if pre_filter_ids.is_some() { p.k * 4 } else { p.k };
@@ -2656,200 +2703,7 @@ impl Executor {
             }
 
             Plan::TraverseMatch(p) => {
-                let max_depth = p.max_depth.min(10); // cap at 10
-                let min_depth = p.min_depth;
-                let confidence_threshold = p.confidence_threshold.unwrap_or(0.0) as f32;
-
-                let from_id = LogicalId::from_string(&p.from_id);
-                let mut visited: HashSet<LogicalId> = HashSet::new();
-                visited.insert(from_id.clone());
-
-                let mut frontier = vec![from_id];
-                let mut rows = Vec::new();
-                let limit = p.limit.unwrap_or(usize::MAX);
-
-                // Optional edge type filter from pattern
-                let edge_type_filter: Option<String> = p.pattern.edge.edge_type.clone();
-
-                for hop in 0..max_depth {
-                    if frontier.is_empty() || rows.len() >= limit {
-                        break;
-                    }
-
-                    let mut next_frontier = Vec::new();
-                    let include_at_depth = hop + 1 >= min_depth;
-
-                    for node_id in &frontier {
-                        // Collect neighbor entries based on direction
-                        // (to_id, confidence, collection)
-                        let mut neighbors: Vec<(LogicalId, f32, String)> = Vec::new();
-
-                        // Get edge types to check: filtered or all
-                        let edge_types_to_check: Vec<EdgeType> = if let Some(ref et_name) = edge_type_filter {
-                            match self.store.get_edge_type(et_name) {
-                                Ok(et) => vec![et],
-                                Err(_) => vec![],
-                            }
-                        } else {
-                            self.edge_types.iter().map(|e| e.value().clone()).collect()
-                        };
-
-                        for et in &edge_types_to_check {
-                            match p.pattern.edge.direction {
-                                trondb_tql::EdgeDirection::Forward => {
-                                    let entries = self.adjacency.get(node_id, &et.name);
-                                    for entry in &entries {
-                                        // Apply temporal filter if present
-                                        if let Some(ref tc) = p.temporal {
-                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
-                                                continue;
-                                            }
-                                        }
-                                        let effective_conf = if entry.created_at > 0 {
-                                            let now_ms = SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_millis() as u64;
-                                            let elapsed = now_ms.saturating_sub(entry.created_at);
-                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
-                                        } else {
-                                            entry.confidence
-                                        };
-                                        if effective_conf >= confidence_threshold {
-                                            neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
-                                        }
-                                    }
-                                }
-                                trondb_tql::EdgeDirection::Backward => {
-                                    let source_ids = self.adjacency.get_backward(node_id, &et.name);
-                                    for source_id in &source_ids {
-                                        let entries = self.adjacency.get(source_id, &et.name);
-                                        for entry in &entries {
-                                            if entry.to_id == *node_id {
-                                                // Apply temporal filter if present
-                                                if let Some(ref tc) = p.temporal {
-                                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
-                                                        continue;
-                                                    }
-                                                }
-                                                let effective_conf = if entry.created_at > 0 {
-                                                    let now_ms = SystemTime::now()
-                                                        .duration_since(UNIX_EPOCH)
-                                                        .unwrap()
-                                                        .as_millis() as u64;
-                                                    let elapsed = now_ms.saturating_sub(entry.created_at);
-                                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
-                                                } else {
-                                                    entry.confidence
-                                                };
-                                                if effective_conf >= confidence_threshold {
-                                                    neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                trondb_tql::EdgeDirection::Undirected => {
-                                    // Forward direction
-                                    let entries = self.adjacency.get(node_id, &et.name);
-                                    for entry in &entries {
-                                        // Apply temporal filter if present
-                                        if let Some(ref tc) = p.temporal {
-                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
-                                                continue;
-                                            }
-                                        }
-                                        let effective_conf = if entry.created_at > 0 {
-                                            let now_ms = SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_millis() as u64;
-                                            let elapsed = now_ms.saturating_sub(entry.created_at);
-                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
-                                        } else {
-                                            entry.confidence
-                                        };
-                                        if effective_conf >= confidence_threshold {
-                                            neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
-                                        }
-                                    }
-                                    // Backward direction
-                                    let source_ids = self.adjacency.get_backward(node_id, &et.name);
-                                    for source_id in &source_ids {
-                                        let entries = self.adjacency.get(source_id, &et.name);
-                                        for entry in &entries {
-                                            if entry.to_id == *node_id {
-                                                // Apply temporal filter if present
-                                                if let Some(ref tc) = p.temporal {
-                                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
-                                                        continue;
-                                                    }
-                                                }
-                                                let effective_conf = if entry.created_at > 0 {
-                                                    let now_ms = SystemTime::now()
-                                                        .duration_since(UNIX_EPOCH)
-                                                        .unwrap()
-                                                        .as_millis() as u64;
-                                                    let elapsed = now_ms.saturating_sub(entry.created_at);
-                                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
-                                                } else {
-                                                    entry.confidence
-                                                };
-                                                if effective_conf >= confidence_threshold {
-                                                    neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        for (neighbor_id, confidence, collection) in &neighbors {
-                            if visited.contains(neighbor_id) {
-                                continue;
-                            }
-                            visited.insert(neighbor_id.clone());
-
-                            if include_at_depth {
-                                if let Ok(entity) = self.store.get(collection, neighbor_id) {
-                                    let mut row = entity_to_row(&entity, &FieldList::All);
-                                    // Add _edge.confidence and _depth metadata
-                                    row.values.insert("_edge.confidence".into(), Value::Float(*confidence as f64));
-                                    if let Some(ref et_name) = edge_type_filter {
-                                        row.values.insert("_edge.type".into(), Value::String(et_name.clone()));
-                                    }
-                                    row.values.insert("_depth".into(), Value::Int((hop + 1) as i64));
-                                    rows.push(row);
-                                    if rows.len() >= limit {
-                                        break;
-                                    }
-                                }
-                            }
-                            next_frontier.push(neighbor_id.clone());
-                        }
-                        if rows.len() >= limit {
-                            break;
-                        }
-                    }
-
-                    frontier = next_frontier;
-                }
-
-                let scanned = rows.len();
-
-                Ok(QueryResult {
-                    columns: build_columns(&rows, &FieldList::All),
-                    rows,
-                    stats: QueryStats {
-                        elapsed: start.elapsed(),
-                        entities_scanned: scanned,
-                        mode: QueryMode::Deterministic,
-                        tier: "Ram".into(),
-                        cost: cost_estimate.clone(),
-                        warnings: opt_warnings.clone(),
-                    },
-                })
+                self.execute_traverse_match_plan(p).await
             }
 
             Plan::Backup(p) => {
@@ -3529,6 +3383,338 @@ impl Executor {
         }
 
         Ok(recomputed)
+    }
+
+    /// Execute a TraverseMatch sub-plan and return the result.
+    /// Used by both standalone TRAVERSE MATCH and SEARCH ... WITHIN.
+    pub async fn execute_traverse_match_plan(
+        &self,
+        p: &crate::planner::TraverseMatchPlan,
+    ) -> Result<QueryResult, EngineError> {
+        let start = std::time::Instant::now();
+        let cost_estimate: Option<crate::cost::AcuEstimate> = None;
+        let opt_warnings: Vec<crate::warning::PlanWarning> = Vec::new();
+
+        let max_depth = p.max_depth.min(10); // cap at 10
+        let min_depth = p.min_depth;
+        let confidence_threshold = p.confidence_threshold.unwrap_or(0.0) as f32;
+
+        let from_id = LogicalId::from_string(&p.from_id);
+        let mut visited: HashSet<LogicalId> = HashSet::new();
+        visited.insert(from_id.clone());
+
+        let mut frontier = vec![from_id];
+        let mut rows = Vec::new();
+        let limit = p.limit.unwrap_or(usize::MAX);
+
+        // Optional edge type filter from pattern
+        let edge_type_filter: Option<String> = p.pattern.edge.edge_type.clone();
+
+        for hop in 0..max_depth {
+            if frontier.is_empty() || rows.len() >= limit {
+                break;
+            }
+
+            let mut next_frontier = Vec::new();
+            let include_at_depth = hop + 1 >= min_depth;
+
+            for node_id in &frontier {
+                // Collect neighbor entries based on direction
+                // (to_id, confidence, collection)
+                let mut neighbors: Vec<(LogicalId, f32, String)> = Vec::new();
+
+                // Get edge types to check: filtered or all
+                let edge_types_to_check: Vec<EdgeType> = if let Some(ref et_name) = edge_type_filter {
+                    match self.store.get_edge_type(et_name) {
+                        Ok(et) => vec![et],
+                        Err(_) => vec![],
+                    }
+                } else {
+                    self.edge_types.iter().map(|e| e.value().clone()).collect()
+                };
+
+                for et in &edge_types_to_check {
+                    match p.pattern.edge.direction {
+                        trondb_tql::EdgeDirection::Forward => {
+                            let entries = self.adjacency.get(node_id, &et.name);
+                            for entry in &entries {
+                                // Apply temporal filter if present
+                                if let Some(ref tc) = p.temporal {
+                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                        continue;
+                                    }
+                                }
+                                let effective_conf = if entry.created_at > 0 {
+                                    let now_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64;
+                                    let elapsed = now_ms.saturating_sub(entry.created_at);
+                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                } else {
+                                    entry.confidence
+                                };
+                                if effective_conf >= confidence_threshold {
+                                    neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
+                                }
+                            }
+                        }
+                        trondb_tql::EdgeDirection::Backward => {
+                            let source_ids = self.adjacency.get_backward(node_id, &et.name);
+                            for source_id in &source_ids {
+                                let entries = self.adjacency.get(source_id, &et.name);
+                                for entry in &entries {
+                                    if entry.to_id == *node_id {
+                                        // Apply temporal filter if present
+                                        if let Some(ref tc) = p.temporal {
+                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                                continue;
+                                            }
+                                        }
+                                        let effective_conf = if entry.created_at > 0 {
+                                            let now_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_millis() as u64;
+                                            let elapsed = now_ms.saturating_sub(entry.created_at);
+                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                        } else {
+                                            entry.confidence
+                                        };
+                                        if effective_conf >= confidence_threshold {
+                                            neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        trondb_tql::EdgeDirection::Undirected => {
+                            // Forward direction
+                            let entries = self.adjacency.get(node_id, &et.name);
+                            for entry in &entries {
+                                // Apply temporal filter if present
+                                if let Some(ref tc) = p.temporal {
+                                    if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                        continue;
+                                    }
+                                }
+                                let effective_conf = if entry.created_at > 0 {
+                                    let now_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as u64;
+                                    let elapsed = now_ms.saturating_sub(entry.created_at);
+                                    crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                } else {
+                                    entry.confidence
+                                };
+                                if effective_conf >= confidence_threshold {
+                                    neighbors.push((entry.to_id.clone(), effective_conf, et.to_collection.clone()));
+                                }
+                            }
+                            // Backward direction
+                            let source_ids = self.adjacency.get_backward(node_id, &et.name);
+                            for source_id in &source_ids {
+                                let entries = self.adjacency.get(source_id, &et.name);
+                                for entry in &entries {
+                                    if entry.to_id == *node_id {
+                                        // Apply temporal filter if present
+                                        if let Some(ref tc) = p.temporal {
+                                            if !edge_passes_temporal_filter(entry, tc).unwrap_or(false) {
+                                                continue;
+                                            }
+                                        }
+                                        let effective_conf = if entry.created_at > 0 {
+                                            let now_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_millis() as u64;
+                                            let elapsed = now_ms.saturating_sub(entry.created_at);
+                                            crate::edge::effective_confidence(entry.confidence, elapsed, &et.decay_config)
+                                        } else {
+                                            entry.confidence
+                                        };
+                                        if effective_conf >= confidence_threshold {
+                                            neighbors.push((source_id.clone(), effective_conf, et.from_collection.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (neighbor_id, confidence, collection) in &neighbors {
+                    if visited.contains(neighbor_id) {
+                        continue;
+                    }
+                    visited.insert(neighbor_id.clone());
+
+                    if include_at_depth {
+                        if let Ok(entity) = self.store.get(collection, neighbor_id) {
+                            let mut row = entity_to_row(&entity, &FieldList::All);
+                            // Add _edge.confidence and _depth metadata
+                            row.values.insert("_edge.confidence".into(), Value::Float(*confidence as f64));
+                            if let Some(ref et_name) = edge_type_filter {
+                                row.values.insert("_edge.type".into(), Value::String(et_name.clone()));
+                            }
+                            row.values.insert("_depth".into(), Value::Int((hop + 1) as i64));
+                            rows.push(row);
+                            if rows.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    next_frontier.push(neighbor_id.clone());
+                }
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+
+            frontier = next_frontier;
+        }
+
+        let scanned = rows.len();
+
+        Ok(QueryResult {
+            columns: build_columns(&rows, &FieldList::All),
+            rows,
+            stats: QueryStats {
+                elapsed: start.elapsed(),
+                entities_scanned: scanned,
+                mode: QueryMode::Deterministic,
+                tier: "Ram".into(),
+                cost: cost_estimate,
+                warnings: opt_warnings,
+            },
+        })
+    }
+
+    /// Brute-force vector search over a small subgraph (<500 entities).
+    /// Bypasses HNSW index and computes cosine similarity directly.
+    async fn execute_brute_force_subgraph(
+        &self,
+        plan: &crate::planner::SearchPlan,
+        candidates: &HashSet<LogicalId>,
+        start: std::time::Instant,
+        cost_estimate: &Option<crate::cost::AcuEstimate>,
+        warnings: &[crate::warning::PlanWarning],
+    ) -> Result<QueryResult, EngineError> {
+        let repr_name = plan.using_repr.as_ref()
+            .ok_or_else(|| EngineError::InvalidQuery(
+                "WITHIN brute-force requires USING repr_name".into(),
+            ))?;
+
+        // Resolve the query vector
+        let query_vec: Vec<f32> = if let Some(ref dv) = plan.dense_vector {
+            dv.iter().map(|&x| x as f32).collect()
+        } else if let Some(ref qt) = plan.query_text {
+            // NaturalLanguage: encode query text via vectoriser
+            let vectoriser = self.vectoriser_registry
+                .get(&plan.collection, repr_name)
+                .ok_or_else(|| EngineError::InvalidQuery(
+                    format!("no vectoriser registered for {}:{}", plan.collection, repr_name),
+                ))?;
+            match vectoriser.encode_query(qt).await
+                .map_err(|e| EngineError::Storage(format!("encode_query failed: {e}")))? {
+                VectorData::Dense(v) => v,
+                _ => return Err(EngineError::InvalidQuery(
+                    "expected dense vector from encode_query".into(),
+                )),
+            }
+        } else {
+            return Err(EngineError::InvalidQuery(
+                "WITHIN brute-force requires a dense vector or query text".into(),
+            ));
+        };
+
+        // Compute query norm
+        let query_norm: f32 = query_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if query_norm == 0.0 {
+            return Err(EngineError::InvalidQuery("zero-norm query vector".into()));
+        }
+
+        // Find repr index in schema for location table lookups
+        let repr_idx: Option<u32> = self.schemas.get(&plan.collection)
+            .and_then(|schema| {
+                schema.representations.iter()
+                    .position(|r| r.name == *repr_name)
+                    .map(|idx| idx as u32)
+            });
+
+        // Score each candidate by cosine similarity
+        let mut scored: Vec<(LogicalId, f32)> = Vec::with_capacity(candidates.len());
+
+        for cid in candidates {
+            // Fetch entity from store
+            let entity = match self.store.get(&plan.collection, cid) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            // Find the matching representation
+            let repr = match entity.representations.iter().find(|r| r.name == *repr_name) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // Check for Dirty state on the representation itself
+            if repr.state == ReprState::Dirty {
+                continue;
+            }
+
+            // Check location table for Dirty/Recomputing
+            if let Some(ridx) = repr_idx {
+                let rk = ReprKey { entity_id: cid.clone(), repr_index: ridx };
+                if let Some(loc) = self.location.get(&rk) {
+                    if loc.state == LocState::Dirty || loc.state == LocState::Recomputing {
+                        continue;
+                    }
+                }
+            }
+
+            // Extract dense vector
+            let vec_data = match &repr.vector {
+                VectorData::Dense(v) => v,
+                _ => continue,
+            };
+
+            // Cosine similarity
+            let dot: f32 = query_vec.iter().zip(vec_data.iter()).map(|(a, b)| a * b).sum();
+            let cand_norm: f32 = vec_data.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if cand_norm == 0.0 { continue; }
+            let score = dot / (query_norm * cand_norm);
+            scored.push((cid.clone(), score));
+        }
+
+        // Sort by score descending, take top-k
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(plan.k);
+
+        // Build result rows
+        let mut rows = Vec::new();
+        for (id, score) in &scored {
+            if let Ok(entity) = self.store.get(&plan.collection, id) {
+                let mut row = entity_to_row(&entity, &plan.fields);
+                row.score = Some(*score);
+                rows.push(row);
+            }
+        }
+
+        let columns = build_columns(&rows, &plan.fields);
+        Ok(QueryResult {
+            columns,
+            rows,
+            stats: QueryStats {
+                elapsed: start.elapsed(),
+                entities_scanned: scored.len(),
+                mode: QueryMode::Probabilistic,
+                tier: "Ram".into(),
+                cost: cost_estimate.clone(),
+                warnings: warnings.to_vec(),
+            },
+        })
     }
 }
 
@@ -4263,6 +4449,19 @@ fn explain_plan(plan: &Plan) -> Vec<Row> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 props.push(("hints", hints_str));
+            }
+            if let Some(ref within) = p.within {
+                let edge_type = within.pattern.edge.edge_type.as_deref().unwrap_or("*");
+                let direction = match within.pattern.edge.direction {
+                    trondb_tql::EdgeDirection::Forward => "->",
+                    trondb_tql::EdgeDirection::Backward => "<-",
+                    trondb_tql::EdgeDirection::Undirected => "-",
+                };
+                props.push(("within", format!(
+                    "TRAVERSE FROM '{}' -[:{}]{} DEPTH {}..{}",
+                    within.from_id, edge_type, direction,
+                    within.min_depth, within.max_depth,
+                )));
             }
         }
         Plan::Insert(p) => {
@@ -5477,6 +5676,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         })).await.unwrap();
 
         assert_eq!(result.rows.len(), 2);
@@ -5560,6 +5760,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         })).await.unwrap();
 
         // Both entities should appear, d1 should rank higher (matches both dense and sparse)
@@ -5647,6 +5848,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         })).await.unwrap();
 
         // Only London entities should be returned
@@ -5674,6 +5876,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = exec
@@ -5755,6 +5958,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = exec
@@ -6369,6 +6573,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6398,6 +6603,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6583,6 +6789,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6612,6 +6819,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6647,6 +6855,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6774,6 +6983,7 @@ mod tests {
                 using_repr: Some("semantic".into()),
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6802,6 +7012,7 @@ mod tests {
                 using_repr: Some("semantic".into()),
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -6878,6 +7089,7 @@ mod tests {
                 using_repr: None,
                 hints: vec![],
                 two_pass: None,
+                within: None,
             }))
             .await
             .unwrap();
@@ -10126,6 +10338,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = exec
@@ -10226,6 +10439,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
 
         let result = exec
@@ -10321,6 +10535,7 @@ mod tests {
             using_repr: None,
             hints: vec![],
             two_pass: None,
+            within: None,
         });
         let result = exec.execute(&search_plan).await.unwrap();
         assert!(result.stats.cost.is_some());
@@ -11453,5 +11668,396 @@ mod tests {
         let schema = exec.schemas.get("replay_idem").unwrap();
         assert!(schema.fields.iter().any(|f| f.name == "already_renamed"));
         assert!(!schema.fields.iter().any(|f| f.name == "something"));
+    }
+
+    #[tokio::test]
+    async fn search_within_traverse_brute_force() {
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a dense representation (3 dims)
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "dense".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "link".into(),
+            from_collection: "items".into(),
+            to_collection: "items".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Insert 5 entities with known vectors
+        for (id, vec) in &[
+            ("a", vec![1.0_f64, 0.0, 0.0]),
+            ("b", vec![0.9_f64, 0.1, 0.0]),
+            ("c", vec![0.8_f64, 0.2, 0.0]),
+            ("d", vec![0.0_f64, 0.0, 1.0]),
+            ("e", vec![0.0_f64, 1.0, 0.0]),
+        ] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "items".into(),
+                fields: vec!["id".into(), "name".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(id.to_string())],
+                vectors: vec![("dense".into(), trondb_tql::VectorLiteral::Dense(vec.clone()))],
+                collocate_with: None,
+                affinity_group: None,
+                valid_from: None,
+                valid_to: None,
+            })).await.unwrap();
+        }
+
+        // Create edges: a->b, b->c
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "link".into(),
+            from_id: "a".into(),
+            to_id: "b".into(),
+            metadata: vec![],
+            valid_from: None,
+            valid_to: None,
+        })).await.unwrap();
+        exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+            edge_type: "link".into(),
+            from_id: "b".into(),
+            to_id: "c".into(),
+            metadata: vec![],
+            valid_from: None,
+            valid_to: None,
+        })).await.unwrap();
+
+        // SEARCH WITHIN TRAVERSE: should find b and c (1-2 hops from a), ranked by similarity to [1,0,0]
+        let result = exec.execute(&Plan::Search(SearchPlan {
+            collection: "items".into(),
+            fields: trondb_tql::FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: Some("dense".into()),
+            hints: vec![],
+            two_pass: None,
+            within: Some(Box::new(TraverseMatchPlan {
+                from_id: "a".into(),
+                pattern: MatchPattern {
+                    source_var: "a".into(),
+                    edge: EdgePattern {
+                        variable: Some("e".into()),
+                        edge_type: Some("link".into()),
+                        direction: EdgeDirection::Forward,
+                    },
+                    target_var: "b".into(),
+                },
+                min_depth: 1,
+                max_depth: 2,
+                confidence_threshold: None,
+                temporal: None,
+                limit: None,
+            })),
+        })).await.unwrap();
+
+        // Should return exactly b and c (not a, d, or e)
+        let ids: Vec<String> = result.rows.iter()
+            .filter_map(|r| r.values.get("id").map(|v| v.to_string()))
+            .collect();
+        assert_eq!(ids.len(), 2, "expected 2 results (b and c), got: {:?}", ids);
+        assert!(ids.contains(&"b".to_string()), "expected b in results");
+        assert!(ids.contains(&"c".to_string()), "expected c in results");
+        // b should rank higher (closer to [1,0,0])
+        assert_eq!(ids[0], "b", "b should rank first (highest cosine similarity to [1,0,0])");
+    }
+
+    #[tokio::test]
+    async fn search_within_empty_subgraph() {
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+
+        let (exec, _dir) = setup_executor().await;
+
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items2".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "dense".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "name".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "link2".into(),
+            from_collection: "items2".into(),
+            to_collection: "items2".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::Insert(InsertPlan {
+            collection: "items2".into(),
+            fields: vec!["id".into(), "name".into()],
+            values: vec![Literal::String("x".into()), Literal::String("x".into())],
+            vectors: vec![("dense".into(), trondb_tql::VectorLiteral::Dense(vec![1.0, 0.0, 0.0]))],
+            collocate_with: None,
+            affinity_group: None,
+            valid_from: None,
+            valid_to: None,
+        })).await.unwrap();
+
+        // TRAVERSE from non-existent entity — empty subgraph
+        let result = exec.execute(&Plan::Search(SearchPlan {
+            collection: "items2".into(),
+            fields: trondb_tql::FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 10,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: Some("dense".into()),
+            hints: vec![],
+            two_pass: None,
+            within: Some(Box::new(TraverseMatchPlan {
+                from_id: "nonexistent".into(),
+                pattern: MatchPattern {
+                    source_var: "a".into(),
+                    edge: EdgePattern {
+                        variable: None,
+                        edge_type: Some("link2".into()),
+                        direction: EdgeDirection::Forward,
+                    },
+                    target_var: "b".into(),
+                },
+                min_depth: 1,
+                max_depth: 1,
+                confidence_threshold: None,
+                temporal: None,
+                limit: None,
+            })),
+        })).await.unwrap();
+
+        assert_eq!(result.rows.len(), 0, "expected 0 results for empty subgraph");
+    }
+
+    #[tokio::test]
+    async fn search_within_traverse_end_to_end() {
+        use trondb_tql::{MatchPattern, EdgePattern, EdgeDirection};
+
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a dense representation (3 dims)
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "docs".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "dense".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![
+                trondb_tql::FieldDecl { name: "title".into(), field_type: trondb_tql::FieldType::Text },
+            ],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "related".into(),
+            from_collection: "docs".into(),
+            to_collection: "docs".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Insert entities: hub with two spokes, plus an isolated island
+        for (id, title, vec) in &[
+            ("hub",    "central hub",      vec![0.5_f64, 0.5, 0.0]),
+            ("spoke1", "first spoke",      vec![0.9_f64, 0.1, 0.0]),
+            ("spoke2", "second spoke",     vec![0.1_f64, 0.9, 0.0]),
+            ("island", "isolated island",  vec![0.5_f64, 0.5, 0.0]),
+        ] {
+            exec.execute(&Plan::Insert(InsertPlan {
+                collection: "docs".into(),
+                fields: vec!["id".into(), "title".into()],
+                values: vec![Literal::String(id.to_string()), Literal::String(title.to_string())],
+                vectors: vec![("dense".into(), trondb_tql::VectorLiteral::Dense(vec.clone()))],
+                collocate_with: None,
+                affinity_group: None,
+                valid_from: None,
+                valid_to: None,
+            })).await.unwrap();
+        }
+
+        // Edges: hub -> spoke1, hub -> spoke2 (island is disconnected)
+        for to_id in &["spoke1", "spoke2"] {
+            exec.execute(&Plan::InsertEdge(InsertEdgePlan {
+                edge_type: "related".into(),
+                from_id: "hub".into(),
+                to_id: to_id.to_string(),
+                metadata: vec![],
+                valid_from: None,
+                valid_to: None,
+            })).await.unwrap();
+        }
+
+        // SEARCH WITHIN TRAVERSE: vector closest to spoke1, but only within hub's 1-hop neighbourhood
+        let result = exec.execute(&Plan::Search(SearchPlan {
+            collection: "docs".into(),
+            fields: trondb_tql::FieldList::All,
+            dense_vector: Some(vec![0.9, 0.1, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 5,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: Some("dense".into()),
+            hints: vec![],
+            two_pass: None,
+            within: Some(Box::new(TraverseMatchPlan {
+                from_id: "hub".into(),
+                pattern: MatchPattern {
+                    source_var: "a".into(),
+                    edge: EdgePattern {
+                        variable: Some("e".into()),
+                        edge_type: Some("related".into()),
+                        direction: EdgeDirection::Forward,
+                    },
+                    target_var: "b".into(),
+                },
+                min_depth: 1,
+                max_depth: 1,
+                confidence_threshold: None,
+                temporal: None,
+                limit: None,
+            })),
+        })).await.unwrap();
+
+        // Should find spoke1 and spoke2 but NOT island (even though island has a similar vector)
+        let ids: Vec<String> = result.rows.iter()
+            .filter_map(|r| r.values.get("id").map(|v| v.to_string()))
+            .collect();
+        assert_eq!(ids.len(), 2, "expected 2 results (spoke1 and spoke2), got: {:?}", ids);
+        assert!(ids.contains(&"spoke1".to_string()), "expected spoke1 in results");
+        assert!(ids.contains(&"spoke2".to_string()), "expected spoke2 in results");
+        assert!(!ids.contains(&"island".to_string()), "island must not appear — it is disconnected");
+        // spoke1 should rank first (closest to query vector [0.9, 0.1, 0.0])
+        assert_eq!(ids[0], "spoke1", "spoke1 should rank first (highest cosine similarity to query)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 8: EXPLAIN shows WITHIN subquery info
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn explain_search_within() {
+        let (exec, _dir) = setup_executor().await;
+
+        // Create collection with a dense representation
+        exec.execute(&Plan::CreateCollection(CreateCollectionPlan {
+            name: "items".into(),
+            representations: vec![trondb_tql::RepresentationDecl {
+                name: "dense".into(),
+                model: None,
+                dimensions: Some(3),
+                metric: trondb_tql::Metric::Cosine,
+                sparse: false,
+                fields: vec![],
+            }],
+            fields: vec![],
+            indexes: vec![],
+            vectoriser_config: None,
+        })).await.unwrap();
+
+        // Create edge type
+        exec.execute(&Plan::CreateEdgeType(CreateEdgeTypePlan {
+            name: "link".into(),
+            from_collection: "items".into(),
+            to_collection: "items".into(),
+            decay_config: None,
+            inference_config: None,
+        })).await.unwrap();
+
+        // Build a SearchPlan with a within clause
+        let within_plan = TraverseMatchPlan {
+            from_id: "a".into(),
+            pattern: trondb_tql::MatchPattern {
+                source_var: "a".into(),
+                edge: trondb_tql::EdgePattern {
+                    variable: Some("e".into()),
+                    edge_type: Some("link".into()),
+                    direction: trondb_tql::EdgeDirection::Forward,
+                },
+                target_var: "b".into(),
+            },
+            min_depth: 1,
+            max_depth: 2,
+            confidence_threshold: None,
+            temporal: None,
+            limit: None,
+        };
+
+        let search_plan = Plan::Search(SearchPlan {
+            collection: "items".into(),
+            fields: FieldList::All,
+            dense_vector: Some(vec![1.0, 0.0, 0.0]),
+            sparse_vector: None,
+            filter: None,
+            pre_filter: None,
+            k: 5,
+            confidence_threshold: 0.0,
+            strategy: SearchStrategy::Hnsw,
+            query_text: None,
+            using_repr: Some("dense".into()),
+            hints: vec![],
+            two_pass: None,
+            within: Some(Box::new(within_plan)),
+        });
+
+        let result = exec
+            .execute(&Plan::Explain(Box::new(search_plan)))
+            .await
+            .unwrap();
+
+        // EXPLAIN output must contain a "within" property row
+        let within_row = result.rows.iter().find(|r| {
+            r.values.get("property") == Some(&Value::String("within".into()))
+        });
+        assert!(within_row.is_some(), "EXPLAIN should emit a 'within' property row");
+
+        let value = within_row.unwrap().values.get("value").unwrap();
+        let value_str = format!("{:?}", value);
+        assert!(
+            value_str.contains("TRAVERSE") || value_str.contains("link"),
+            "WITHIN value should mention TRAVERSE or edge type: {value_str}"
+        );
     }
 }

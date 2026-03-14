@@ -921,7 +921,15 @@ impl Parser {
 
     fn parse_traverse_match(&mut self) -> Result<Statement, ParseError> {
         // Already consumed: TRAVERSE
-        // Now: FROM 'id' MATCH (a)-[e:TYPE]->(b) DEPTH min..max [CONFIDENCE > threshold] [LIMIT n];
+        let stmt = self.parse_traverse_match_inner()?;
+        self.expect(&Token::Semicolon)?;
+        Ok(Statement::TraverseMatch(stmt))
+    }
+
+    fn parse_traverse_match_inner(&mut self) -> Result<TraverseMatchStmt, ParseError> {
+        // Caller has already consumed TRAVERSE keyword.
+        // Now: FROM 'id' MATCH (a)-[e:TYPE]->(b) DEPTH min..max [CONFIDENCE > threshold] [LIMIT n]
+        // No trailing semicolon is consumed here.
         self.expect(&Token::From)?;
         let from_id = self.expect_string_lit()?;
         self.expect(&Token::Match)?;
@@ -997,9 +1005,7 @@ impl Parser {
             None
         };
 
-        self.expect(&Token::Semicolon)?;
-
-        Ok(Statement::TraverseMatch(TraverseMatchStmt {
+        Ok(TraverseMatchStmt {
             from_id,
             pattern: MatchPattern {
                 source_var,
@@ -1015,7 +1021,7 @@ impl Parser {
             confidence_threshold,
             temporal,
             limit,
-        }))
+        })
     }
 
     fn parse_kv_list(&mut self) -> Result<Vec<(String, Literal)>, ParseError> {
@@ -1268,6 +1274,18 @@ impl Parser {
             None
         };
 
+        // Optional WITHIN (TRAVERSE ...) clause
+        let within = if self.peek() == Some(&Token::Within) {
+            self.advance(); // consume WITHIN
+            self.expect(&Token::LParen)?;
+            self.expect(&Token::Traverse)?;
+            let traverse_stmt = self.parse_traverse_match_inner()?;
+            self.expect(&Token::RParen)?;
+            Some(Box::new(traverse_stmt))
+        } else {
+            None
+        };
+
         let limit = if self.peek() == Some(&Token::Limit) {
             self.advance();
             Some(self.expect_int()? as usize)
@@ -1287,6 +1305,7 @@ impl Parser {
             query_text,
             using_repr,
             hints,
+            within,
         }))
     }
 
@@ -3382,5 +3401,54 @@ mod tests {
     fn parse_import_case_insensitive() {
         let stmt = parse("import into venues from '/data/venues.jsonl';").unwrap();
         assert!(matches!(stmt, Statement::Import(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // WITHIN (TRAVERSE ...) clause tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_search_within_traverse() {
+        let input = "SEARCH things NEAR VECTOR [1.0, 2.0] USING dense WITHIN (TRAVERSE FROM 'seed1' MATCH (a)-[e:knows]->(b) DEPTH 1..2) LIMIT 5;";
+        let stmt = parse(input).unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert_eq!(s.collection, "things");
+                assert!(s.within.is_some());
+                let within = s.within.unwrap();
+                assert_eq!(within.from_id, "seed1");
+                assert_eq!(within.min_depth, 1);
+                assert_eq!(within.max_depth, 2);
+                assert_eq!(within.pattern.edge.edge_type, Some("knows".to_string()));
+                assert_eq!(s.limit, Some(5));
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_within_and_where() {
+        let input = "SEARCH things WHERE color = 'red' NEAR VECTOR [1.0] USING dense WITHIN (TRAVERSE FROM 'x' MATCH (a)-[e]->(b) DEPTH 1..3) LIMIT 10;";
+        let stmt = parse(input).unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert!(s.filter.is_some());
+                assert!(s.within.is_some());
+                assert_eq!(s.limit, Some(10));
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn parse_search_without_within() {
+        let input = "SEARCH things NEAR VECTOR [1.0] USING dense LIMIT 5;";
+        let stmt = parse(input).unwrap();
+        match stmt {
+            Statement::Search(s) => {
+                assert!(s.within.is_none());
+            }
+            _ => panic!("expected Search"),
+        }
     }
 }

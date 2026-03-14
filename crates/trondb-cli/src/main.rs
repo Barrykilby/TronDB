@@ -14,11 +14,131 @@ use trondb_routing::sweeper::DecaySweeper;
 use trondb_routing::RouterConfig;
 use trondb_wal::WalConfig;
 
+/// Parse a `--flag value` pair from CLI args.
+fn arg_value(flag: &str) -> Option<String> {
+    std::env::args()
+        .skip_while(|a| a != flag)
+        .nth(1)
+}
+
 #[tokio::main]
 async fn main() {
-    let data_dir = std::env::args()
-        .skip_while(|a| a != "--data-dir")
-        .nth(1)
+    let remote = arg_value("--remote");
+
+    if let Some(addr) = remote {
+        run_remote(&addr).await;
+    } else {
+        run_local().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote mode: connect to a TronDB server via gRPC ExecuteTql
+// ---------------------------------------------------------------------------
+
+async fn run_remote(addr: &str) {
+    let endpoint = if addr.starts_with("http") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    };
+
+    println!("TronDB v0.2.0 — inference-first storage engine");
+    println!("Connected to: {endpoint}");
+    println!("Type .help for commands, or enter TQL statements ending with ;\n");
+
+    let mut client = match trondb_proto::pb::tron_node_client::TronNodeClient::connect(
+        endpoint.clone(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to connect to {endpoint}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut rl = DefaultEditor::new().expect("failed to create editor");
+    let mut buffer = String::new();
+
+    loop {
+        let prompt = if buffer.is_empty() {
+            "trondb> "
+        } else {
+            "   ...> "
+        };
+
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let trimmed = line.trim();
+
+                if buffer.is_empty() && trimmed.starts_with('.') {
+                    handle_dot_command_remote(trimmed);
+                    continue;
+                }
+
+                buffer.push_str(trimmed);
+                buffer.push(' ');
+
+                if !buffer.trim_end().ends_with(';') {
+                    continue;
+                }
+
+                let input = buffer.trim().to_string();
+                buffer.clear();
+
+                let _ = rl.add_history_entry(&input);
+
+                let request = trondb_proto::pb::TqlRequest { tql: input };
+                match client.execute_tql(request).await {
+                    Ok(response) => {
+                        let resp = response.into_inner();
+                        println!("{}", display::format_grpc_response(&resp));
+                    }
+                    Err(e) => eprintln!("Error: {e}"),
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                buffer.clear();
+                println!("(statement cleared)");
+            }
+            Err(ReadlineError::Eof) => {
+                println!("Goodbye.");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                break;
+            }
+        }
+    }
+}
+
+fn handle_dot_command_remote(cmd: &str) {
+    match cmd {
+        ".help" => {
+            println!("Commands:");
+            println!("  .help          Show this help");
+            println!("  .quit          Exit TronDB");
+            println!();
+            println!("TQL statements must end with a semicolon (;)");
+            println!("(remote mode — .collections and .data not available)");
+        }
+        ".quit" | ".exit" => {
+            println!("Goodbye.");
+            std::process::exit(0);
+        }
+        _ => eprintln!("Unknown command: {cmd}. Type .help for available commands."),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local mode: open a local engine (original behavior)
+// ---------------------------------------------------------------------------
+
+async fn run_local() {
+    let data_dir = arg_value("--data-dir")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./trondb_data"));
 

@@ -9,6 +9,9 @@ service TronNode {
     // Execute a plan and return results
     rpc Execute(PlanRequest) returns (QueryResponse);
 
+    // Execute raw TQL text (parse + plan + execute server-side)
+    rpc ExecuteTql(TqlRequest) returns (QueryResponse);
+
     // Pull health snapshot on demand
     rpc HealthSnapshot(Empty) returns (HealthSignalResponse);
 
@@ -23,6 +26,10 @@ service TronNode {
 }
 
 message Empty {}
+
+message TqlRequest {
+    string tql = 1;
+}
 
 // ---------------------------------------------------------------------------
 // Plan types (maps to trondb_core::planner::Plan, 16 variants)
@@ -152,6 +159,7 @@ message SearchPlan {
     optional string using_repr = 13;
     repeated string hints = 14;
     optional TwoPassConfigProto two_pass = 15;
+    optional TraverseMatchPlanProto within = 16;
 }
 
 message ExplainPlan {
