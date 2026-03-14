@@ -237,6 +237,20 @@ impl TronNode for TronNodeService {
         Ok(Response::new(proto_result))
     }
 
+    async fn execute_tql(
+        &self,
+        request: Request<pb::TqlRequest>,
+    ) -> Result<Response<pb::QueryResponse>, Status> {
+        let engine = self.engine_ref()?;
+        let tql = request.into_inner().tql;
+        let result = engine
+            .execute_tql(&tql)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let proto_result: pb::QueryResponse = (&result).into();
+        Ok(Response::new(proto_result))
+    }
+
     async fn health_snapshot(
         &self,
         _request: Request<pb::Empty>,

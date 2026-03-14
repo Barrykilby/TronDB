@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 trondb-core = { path = "../trondb-core" }
+trondb-proto = { path = "../trondb-proto" }
 trondb-routing = { path = "../trondb-routing" }
 trondb-tql = { path = "../trondb-tql" }
 trondb-wal = { path = "../trondb-wal" }
@@ -16,3 +17,4 @@ trondb-vectoriser = { path = "../trondb-vectoriser" }
 comfy-table.workspace = true
 rustyline.workspace = true
 tokio.workspace = true
+tonic.workspace = true
