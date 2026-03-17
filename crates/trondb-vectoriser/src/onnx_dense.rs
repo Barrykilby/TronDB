@@ -59,11 +59,18 @@ impl OnnxDenseVectoriser {
         let mask_tensor = TensorRef::from_array_view(([1, seq_len], &*attention_mask))
             .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
 
+        // Always provide token_type_ids (zeros) — required by models like BGE,
+        // harmless for models that don't use it (ort ignores unused inputs)
+        let token_type_ids: Vec<i64> = vec![0i64; seq_len];
+        let type_tensor = TensorRef::from_array_view(([1, seq_len], &*token_type_ids))
+            .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
+
         let mut session = self.session.lock()
             .map_err(|e| VectoriserError::EncodeFailed(format!("session lock poisoned: {e}")))?;
         let outputs = session.run(ort::inputs![
             "input_ids" => id_tensor,
             "attention_mask" => mask_tensor,
+            "token_type_ids" => type_tensor,
         ]).map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
 
         let (shape, data) = outputs[0].try_extract_tensor::<f32>()
