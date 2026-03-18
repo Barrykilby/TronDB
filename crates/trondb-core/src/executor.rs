@@ -43,6 +43,21 @@ enum SchemaAlterOp {
 }
 
 // ---------------------------------------------------------------------------
+// Collection lifecycle hook — allows the server layer to register/deregister
+// vectorisers when collections are created or dropped, without trondb-core
+// depending on trondb-vectoriser.
+// ---------------------------------------------------------------------------
+
+/// Event fired after a collection is created or dropped.
+pub enum CollectionEvent<'a> {
+    Created(&'a CollectionSchema),
+    Dropped(&'a str),
+}
+
+/// Callback type for collection lifecycle events.
+pub type CollectionHook = Box<dyn Fn(CollectionEvent<'_>) + Send + Sync>;
+
+// ---------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------
 
@@ -71,6 +86,8 @@ pub struct Executor {
     slow_log: Arc<crate::slow_log::SlowQueryLog>,
     /// Base directory for path validation (BACKUP/RESTORE/IMPORT)
     data_dir: PathBuf,
+    /// Optional hook called after collection create/drop (set by server layer)
+    collection_hook: std::sync::Mutex<Option<CollectionHook>>,
 }
 
 impl Executor {
@@ -112,6 +129,7 @@ impl Executor {
                 crate::slow_log::SlowQueryConfig::default(),
             )),
             data_dir,
+            collection_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -133,7 +151,9 @@ impl Executor {
                         self.store.create_collection_schema(&schema)?;
                         replayed += 1;
                     }
-                    self.schemas.insert(schema.name.clone(), schema);
+                    self.schemas.insert(schema.name.clone(), schema.clone());
+                    // Fire hook so replica registers vectorisers for streamed collections
+                    self.fire_collection_hook(CollectionEvent::Created(&schema));
                 }
                 RecordType::EntityWrite => {
                     let entity: Entity = rmp_serde::from_slice(&record.payload)
@@ -236,6 +256,8 @@ impl Executor {
                             true
                         }
                     });
+                    // Fire hook so replica deregisters vectorisers for dropped collections
+                    self.fire_collection_hook(CollectionEvent::Dropped(&coll_name));
                 }
                 RecordType::SchemaDropEdgeType => {
                     let et_name: String = rmp_serde::from_slice(&record.payload)
@@ -496,6 +518,9 @@ impl Executor {
                     let fidx_key = format!("{}:{}", schema.name, idx.name);
                     self.field_indexes.insert(fidx_key, FieldIndex::new(partition, field_types));
                 }
+
+                // Fire collection hook so the server layer can register vectorisers
+                self.fire_collection_hook(CollectionEvent::Created(&schema));
 
                 Ok(QueryResult {
                     columns: vec!["result".into()],
@@ -2249,6 +2274,9 @@ impl Executor {
                 // Step 8: Remove from schemas
                 self.schemas.remove(&p.name);
 
+                // Step 9: Fire collection hook to deregister vectorisers
+                self.fire_collection_hook(CollectionEvent::Dropped(&p.name));
+
                 Ok(QueryResult {
                     columns: vec!["result".into()],
                     rows: vec![Row {
@@ -3050,6 +3078,21 @@ impl Executor {
 
     pub fn vectoriser_registry(&self) -> &Arc<VectoriserRegistry> {
         &self.vectoriser_registry
+    }
+
+    /// Set a hook that fires after CreateCollection / DropCollection.
+    /// The server layer uses this to register/deregister vectorisers.
+    pub fn set_collection_hook(&self, hook: CollectionHook) {
+        *self.collection_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Fire the collection lifecycle hook (if set).
+    fn fire_collection_hook(&self, event: CollectionEvent<'_>) {
+        if let Ok(guard) = self.collection_hook.lock() {
+            if let Some(ref hook) = *guard {
+                hook(event);
+            }
+        }
     }
 
     pub fn list_edge_types(&self) -> Vec<EdgeType> {

@@ -448,6 +448,13 @@ impl Engine {
         &self.vectoriser_registry
     }
 
+    /// Set a hook that fires after CreateCollection / DropCollection.
+    /// The server layer uses this to register/deregister vectorisers
+    /// without trondb-core depending on trondb-vectoriser.
+    pub fn set_collection_hook(&self, hook: executor::CollectionHook) {
+        self.executor.set_collection_hook(hook);
+    }
+
     pub fn inference_audit(&self) -> &InferenceAuditBuffer {
         &self.inference_audit
     }

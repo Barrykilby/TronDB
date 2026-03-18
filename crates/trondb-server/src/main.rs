@@ -301,23 +301,50 @@ fn start_metrics_server(engine: Arc<trondb_core::Engine>, port: u16) -> JoinHand
     })
 }
 
-/// Register vectorisers for all existing collections that have a `VectoriserConfig`.
+/// Register vectorisers for all existing collections that have a `VectoriserConfig`,
+/// and install a collection lifecycle hook so that runtime CreateCollection /
+/// DropCollection also register/deregister vectorisers automatically.
 ///
 /// Called during startup (before `Arc::new(engine)`) so that the engine can
 /// auto-vectorise inserts and handle SEARCH NEAR 'text' queries immediately.
 fn register_vectorisers(engine: &trondb_core::Engine) {
+    // 1. Register vectorisers for collections that already exist on disk.
     for schema in engine.schemas() {
-        if let Some(ref vc) = schema.vectoriser_config {
-            for repr in &schema.representations {
-                if !repr.fields.is_empty() {
-                    match trondb_vectoriser::create_vectoriser_from_config(vc, repr) {
-                        Ok(v) => engine.vectoriser_registry().register(&schema.name, &repr.name, v),
-                        Err(e) => tracing::warn!(
-                            collection = %schema.name,
-                            repr = %repr.name,
-                            "could not create vectoriser: {e}",
-                        ),
-                    }
+        register_vectorisers_for_schema(engine.vectoriser_registry(), &schema);
+    }
+
+    // 2. Install a hook so that CreateCollection / DropCollection at runtime
+    //    also register/deregister vectorisers — regardless of calling path
+    //    (gRPC, execute_tql, CLI, replica WAL replay).
+    let registry = std::sync::Arc::clone(engine.vectoriser_registry());
+    engine.set_collection_hook(Box::new(move |event| {
+        use trondb_core::executor::CollectionEvent;
+        match event {
+            CollectionEvent::Created(schema) => {
+                register_vectorisers_for_schema(&registry, schema);
+            }
+            CollectionEvent::Dropped(name) => {
+                registry.remove_collection(name);
+            }
+        }
+    }));
+}
+
+/// Register vectorisers for every managed representation in a single schema.
+fn register_vectorisers_for_schema(
+    registry: &trondb_core::vectoriser::VectoriserRegistry,
+    schema: &trondb_core::types::CollectionSchema,
+) {
+    if let Some(ref vc) = schema.vectoriser_config {
+        for repr in &schema.representations {
+            if !repr.fields.is_empty() {
+                match trondb_vectoriser::create_vectoriser_from_config(vc, repr) {
+                    Ok(v) => registry.register(&schema.name, &repr.name, v),
+                    Err(e) => tracing::warn!(
+                        collection = %schema.name,
+                        repr = %repr.name,
+                        "could not create vectoriser: {e}",
+                    ),
                 }
             }
         }

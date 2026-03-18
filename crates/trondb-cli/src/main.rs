@@ -163,22 +163,9 @@ async fn run_local() {
             std::process::exit(1);
         }
     };
-    // Register vectorisers for existing collections that have a VectoriserConfig
-    for schema in engine.schemas() {
-        if let Some(ref vc) = schema.vectoriser_config {
-            for repr in &schema.representations {
-                if !repr.fields.is_empty() {
-                    match trondb_vectoriser::create_vectoriser_from_config(vc, repr) {
-                        Ok(v) => engine.vectoriser_registry().register(&schema.name, &repr.name, v),
-                        Err(e) => eprintln!(
-                            "warning: could not create vectoriser for {}.{}: {e}",
-                            schema.name, repr.name
-                        ),
-                    }
-                }
-            }
-        }
-    }
+    // Register vectorisers for existing collections and install a hook so
+    // runtime CreateCollection / DropCollection also register/deregister vectorisers.
+    register_vectorisers(&engine);
 
     let engine = Arc::new(engine);
 
@@ -284,5 +271,46 @@ fn handle_dot_command(cmd: &str, engine: &Engine, data_dir: &std::path::Path) {
             std::process::exit(0);
         }
         _ => eprintln!("Unknown command: {cmd}. Type .help for available commands."),
+    }
+}
+
+/// Register vectorisers for all existing collections and install a lifecycle
+/// hook so that runtime CreateCollection / DropCollection also
+/// register/deregister vectorisers automatically.
+fn register_vectorisers(engine: &Engine) {
+    for schema in engine.schemas() {
+        register_vectorisers_for_schema(engine.vectoriser_registry(), &schema);
+    }
+
+    let registry = Arc::clone(engine.vectoriser_registry());
+    engine.set_collection_hook(Box::new(move |event| {
+        use trondb_core::executor::CollectionEvent;
+        match event {
+            CollectionEvent::Created(schema) => {
+                register_vectorisers_for_schema(&registry, schema);
+            }
+            CollectionEvent::Dropped(name) => {
+                registry.remove_collection(name);
+            }
+        }
+    }));
+}
+
+fn register_vectorisers_for_schema(
+    registry: &trondb_core::vectoriser::VectoriserRegistry,
+    schema: &trondb_core::types::CollectionSchema,
+) {
+    if let Some(ref vc) = schema.vectoriser_config {
+        for repr in &schema.representations {
+            if !repr.fields.is_empty() {
+                match trondb_vectoriser::create_vectoriser_from_config(vc, repr) {
+                    Ok(v) => registry.register(&schema.name, &repr.name, v),
+                    Err(e) => eprintln!(
+                        "warning: could not create vectoriser for {}.{}: {e}",
+                        schema.name, repr.name,
+                    ),
+                }
+            }
+        }
     }
 }
