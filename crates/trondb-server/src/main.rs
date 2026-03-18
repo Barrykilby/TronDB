@@ -358,10 +358,28 @@ fn register_vectorisers_for_schema(
     schema: &trondb_core::types::CollectionSchema,
 ) {
     let coll_config = schema.vectoriser_config.as_ref();
+    tracing::info!(
+        collection = %schema.name,
+        coll_vectoriser = coll_config.is_some(),
+        repr_count = schema.representations.len(),
+        "checking collection for vectoriser registration"
+    );
     for repr in &schema.representations {
+        tracing::info!(
+            collection = %schema.name,
+            repr = %repr.name,
+            sparse = repr.sparse,
+            fields_count = repr.fields.len(),
+            has_repr_vectoriser = repr.vectoriser.is_some(),
+            has_coll_vectoriser = coll_config.is_some(),
+            "checking representation"
+        );
         if !repr.fields.is_empty() && (repr.vectoriser.is_some() || coll_config.is_some()) {
             match trondb_vectoriser::create_vectoriser_from_config(repr.vectoriser.as_ref(), coll_config, repr) {
-                Ok(v) => registry.register(&schema.name, &repr.name, v),
+                Ok(v) => {
+                    tracing::info!(collection = %schema.name, repr = %repr.name, "vectoriser registered");
+                    registry.register(&schema.name, &repr.name, v);
+                }
                 Err(e) => tracing::warn!(
                     collection = %schema.name,
                     repr = %repr.name,

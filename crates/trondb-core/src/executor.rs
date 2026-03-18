@@ -1208,6 +1208,12 @@ impl Executor {
                         let schema = self.schemas.get(&p.collection)
                             .ok_or_else(|| EngineError::CollectionNotFound(p.collection.clone()))?;
 
+                        // Determine repr: prefer explicit USING, else first managed repr (dense preferred)
+                        let is_sparse_repr = p.using_repr.as_deref()
+                            .and_then(|name| schema.representations.iter().find(|r| r.name == name))
+                            .map(|r| r.sparse)
+                            .unwrap_or(false);
+
                         let repr_name = p.using_repr.as_deref()
                             .or_else(|| {
                                 schema.representations.iter()
@@ -1215,7 +1221,7 @@ impl Executor {
                                     .map(|r| r.name.as_str())
                             })
                             .ok_or_else(|| EngineError::InvalidQuery(
-                                "no managed dense representation found for natural language SEARCH".into(),
+                                "no managed representation found for natural language SEARCH".into(),
                             ))?
                             .to_string();
 
@@ -1232,31 +1238,52 @@ impl Executor {
                         let query_vector = vectoriser.encode_query(query_text).await
                             .map_err(|e| EngineError::Storage(format!("encode_query failed: {e}")))?;
 
-                        let query_f32 = match query_vector {
-                            VectorData::Dense(v) => v,
-                            _ => return Err(EngineError::InvalidQuery(
-                                "natural language SEARCH requires a dense vectoriser".into(),
-                            )),
-                        };
-
-                        let hnsw_key = format!("{}:{}", p.collection, repr_name);
-                        let hnsw = self.indexes.get(&hnsw_key)
-                            .ok_or_else(|| EngineError::InvalidQuery(format!(
-                                "no HNSW index for {}", hnsw_key
-                            )))?;
-
-                        let mut raw = if let Some(ref tp) = p.two_pass {
-                            let first_pass = hnsw.search(&query_f32, tp.first_pass_k);
-                            let mut rescored = first_pass;
-                            rescored.truncate(p.k);
-                            rescored
+                        if is_sparse_repr {
+                            // Sparse path: encode → search sparse index
+                            let sparse_pairs = match query_vector {
+                                VectorData::Sparse(v) => v,
+                                _ => return Err(EngineError::InvalidQuery(
+                                    "sparse representation vectoriser returned non-sparse data".into(),
+                                )),
+                            };
+                            let sparse_key = format!("{}:{}", p.collection, repr_name);
+                            let sparse_idx = self.sparse_indexes.get(&sparse_key)
+                                .ok_or_else(|| EngineError::InvalidQuery(format!(
+                                    "no sparse index for {}", sparse_key
+                                )))?;
+                            let mut raw = sparse_idx.search(&sparse_pairs, fetch_k);
+                            if p.confidence_threshold > 0.0 {
+                                raw.retain(|(_, score)| (*score as f64) >= p.confidence_threshold);
+                            }
+                            raw
                         } else {
-                            hnsw.search(&query_f32, fetch_k)
-                        };
-                        if p.confidence_threshold > 0.0 {
-                            raw.retain(|(_, score)| (*score as f64) >= p.confidence_threshold);
+                            // Dense path: encode → HNSW search
+                            let query_f32 = match query_vector {
+                                VectorData::Dense(v) => v,
+                                _ => return Err(EngineError::InvalidQuery(
+                                    "dense representation vectoriser returned non-dense data".into(),
+                                )),
+                            };
+
+                            let hnsw_key = format!("{}:{}", p.collection, repr_name);
+                            let hnsw = self.indexes.get(&hnsw_key)
+                                .ok_or_else(|| EngineError::InvalidQuery(format!(
+                                    "no HNSW index for {}", hnsw_key
+                                )))?;
+
+                            let mut raw = if let Some(ref tp) = p.two_pass {
+                                let first_pass = hnsw.search(&query_f32, tp.first_pass_k);
+                                let mut rescored = first_pass;
+                                rescored.truncate(p.k);
+                                rescored
+                            } else {
+                                hnsw.search(&query_f32, fetch_k)
+                            };
+                            if p.confidence_threshold > 0.0 {
+                                raw.retain(|(_, score)| (*score as f64) >= p.confidence_threshold);
+                            }
+                            raw
                         }
-                        raw
                     }
                 };
 
