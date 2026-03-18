@@ -378,6 +378,14 @@ impl Executor {
                                         model_version: String::new(),
                                         vectoriser: None,
                                     });
+                                    // Create in-memory index
+                                    if *sparse {
+                                        let sparse_key = format!("{}:{}", payload.collection, name);
+                                        self.sparse_indexes.entry(sparse_key).or_insert_with(SparseIndex::new);
+                                    } else if let Some(dims) = dimensions {
+                                        let hnsw_key = format!("{}:{}", payload.collection, name);
+                                        self.indexes.entry(hnsw_key).or_insert_with(|| HnswIndex::new(*dims));
+                                    }
                                     self.store.update_collection_schema(&schema)?;
                                     self.schemas.insert(payload.collection.clone(), schema);
                                 }
@@ -3058,6 +3066,15 @@ impl Executor {
                         });
                         fire_schema_altered = true;
 
+                        // Create the in-memory index for the new representation
+                        if *sparse {
+                            let sparse_key = format!("{}:{}", p.collection, name);
+                            self.sparse_indexes.insert(sparse_key, SparseIndex::new());
+                        } else if let Some(dims) = dimensions {
+                            let hnsw_key = format!("{}:{}", p.collection, name);
+                            self.indexes.insert(hnsw_key, HnswIndex::new(*dims));
+                        }
+
                         // If the new repr has FIELDS, create Dirty location entries for all existing entities
                         // so the background recompute loop generates vectors for them.
                         if !fields.is_empty() {
@@ -3646,11 +3663,23 @@ impl Executor {
                 // WAL + Fjall + index updates for each entity
                 for ((repr_key, entity), vector_data) in chunk.iter().zip(vectors.into_iter()) {
                     let mut updated = entity.clone();
-                    if *repr_idx < updated.representations.len() {
-                        updated.representations[*repr_idx].vector = vector_data;
-                        updated.representations[*repr_idx].state = ReprState::Clean;
-                        updated.representations[*repr_idx].recipe_hash = recipe_hash;
+                    // Extend representations Vec if needed (entity predates this repr)
+                    while updated.representations.len() <= *repr_idx {
+                        updated.representations.push(crate::types::Representation {
+                            name: String::new(),
+                            repr_type: crate::types::ReprType::Atomic,
+                            fields: Vec::new(),
+                            vector: VectorData::Dense(Vec::new()),
+                            state: ReprState::Dirty,
+                            recipe_hash: [0u8; 32],
+                            computed_at: 0,
+                            model_version: String::new(),
+                        });
                     }
+                    updated.representations[*repr_idx].name = stored_repr.name.clone();
+                    updated.representations[*repr_idx].vector = vector_data;
+                    updated.representations[*repr_idx].state = ReprState::Clean;
+                    updated.representations[*repr_idx].recipe_hash = recipe_hash;
 
                     let tx_id = self.wal.next_tx_id();
                     self.wal.append(RecordType::TxBegin, collection, tx_id, 1, vec![]);
