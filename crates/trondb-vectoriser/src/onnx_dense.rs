@@ -45,7 +45,7 @@ impl OnnxDenseVectoriser {
                 .and_then(|mut b| b.commit_from_file(model_path).map_err(|e| e.to_string()))
             {
                 Ok(s) => {
-                    tracing::info!(model = model_id, "ONNX dense vectoriser using CUDA");
+                    tracing::info!(model = model_id, "ONNX dense vectoriser loaded");
                     s
                 }
                 Err(e) => {
@@ -85,8 +85,13 @@ impl OnnxDenseVectoriser {
         let encoding = self.tokenizer.encode(text, true)
             .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
 
-        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let attention_mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
+        // Truncate to model's max sequence length (512 for BGE/MiniLM models)
+        let max_len = 512;
+        let ids = encoding.get_ids();
+        let mask = encoding.get_attention_mask();
+        let len = ids.len().min(max_len);
+        let input_ids: Vec<i64> = ids[..len].iter().map(|&id| id as i64).collect();
+        let attention_mask: Vec<i64> = mask[..len].iter().map(|&m| m as i64).collect();
         let seq_len = input_ids.len();
 
         let id_tensor = TensorRef::from_array_view(([1, seq_len], &*input_ids))

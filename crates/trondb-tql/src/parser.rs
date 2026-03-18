@@ -228,7 +228,7 @@ impl Parser {
                                 // ALTER COLLECTION name ADD REPRESENTATION name DIMENSIONS n METRIC m [SPARSE true] [FIELDS (f1, f2)];
                                 self.advance(); // ADD
                                 self.expect(&Token::Representation)?;
-                                let name = self.expect_ident()?;
+                                let name = self.expect_name()?;
                                 // Parse optional DIMENSIONS
                                 let dimensions = if self.peek() == Some(&Token::Dimensions) {
                                     self.advance();
@@ -246,8 +246,11 @@ impl Parser {
                                 // Parse optional SPARSE
                                 let sparse = if self.peek() == Some(&Token::Sparse) {
                                     self.advance();
-                                    let val = self.expect_ident()?;
-                                    val.to_lowercase() == "true"
+                                    match self.peek() {
+                                        Some(Token::True) => { self.advance(); true }
+                                        Some(Token::False) => { self.advance(); false }
+                                        _ => return Err(ParseError::InvalidSyntax("expected true or false after SPARSE".into())),
+                                    }
                                 } else {
                                     false
                                 };
