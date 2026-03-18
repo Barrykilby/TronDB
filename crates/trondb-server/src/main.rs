@@ -103,7 +103,9 @@ async fn start_primary(config: config::ClusterConfig) -> Result<(), Box<dyn std:
     let engine_shutdown = engine.clone();
     tonic::transport::Server::builder()
         .add_service(health_service)
-        .add_service(pb::tron_node_server::TronNodeServer::new(service))
+        .add_service(pb::tron_node_server::TronNodeServer::new(service)
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024))
         .serve_with_shutdown(addr, async move {
             shutdown_signal().await;
             tracing::info!("graceful shutdown starting");
@@ -219,7 +221,9 @@ async fn start_replica(config: config::ClusterConfig) -> Result<(), Box<dyn std:
     let engine_shutdown = engine.clone();
     tonic::transport::Server::builder()
         .add_service(health_service)
-        .add_service(pb::tron_node_server::TronNodeServer::new(service))
+        .add_service(pb::tron_node_server::TronNodeServer::new(service)
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024))
         .serve_with_shutdown(addr, async move {
             shutdown_signal().await;
             tracing::info!("replica graceful shutdown starting");
@@ -274,7 +278,9 @@ async fn start_router(config: config::ClusterConfig) -> Result<(), Box<dyn std::
 
     tonic::transport::Server::builder()
         .add_service(health_service)
-        .add_service(pb::tron_node_server::TronNodeServer::new(service))
+        .add_service(pb::tron_node_server::TronNodeServer::new(service)
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024))
         .serve_with_shutdown(addr, async move {
             shutdown_signal().await;
             tracing::info!("router shutdown complete");
