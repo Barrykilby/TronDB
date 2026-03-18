@@ -76,6 +76,19 @@ async fn start_primary(config: config::ClusterConfig) -> Result<(), Box<dyn std:
     // Spawn Prometheus metrics endpoint on port 9401
     background_handles.push(start_metrics_server(engine.clone(), 9401));
 
+    // Background recompute_dirty loop — processes entities marked Dirty by ALTER REPRESENTATION SET FIELDS
+    let recompute_engine = engine.clone();
+    background_handles.push(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            match recompute_engine.trigger_cascade_recompute().await {
+                Ok(0) => {} // nothing to do
+                Ok(n) => tracing::info!(recomputed = n, "recompute_dirty processed entities"),
+                Err(e) => tracing::warn!(error = %e, "recompute_dirty failed"),
+            }
+        }
+    }));
+
     let service = service::TronNodeService::new(engine.clone(), config.role);
     let addr = config.bind_addr.parse()?;
 
