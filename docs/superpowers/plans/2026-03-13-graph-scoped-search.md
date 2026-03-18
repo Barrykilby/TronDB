@@ -847,7 +847,7 @@ git commit -m "test: end-to-end SEARCH WITHIN TRAVERSE integration test"
 
 **Files:**
 - Modify: `CLAUDE.md` (add Phase 16 section)
-- Modify: `tools/johnny_benchmark.py` (add Scenario 4 TronDB path)
+- Modify: `tools/benchmark.py` (add Scenario 4 TronDB path)
 
 - [ ] **Step 1: Add Phase 16 to CLAUDE.md**
 
@@ -870,12 +870,12 @@ Add after the Phase 15 section:
 
 - [ ] **Step 2: Update benchmark Scenario 4**
 
-In `tools/johnny_benchmark.py`, in `cmd_bench_retrieval()`, update Scenario 4 to include TronDB timing now that WITHIN is available. Add a TronDB query using the new syntax and compare latency.
+In `tools/benchmark.py`, in `cmd_bench_retrieval()`, update Scenario 4 to include TronDB timing now that WITHIN is available. Add a TronDB query using the new syntax and compare latency.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add CLAUDE.md tools/johnny_benchmark.py
+git add CLAUDE.md tools/benchmark.py
 git commit -m "docs: add Phase 16 to CLAUDE.md, update benchmark for WITHIN"
 ```
 
@@ -889,7 +889,7 @@ CARGO_TARGET_DIR=/tmp/trondb-target cargo build -p trondb-cli
 - [ ] **Step 5: Run the benchmark**
 
 ```bash
-python3 tools/johnny_benchmark.py bench-retrieval
+python3 tools/benchmark.py bench-retrieval
 ```
 
 Verify Scenario 4 now shows TronDB times alongside DuckDB.

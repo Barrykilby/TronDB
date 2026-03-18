@@ -2310,4 +2310,4 @@ Chunk 9: CLAUDE.md + integration test                          (depends on all)
 
 **Plan saved to:** `docs/superpowers/plans/2026-03-13-phase-13-planner-cost-model.md`
 
-**Next step:** Annotate this plan with `> BARRY:` inline notes, then reply to approve implementation.
+**Next step:** Annotate this plan with `

@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-13
 **Status:** Draft
-**Motivation:** Benchmark of Johnny's 23K memory cards + 326K edges on TronDB showed that DuckDB can combine recursive CTE graph traversal with cosine similarity ranking in a single SQL query (~26ms). TronDB cannot — it requires multiple gRPC round-trips and client-side stitching. This is the critical retrieval pattern for a memory system: "within this topic neighbourhood, what's most relevant to my question?"
+**Motivation:** Benchmark of the reference application's 23K memory cards + 326K edges on TronDB showed that DuckDB can combine recursive CTE graph traversal with cosine similarity ranking in a single SQL query (~26ms). TronDB cannot — it requires multiple gRPC round-trips and client-side stitching. This is the critical retrieval pattern for a memory system: "within this topic neighbourhood, what's most relevant to my question?"
 
 ## Problem Statement
 
@@ -271,7 +271,7 @@ No changes needed. The existing `format_result()` and `format_grpc_response()` f
 
 11. **End-to-end gRPC:** Execute SEARCH WITHIN via ExecuteTql RPC, verify correct results
 12. **EXPLAIN output:** Verify WITHIN subquery shown in explain output
-13. **Benchmark regression:** Run Scenario 4 from johnny_benchmark.py, verify TronDB can now answer it
+13. **Benchmark regression:** Run Scenario 4 from benchmark.py, verify TronDB can now answer it
 
 ### Edge cases
 
@@ -297,4 +297,4 @@ No changes needed. The existing `format_result()` and `format_grpc_response()` f
 - General CTE/subquery syntax — wait for demand
 - `SEARCH ... WITHIN (SEARCH ...)` — vector-scoped vector search, unclear use case
 - New Plan variant — extends existing SearchPlan, no Composed/Pipeline plan type
-- Multi-node scatter-gather with WITHIN — in a distributed deployment, the TRAVERSE sub-plan runs on the local node's AdjacencyIndex which may not have edges for entities on other nodes. Distributed graph-scoped search would require scatter-gather of the TRAVERSE step, which is a separate feature. Single-node deployments (including the current Johnny benchmark setup) are unaffected.
+- Multi-node scatter-gather with WITHIN — in a distributed deployment, the TRAVERSE sub-plan runs on the local node's AdjacencyIndex which may not have edges for entities on other nodes. Distributed graph-scoped search would require scatter-gather of the TRAVERSE step, which is a separate feature. Single-node deployments (including the current the reference application benchmark setup) are unaffected.
