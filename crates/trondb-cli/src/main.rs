@@ -52,7 +52,9 @@ async fn run_remote(addr: &str) {
     )
     .await
     {
-        Ok(c) => c,
+        Ok(c) => c
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024),
         Err(e) => {
             eprintln!("Failed to connect to {endpoint}: {e}");
             std::process::exit(1);
