@@ -3703,6 +3703,8 @@ impl Executor {
                                 let sparse_key = format!("{}:{}", collection, repr.name);
                                 if let Some(sparse_idx) = self.sparse_indexes.get(&sparse_key) {
                                     sparse_idx.insert(&repr_key.entity_id, pairs);
+                                } else {
+                                    tracing::warn!(key = %sparse_key, "sparse index not found for recompute insert");
                                 }
                             }
                             _ => {}
