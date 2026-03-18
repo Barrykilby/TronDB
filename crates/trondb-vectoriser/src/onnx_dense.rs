@@ -167,6 +167,98 @@ impl Vectoriser for OnnxDenseVectoriser {
         Ok(VectorData::Dense(self.encode_text(&text)?))
     }
 
+    async fn encode_batch(&self, batch: &[FieldSet]) -> Result<Vec<VectorData>, VectoriserError> {
+        if batch.is_empty() { return Ok(Vec::new()); }
+
+        let max_len = 512;
+
+        // Tokenize all texts
+        let texts: Vec<String> = batch.iter().map(|fields| {
+            let mut pairs: Vec<_> = fields.iter().collect();
+            pairs.sort_by_key(|(k, _)| (*k).clone());
+            pairs.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(". ")
+        }).collect();
+
+        let encodings: Vec<_> = texts.iter().map(|t| {
+            self.tokenizer.encode(t.as_str(), true)
+                .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))
+        }).collect::<Result<Vec<_>, _>>()?;
+
+        // Find max sequence length in batch (capped at 512)
+        let max_seq = encodings.iter().map(|e| e.get_ids().len().min(max_len)).max().unwrap_or(1);
+        let batch_size = encodings.len();
+
+        // Pad all sequences to max_seq and flatten into [batch_size * max_seq]
+        let mut all_ids = vec![0i64; batch_size * max_seq];
+        let mut all_mask = vec![0i64; batch_size * max_seq];
+        let mut all_types = vec![0i64; batch_size * max_seq];
+
+        for (i, enc) in encodings.iter().enumerate() {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let len = ids.len().min(max_len);
+            for j in 0..len {
+                all_ids[i * max_seq + j] = ids[j] as i64;
+                all_mask[i * max_seq + j] = mask[j] as i64;
+            }
+        }
+
+        let id_tensor = TensorRef::from_array_view(([batch_size, max_seq], &*all_ids))
+            .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
+        let mask_tensor = TensorRef::from_array_view(([batch_size, max_seq], &*all_mask))
+            .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
+        let type_tensor = TensorRef::from_array_view(([batch_size, max_seq], &*all_types))
+            .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
+
+        let mut session = self.session.lock()
+            .map_err(|e| VectoriserError::EncodeFailed(format!("session lock poisoned: {e}")))?;
+        let outputs = session.run(ort::inputs![
+            "input_ids" => id_tensor,
+            "attention_mask" => mask_tensor,
+            "token_type_ids" => type_tensor,
+        ]).map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
+
+        let (shape, data) = outputs[0].try_extract_tensor::<f32>()
+            .map_err(|e| VectoriserError::EncodeFailed(e.to_string()))?;
+        let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+
+        // Extract per-entity vectors from batch output
+        let mut results = Vec::with_capacity(batch_size);
+        if dims.len() == 3 {
+            // (batch, seq_len, hidden_dim) — mean pool per entity using attention mask
+            let seq = dims[1];
+            let hidden = dims[2];
+            for i in 0..batch_size {
+                let enc_len = encodings[i].get_ids().len().min(max_len);
+                let mut pooled = vec![0.0f32; hidden];
+                for t in 0..enc_len {
+                    for d in 0..hidden {
+                        pooled[d] += data[i * seq * hidden + t * hidden + d];
+                    }
+                }
+                let tc = enc_len as f32;
+                for d in &mut pooled { *d /= tc; }
+                // L2 normalise
+                let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 { for d in &mut pooled { *d /= norm; } }
+                results.push(VectorData::Dense(pooled));
+            }
+        } else if dims.len() == 2 {
+            // (batch, hidden_dim) — already pooled
+            let hidden = dims[1];
+            for i in 0..batch_size {
+                let mut vec = data[i * hidden..(i + 1) * hidden].to_vec();
+                let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 { for d in &mut vec { *d /= norm; } }
+                results.push(VectorData::Dense(vec));
+            }
+        } else {
+            return Err(VectoriserError::EncodeFailed(format!("unexpected batch output shape: {dims:?}")));
+        }
+
+        Ok(results)
+    }
+
     async fn encode_query(&self, query: &str) -> Result<VectorData, VectoriserError> {
         Ok(VectorData::Dense(self.encode_text(query)?))
     }

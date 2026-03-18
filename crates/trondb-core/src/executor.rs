@@ -3019,10 +3019,14 @@ impl Executor {
                                 dirty_count += 1;
                             }
                         }
+                        // Verify the dirty entries are visible
+                        let verify_dirty = self.location.iter_dirty().len();
                         tracing::info!(
                             collection = %p.collection,
                             representation = %repr_name,
                             dirty_count,
+                            verified_dirty = verify_dirty,
+                            total_location = self.location.len(),
                             "marked entities dirty for recomputation"
                         );
                     }
@@ -3565,100 +3569,131 @@ impl Executor {
     /// write the new vector, and transition back to Clean.
     pub async fn recompute_dirty(&self) -> Result<usize, EngineError> {
         let dirty_keys = self.location.iter_dirty();
-        if !dirty_keys.is_empty() {
-            tracing::debug!(dirty_count = dirty_keys.len(), "recompute_dirty found dirty entries");
+        let total_loc = self.location.len();
+        if dirty_keys.is_empty() {
+            if total_loc > 0 {
+                tracing::trace!(total_location_entries = total_loc, "recompute_dirty: no dirty entries");
+            }
+            return Ok(0);
         }
-        let mut recomputed = 0;
+        tracing::info!(dirty = dirty_keys.len(), total_loc, "recompute_dirty starting batch");
+
+        // Group dirty entries by (collection, repr_index) for batch processing
+        let mut groups: std::collections::HashMap<(String, usize), Vec<(crate::location::ReprKey, crate::types::Entity)>> =
+            std::collections::HashMap::new();
 
         for (repr_key, _loc_desc) in &dirty_keys {
             let collection = match self.find_collection_for_entity(&repr_key.entity_id) {
                 Ok(c) => c,
-                Err(_) => {
-                    tracing::debug!(entity = %repr_key.entity_id, "recompute: entity not found in collection map, skipping");
-                    continue;
-                }
+                Err(_) => continue,
             };
-
             let entity = match self.store.get(&collection, &repr_key.entity_id) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
+            let repr_idx = repr_key.repr_index as usize;
+            groups.entry((collection, repr_idx))
+                .or_default()
+                .push((repr_key.clone(), entity));
+        }
 
-            let schema = match self.schemas.get(&collection) {
+        let mut recomputed = 0;
+        let batch_size: usize = std::env::var("TRONDB_RECOMPUTE_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+
+        for ((collection, repr_idx), entries) in &groups {
+            let schema = match self.schemas.get(collection) {
                 Some(s) => s.clone(),
                 None => continue,
             };
+            if *repr_idx >= schema.representations.len() { continue; }
+            let stored_repr = &schema.representations[*repr_idx];
+            if stored_repr.fields.is_empty() { continue; }
 
-            let repr_idx = repr_key.repr_index as usize;
-            if repr_idx >= schema.representations.len() {
-                continue;
-            }
-
-            let stored_repr = &schema.representations[repr_idx];
-            if stored_repr.fields.is_empty() {
-                continue; // passthrough — no auto-recomputation
-            }
-
-            // Build FieldSet from current metadata
-            let field_set: FieldSet = stored_repr
-                .fields
-                .iter()
-                .filter_map(|f| entity.metadata.get(f).map(|v| (f.clone(), v.to_string())))
-                .collect();
-
-            let vectoriser = match self.vectoriser_registry.get(&collection, &stored_repr.name) {
+            let vectoriser = match self.vectoriser_registry.get(collection, &stored_repr.name) {
                 Some(v) => v,
                 None => continue,
             };
 
-            // Transition to Recomputing
-            self.location.transition(repr_key, LocState::Recomputing)?;
+            let model_id = vectoriser.model_id().to_string();
+            let recipe_hash = crate::vectoriser::compute_recipe_hash(&model_id, &stored_repr.fields);
 
-            // Encode new vector
-            let vector_data = vectoriser
-                .encode(&field_set)
-                .await
-                .map_err(|e| EngineError::Storage(format!("recompute failed: {e}")))?;
+            // Process in batches
+            for chunk in entries.chunks(batch_size) {
+                // Build FieldSets for the batch
+                let field_sets: Vec<FieldSet> = chunk.iter().map(|(_, entity)| {
+                    stored_repr.fields.iter()
+                        .filter_map(|f| entity.metadata.get(f).map(|v| (f.clone(), v.to_string())))
+                        .collect()
+                }).collect();
 
-            let model_id = vectoriser.model_id();
-            let recipe_hash =
-                crate::vectoriser::compute_recipe_hash(model_id, &stored_repr.fields);
-
-            // Update entity with new vector + Clean state
-            let mut updated_entity = entity.clone();
-            if repr_idx < updated_entity.representations.len() {
-                updated_entity.representations[repr_idx].vector = vector_data;
-                updated_entity.representations[repr_idx].state = ReprState::Clean;
-                updated_entity.representations[repr_idx].recipe_hash = recipe_hash;
-            }
-
-            // WAL: ReprWrite
-            let tx_id = self.wal.next_tx_id();
-            self.wal
-                .append(RecordType::TxBegin, &collection, tx_id, 1, vec![]);
-            let payload = rmp_serde::to_vec_named(&updated_entity)
-                .map_err(|e| EngineError::Storage(e.to_string()))?;
-            self.wal
-                .append(RecordType::ReprWrite, &collection, tx_id, 1, payload);
-            self.wal.commit(tx_id).await?;
-
-            // Fjall persist
-            self.store.insert(&collection, updated_entity.clone())?;
-            self.store.persist()?;
-
-            // Update HNSW index
-            if let Some(repr) = updated_entity.representations.get(repr_idx) {
-                if let VectorData::Dense(ref vec_f32) = repr.vector {
-                    let hnsw_key = format!("{}:{}", collection, repr.name);
-                    if let Some(hnsw) = self.indexes.get(&hnsw_key) {
-                        hnsw.insert(&repr_key.entity_id, vec_f32);
-                    }
+                // Transition all to Recomputing
+                for (repr_key, _) in chunk {
+                    let _ = self.location.transition(repr_key, LocState::Recomputing);
                 }
+
+                // Batch encode via GPU
+                let vectors = match vectoriser.encode_batch(&field_sets).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(collection = %collection, repr = %stored_repr.name, error = %e, "batch encode failed");
+                        continue;
+                    }
+                };
+
+                // WAL + Fjall + index updates for each entity
+                for ((repr_key, entity), vector_data) in chunk.iter().zip(vectors.into_iter()) {
+                    let mut updated = entity.clone();
+                    if *repr_idx < updated.representations.len() {
+                        updated.representations[*repr_idx].vector = vector_data;
+                        updated.representations[*repr_idx].state = ReprState::Clean;
+                        updated.representations[*repr_idx].recipe_hash = recipe_hash;
+                    }
+
+                    let tx_id = self.wal.next_tx_id();
+                    self.wal.append(RecordType::TxBegin, collection, tx_id, 1, vec![]);
+                    let payload = rmp_serde::to_vec_named(&updated)
+                        .map_err(|e| EngineError::Storage(e.to_string()))?;
+                    self.wal.append(RecordType::ReprWrite, collection, tx_id, 1, payload);
+                    self.wal.commit(tx_id).await?;
+
+                    self.store.insert(collection, updated.clone())?;
+
+                    // Update HNSW/sparse index
+                    if let Some(repr) = updated.representations.get(*repr_idx) {
+                        match &repr.vector {
+                            VectorData::Dense(ref vec_f32) => {
+                                let hnsw_key = format!("{}:{}", collection, repr.name);
+                                if let Some(hnsw) = self.indexes.get(&hnsw_key) {
+                                    hnsw.insert(&repr_key.entity_id, vec_f32);
+                                }
+                            }
+                            VectorData::Sparse(ref pairs) => {
+                                let sparse_key = format!("{}:{}", collection, repr.name);
+                                if let Some(sparse_idx) = self.sparse_indexes.get(&sparse_key) {
+                                    sparse_idx.insert(&repr_key.entity_id, pairs);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    self.location.transition(repr_key, LocState::Clean)?;
+                    recomputed += 1;
+                }
+
+                // Persist after each batch
+                self.store.persist()?;
             }
 
-            // Transition to Clean
-            self.location.transition(repr_key, LocState::Clean)?;
-            recomputed += 1;
+            tracing::info!(
+                collection = %collection,
+                repr = %stored_repr.name,
+                count = entries.len(),
+                "recompute_dirty batch completed"
+            );
         }
 
         Ok(recomputed)
