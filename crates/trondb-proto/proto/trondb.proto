@@ -94,6 +94,7 @@ message AlterCollectionPlanProto {
         SetModelOp set_model = 4;
         AlterReprSetFieldsOp alter_repr_fields = 5;
         AddRepresentationOp add_representation = 6;
+        AlterReprSetModelOp alter_repr_model = 7;
     }
 }
 
@@ -114,6 +115,12 @@ message SetModelOp {
 message AlterReprSetFieldsOp {
     string repr_name = 1;
     repeated string fields = 2;
+}
+
+message AlterReprSetModelOp {
+    string repr_name = 1;
+    string model = 2;
+    string model_path = 3;
 }
 
 message AddRepresentationOp {

@@ -859,6 +859,15 @@ impl From<&Plan> for pb::PlanRequest {
                                 },
                             ))
                         }
+                        AlterCollectionOp::AlterRepresentationSetModel { repr_name, model, model_path } => {
+                            Some(pb::alter_collection_plan_proto::Operation::AlterReprModel(
+                                pb::AlterReprSetModelOp {
+                                    repr_name: repr_name.clone(),
+                                    model: model.clone(),
+                                    model_path: model_path.clone(),
+                                },
+                            ))
+                        }
                         AlterCollectionOp::AlterRepresentationSetFields { repr_name, fields } => {
                             Some(pb::alter_collection_plan_proto::Operation::AlterReprFields(
                                 pb::AlterReprSetFieldsOp {
@@ -1229,6 +1238,11 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     Operation::AlterReprFields(arf) => trondb_tql::AlterCollectionOp::AlterRepresentationSetFields {
                         repr_name: arf.repr_name,
                         fields: arf.fields,
+                    },
+                    Operation::AlterReprModel(arm) => trondb_tql::AlterCollectionOp::AlterRepresentationSetModel {
+                        repr_name: arm.repr_name,
+                        model: arm.model,
+                        model_path: arm.model_path,
                     },
                     Operation::AddRepresentation(ar) => {
                         let metric = match ar.metric.to_uppercase().as_str() {

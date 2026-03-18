@@ -337,21 +337,23 @@ fn register_vectorisers(engine: &trondb_core::Engine) {
 }
 
 /// Register vectorisers for every managed representation in a single schema.
+///
+/// Per-representation `vectoriser` config takes priority over collection-level
+/// `vectoriser_config`. Both are passed to the factory for merging.
 fn register_vectorisers_for_schema(
     registry: &trondb_core::vectoriser::VectoriserRegistry,
     schema: &trondb_core::types::CollectionSchema,
 ) {
-    if let Some(ref vc) = schema.vectoriser_config {
-        for repr in &schema.representations {
-            if !repr.fields.is_empty() {
-                match trondb_vectoriser::create_vectoriser_from_config(vc, repr) {
-                    Ok(v) => registry.register(&schema.name, &repr.name, v),
-                    Err(e) => tracing::warn!(
-                        collection = %schema.name,
-                        repr = %repr.name,
-                        "could not create vectoriser: {e}",
-                    ),
-                }
+    let coll_config = schema.vectoriser_config.as_ref();
+    for repr in &schema.representations {
+        if !repr.fields.is_empty() && (repr.vectoriser.is_some() || coll_config.is_some()) {
+            match trondb_vectoriser::create_vectoriser_from_config(repr.vectoriser.as_ref(), coll_config, repr) {
+                Ok(v) => registry.register(&schema.name, &repr.name, v),
+                Err(e) => tracing::warn!(
+                    collection = %schema.name,
+                    repr = %repr.name,
+                    "could not create vectoriser: {e}",
+                ),
             }
         }
     }

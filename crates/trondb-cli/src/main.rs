@@ -304,16 +304,15 @@ fn register_vectorisers_for_schema(
     registry: &trondb_core::vectoriser::VectoriserRegistry,
     schema: &trondb_core::types::CollectionSchema,
 ) {
-    if let Some(ref vc) = schema.vectoriser_config {
-        for repr in &schema.representations {
-            if !repr.fields.is_empty() {
-                match trondb_vectoriser::create_vectoriser_from_config(vc, repr) {
-                    Ok(v) => registry.register(&schema.name, &repr.name, v),
-                    Err(e) => eprintln!(
-                        "warning: could not create vectoriser for {}.{}: {e}",
-                        schema.name, repr.name,
-                    ),
-                }
+    let coll_config = schema.vectoriser_config.as_ref();
+    for repr in &schema.representations {
+        if !repr.fields.is_empty() && (repr.vectoriser.is_some() || coll_config.is_some()) {
+            match trondb_vectoriser::create_vectoriser_from_config(repr.vectoriser.as_ref(), coll_config, repr) {
+                Ok(v) => registry.register(&schema.name, &repr.name, v),
+                Err(e) => eprintln!(
+                    "warning: could not create vectoriser for {}.{}: {e}",
+                    schema.name, repr.name,
+                ),
             }
         }
     }

@@ -174,28 +174,55 @@ impl Parser {
                                 }))
                             }
                             Some(Token::Alter) => {
-                                // ALTER COLLECTION name ALTER REPRESENTATION repr SET FIELDS (f1, f2);
+                                // ALTER COLLECTION name ALTER REPRESENTATION repr SET ...
                                 self.advance(); // ALTER
                                 self.expect(&Token::Representation)?;
                                 let repr_name = self.expect_ident()?;
                                 self.expect(&Token::Set)?;
-                                self.expect(&Token::Fields)?;
-                                self.expect(&Token::LParen)?;
-                                let mut fields = Vec::new();
-                                loop {
-                                    fields.push(self.expect_ident()?);
-                                    if self.peek() == Some(&Token::Comma) {
-                                        self.advance();
-                                    } else {
-                                        break;
+                                match self.peek() {
+                                    Some(Token::Fields) => {
+                                        // ALTER REPRESENTATION repr SET FIELDS (f1, f2);
+                                        self.advance(); // FIELDS
+                                        self.expect(&Token::LParen)?;
+                                        let mut fields = Vec::new();
+                                        loop {
+                                            fields.push(self.expect_ident()?);
+                                            if self.peek() == Some(&Token::Comma) {
+                                                self.advance();
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        self.expect(&Token::RParen)?;
+                                        self.expect(&Token::Semicolon)?;
+                                        Ok(Statement::AlterCollection(AlterCollectionStmt {
+                                            collection,
+                                            operation: AlterCollectionOp::AlterRepresentationSetFields { repr_name, fields },
+                                        }))
                                     }
+                                    Some(Token::Model) => {
+                                        // ALTER REPRESENTATION repr SET MODEL 'id' MODEL_PATH '/path';
+                                        self.advance(); // MODEL
+                                        let model = self.expect_string_lit()?;
+                                        self.expect(&Token::ModelPath)?;
+                                        let model_path = self.expect_string_lit()?;
+                                        self.expect(&Token::Semicolon)?;
+                                        Ok(Statement::AlterCollection(AlterCollectionStmt {
+                                            collection,
+                                            operation: AlterCollectionOp::AlterRepresentationSetModel { repr_name, model, model_path },
+                                        }))
+                                    }
+                                    Some(tok) => {
+                                        let tok_str = format!("{tok:?}");
+                                        let pos = self.tokens[self.pos].1.start;
+                                        Err(ParseError::UnexpectedToken {
+                                            pos,
+                                            expected: "FIELDS or MODEL".into(),
+                                            got: tok_str,
+                                        })
+                                    }
+                                    None => Err(ParseError::UnexpectedEof("expected FIELDS or MODEL".into())),
                                 }
-                                self.expect(&Token::RParen)?;
-                                self.expect(&Token::Semicolon)?;
-                                Ok(Statement::AlterCollection(AlterCollectionStmt {
-                                    collection,
-                                    operation: AlterCollectionOp::AlterRepresentationSetFields { repr_name, fields },
-                                }))
                             }
                             Some(Token::Add) => {
                                 // ALTER COLLECTION name ADD REPRESENTATION name DIMENSIONS n METRIC m [SPARSE true] [FIELDS (f1, f2)];

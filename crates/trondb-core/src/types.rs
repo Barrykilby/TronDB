@@ -248,6 +248,9 @@ pub struct StoredRepresentation {
     /// Version identifier of the model used to compute this representation.
     #[serde(default)]
     pub model_version: String,
+    /// Per-representation vectoriser config. Overrides collection-level VectoriserConfig.
+    #[serde(default)]
+    pub vectoriser: Option<VectoriserConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -348,6 +351,7 @@ mod tests {
             fields: vec![],
             computed_at: 0,
             model_version: String::new(),
+                vectoriser: None,
             }],
             fields: vec![StoredField {
                 name: "status".into(),

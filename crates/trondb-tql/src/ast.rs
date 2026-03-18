@@ -492,6 +492,8 @@ pub enum AlterCollectionOp {
     SetModel { model: String, model_path: String },
     /// ALTER REPRESENTATION name SET FIELDS (f1, f2) — make repr managed, marks entities dirty
     AlterRepresentationSetFields { repr_name: String, fields: Vec<String> },
+    /// ALTER REPRESENTATION name SET MODEL 'id' MODEL_PATH '/path' — set per-repr vectoriser
+    AlterRepresentationSetModel { repr_name: String, model: String, model_path: String },
     /// ADD REPRESENTATION name DIMENSIONS n METRIC m [SPARSE true] [FIELDS (f1, f2)]
     AddRepresentation {
         name: String,

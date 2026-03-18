@@ -923,6 +923,7 @@ mod tests {
             fields: vec![],
             computed_at: 0,
             model_version: String::new(),
+                vectoriser: None,
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -975,6 +976,7 @@ mod tests {
             fields: vec![],
             computed_at: 0,
             model_version: String::new(),
+                vectoriser: None,
             }],
             fields: vec![],
             indexes: vec![],
@@ -1018,6 +1020,7 @@ mod tests {
             fields: vec![],
             computed_at: 0,
             model_version: String::new(),
+                vectoriser: None,
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -1066,6 +1069,7 @@ mod tests {
             fields: vec![],
             computed_at: 0,
             model_version: String::new(),
+                vectoriser: None,
             }],
             fields: vec![StoredField {
                 name: "score".into(),
@@ -1160,6 +1164,7 @@ mod tests {
             fields: vec![],
             computed_at: 0,
             model_version: String::new(),
+                vectoriser: None,
             }],
             fields: vec![StoredField {
                 name: "score".into(),
@@ -1207,6 +1212,7 @@ mod tests {
             fields: vec![],
             computed_at: 0,
             model_version: String::new(),
+                vectoriser: None,
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -1255,6 +1261,7 @@ mod tests {
             fields: vec![],
             computed_at: 0,
             model_version: String::new(),
+                vectoriser: None,
             }],
             fields: vec![StoredField {
                 name: "city".into(),
@@ -1307,6 +1314,7 @@ mod tests {
             fields: vec![],
             computed_at: 0,
             model_version: String::new(),
+                vectoriser: None,
             }],
             fields: vec![],
             indexes: vec![],

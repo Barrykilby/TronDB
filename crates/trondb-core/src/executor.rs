@@ -42,6 +42,7 @@ enum SchemaAlterOp {
     DropField { field_name: String },
     SetModel { model: String, model_path: String },
     AlterRepresentationSetFields { repr_name: String, fields: Vec<String> },
+    AlterRepresentationSetModel { repr_name: String, model: String, model_path: String },
     AddRepresentation { name: String, dimensions: Option<usize>, metric: crate::types::Metric, sparse: bool, fields: Vec<String> },
 }
 
@@ -352,6 +353,18 @@ impl Executor {
                                     self.schemas.insert(payload.collection.clone(), schema);
                                 }
                             }
+                            SchemaAlterOp::AlterRepresentationSetModel { repr_name, model, model_path } => {
+                                if let Some(repr) = schema.representations.iter_mut().find(|r| r.name == *repr_name) {
+                                    let vc = repr.vectoriser.get_or_insert(crate::types::VectoriserConfig {
+                                        model: None, model_path: None, device: None,
+                                        vectoriser_type: None, endpoint: None, auth: None,
+                                    });
+                                    vc.model = Some(model.clone());
+                                    vc.model_path = Some(model_path.clone());
+                                    self.store.update_collection_schema(&schema)?;
+                                    self.schemas.insert(payload.collection.clone(), schema);
+                                }
+                            }
                             SchemaAlterOp::AddRepresentation { name, dimensions, metric, sparse, fields } => {
                                 if !schema.representations.iter().any(|r| r.name == *name) {
                                     schema.representations.push(crate::types::StoredRepresentation {
@@ -363,6 +376,7 @@ impl Executor {
                                         fields: fields.clone(),
                                         computed_at: 0,
                                         model_version: String::new(),
+                                        vectoriser: None,
                                     });
                                     self.store.update_collection_schema(&schema)?;
                                     self.schemas.insert(payload.collection.clone(), schema);
@@ -2840,7 +2854,8 @@ impl Executor {
                     }
                     trondb_tql::AlterCollectionOp::DropField { .. } => {}
                     trondb_tql::AlterCollectionOp::SetModel { .. } => {}
-                    trondb_tql::AlterCollectionOp::AlterRepresentationSetFields { repr_name, .. } => {
+                    trondb_tql::AlterCollectionOp::AlterRepresentationSetFields { repr_name, .. } |
+                    trondb_tql::AlterCollectionOp::AlterRepresentationSetModel { repr_name, .. } => {
                         if !schema.representations.iter().any(|r| r.name == *repr_name) {
                             return Err(EngineError::InvalidQuery(
                                 format!("representation '{}' not found in collection '{}'", repr_name, p.collection)
@@ -2875,6 +2890,9 @@ impl Executor {
                         trondb_tql::AlterCollectionOp::AlterRepresentationSetFields { repr_name, fields } => {
                             SchemaAlterOp::AlterRepresentationSetFields { repr_name: repr_name.clone(), fields: fields.clone() }
                         }
+                        trondb_tql::AlterCollectionOp::AlterRepresentationSetModel { repr_name, model, model_path } => {
+                            SchemaAlterOp::AlterRepresentationSetModel { repr_name: repr_name.clone(), model: model.clone(), model_path: model_path.clone() }
+                        }
                         trondb_tql::AlterCollectionOp::AddRepresentation { name, dimensions, metric, sparse, fields } => {
                             SchemaAlterOp::AddRepresentation { name: name.clone(), dimensions: *dimensions, metric: convert_metric(metric), sparse: *sparse, fields: fields.clone() }
                         }
@@ -2902,6 +2920,7 @@ impl Executor {
                         // Schema-only operations — no entity mutation needed
                         trondb_tql::AlterCollectionOp::SetModel { .. } |
                         trondb_tql::AlterCollectionOp::AlterRepresentationSetFields { .. } |
+                        trondb_tql::AlterCollectionOp::AlterRepresentationSetModel { .. } |
                         trondb_tql::AlterCollectionOp::AddRepresentation { .. } => false,
                     };
                     if changed {
@@ -2966,6 +2985,20 @@ impl Executor {
                             "marked entities dirty for recomputation"
                         );
                     }
+                    trondb_tql::AlterCollectionOp::AlterRepresentationSetModel { repr_name, model, model_path } => {
+                        let repr = schema.representations.iter_mut()
+                            .find(|r| r.name == *repr_name)
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                format!("representation '{}' not found", repr_name)
+                            ))?;
+                        let vc = repr.vectoriser.get_or_insert(crate::types::VectoriserConfig {
+                            model: None, model_path: None, device: None,
+                            vectoriser_type: None, endpoint: None, auth: None,
+                        });
+                        vc.model = Some(model.clone());
+                        vc.model_path = Some(model_path.clone());
+                        fire_schema_altered = true;
+                    }
                     trondb_tql::AlterCollectionOp::AddRepresentation { name, dimensions, metric, sparse, fields } => {
                         schema.representations.push(crate::types::StoredRepresentation {
                             name: name.clone(),
@@ -2976,6 +3009,7 @@ impl Executor {
                             fields: fields.clone(),
                             computed_at: 0,
                             model_version: String::new(),
+                            vectoriser: None,
                         });
                         fire_schema_altered = true;
                     }
@@ -3901,6 +3935,7 @@ fn build_collection_schema(p: &crate::planner::CreateCollectionPlan) -> Collecti
             fields: r.fields.clone(),
             computed_at: 0,
             model_version: String::new(),
+            vectoriser: None,
         }
     }).collect();
 

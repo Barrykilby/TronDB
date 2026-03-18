@@ -961,6 +961,7 @@ mod tests {
                 fields: vec![],
                 computed_at: 0,
                 model_version: String::new(),
+                    vectoriser: None,
                 }],
                 fields: vec![],
                 indexes: vec![],
