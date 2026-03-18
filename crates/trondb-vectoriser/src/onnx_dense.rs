@@ -6,6 +6,10 @@ use trondb_core::types::VectorData;
 use trondb_core::vectoriser::{FieldSet, VectorKind, Vectoriser, VectoriserError};
 
 #[cfg(feature = "onnx")]
+use ort::execution_providers::CUDAExecutionProvider;
+#[cfg(feature = "onnx")]
+use ort::session::builder::GraphOptimizationLevel;
+#[cfg(feature = "onnx")]
 use ort::session::Session;
 #[cfg(feature = "onnx")]
 use ort::value::TensorRef;
@@ -29,10 +33,41 @@ impl OnnxDenseVectoriser {
         tokenizer_path: &Path,
         dimensions: usize,
     ) -> Result<Self, VectoriserError> {
-        let session = Session::builder()
-            .map_err(|e| VectoriserError::ModelNotLoaded(e.to_string()))?
-            .commit_from_file(model_path)
+        // Try CUDA first, fall back to CPU if GPU isn't available
+        let builder = Session::builder()
             .map_err(|e| VectoriserError::ModelNotLoaded(e.to_string()))?;
+        let session = match builder
+            .with_execution_providers([CUDAExecutionProvider::default().build()])
+        {
+            Ok(b) => match b
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .map_err(|e| e.to_string())
+                .and_then(|mut b| b.commit_from_file(model_path).map_err(|e| e.to_string()))
+            {
+                Ok(s) => {
+                    tracing::info!(model = model_id, "ONNX dense vectoriser using CUDA");
+                    s
+                }
+                Err(e) => {
+                    tracing::warn!(model = model_id, error = %e, "CUDA session failed, falling back to CPU");
+                    Session::builder()
+                        .map_err(|e| VectoriserError::ModelNotLoaded(e.to_string()))?
+                        .with_optimization_level(GraphOptimizationLevel::Level3)
+                        .map_err(|e| VectoriserError::ModelNotLoaded(e.to_string()))?
+                        .commit_from_file(model_path)
+                        .map_err(|e| VectoriserError::ModelNotLoaded(e.to_string()))?
+                }
+            }
+            Err(e) => {
+                tracing::warn!(model = model_id, error = %e, "CUDA unavailable, falling back to CPU");
+                Session::builder()
+                    .map_err(|e| VectoriserError::ModelNotLoaded(e.to_string()))?
+                    .with_optimization_level(GraphOptimizationLevel::Level3)
+                    .map_err(|e| VectoriserError::ModelNotLoaded(e.to_string()))?
+                    .commit_from_file(model_path)
+                    .map_err(|e| VectoriserError::ModelNotLoaded(e.to_string()))?
+            }
+        };
 
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| VectoriserError::ModelNotLoaded(e.to_string()))?;
