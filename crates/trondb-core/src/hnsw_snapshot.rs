@@ -42,6 +42,12 @@ pub fn save_snapshot(
 ) -> Result<(), String> {
     let basename = format!("{collection}_{repr_name}");
 
+    // Skip snapshot for empty indexes — hnsw_rs can't dump zero-point graphs
+    if hnsw_index.is_empty() {
+        tracing::debug!("Skipping HNSW snapshot for empty index: {basename}");
+        return Ok(());
+    }
+
     // Use a temp directory for atomic write
     let tmp_dir = dir.join(format!(".tmp_{basename}"));
     std::fs::create_dir_all(&tmp_dir)
