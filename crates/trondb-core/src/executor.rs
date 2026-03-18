@@ -2992,7 +2992,9 @@ impl Executor {
                         schema.representations[repr_idx].fields = fields.clone();
                         fire_schema_altered = true;
 
-                        // Mark all entities dirty for this representation so recompute_dirty regenerates vectors
+                        // Mark all entities dirty for this representation so recompute_dirty regenerates vectors.
+                        // For entities without a location entry (e.g. repr was just added), create one as Dirty.
+                        let is_sparse = schema.representations[repr_idx].sparse;
                         let scan_entities = self.store.scan(&p.collection)?;
                         let mut dirty_count = 0u64;
                         for entity in &scan_entities {
@@ -3002,6 +3004,18 @@ impl Executor {
                             };
                             if self.location.get(&key).is_some() {
                                 let _ = self.location.transition(&key, crate::location::LocState::Dirty);
+                                dirty_count += 1;
+                            } else {
+                                // No entry yet — create one as Dirty
+                                let desc = crate::location::LocationDescriptor {
+                                    tier: crate::location::Tier::NVMe,
+                                    node_address: crate::location::NodeAddress::localhost(),
+                                    state: crate::location::LocState::Dirty,
+                                    version: 0,
+                                    encoding: if is_sparse { crate::location::Encoding::Sparse } else { crate::location::Encoding::Float32 },
+                                    last_accessed: 0,
+                                };
+                                self.location.register(key, desc);
                                 dirty_count += 1;
                             }
                         }
@@ -3039,6 +3053,36 @@ impl Executor {
                             vectoriser: None,
                         });
                         fire_schema_altered = true;
+
+                        // If the new repr has FIELDS, create Dirty location entries for all existing entities
+                        // so the background recompute loop generates vectors for them.
+                        if !fields.is_empty() {
+                            let new_repr_idx = (schema.representations.len() - 1) as u32;
+                            let scan_entities = self.store.scan(&p.collection)?;
+                            let mut dirty_count = 0u64;
+                            for entity in &scan_entities {
+                                let key = crate::location::ReprKey {
+                                    entity_id: entity.id.clone(),
+                                    repr_index: new_repr_idx,
+                                };
+                                let desc = crate::location::LocationDescriptor {
+                                    tier: crate::location::Tier::NVMe,
+                                    node_address: crate::location::NodeAddress::localhost(),
+                                    state: crate::location::LocState::Dirty,
+                                    version: 0,
+                                    encoding: if *sparse { crate::location::Encoding::Sparse } else { crate::location::Encoding::Float32 },
+                                    last_accessed: 0,
+                                };
+                                self.location.register(key, desc);
+                                dirty_count += 1;
+                            }
+                            tracing::info!(
+                                collection = %p.collection,
+                                representation = %name,
+                                dirty_count,
+                                "created dirty location entries for new managed representation"
+                            );
+                        }
                     }
                 }
                 self.store.update_collection_schema(&schema)?;
@@ -3521,12 +3565,18 @@ impl Executor {
     /// write the new vector, and transition back to Clean.
     pub async fn recompute_dirty(&self) -> Result<usize, EngineError> {
         let dirty_keys = self.location.iter_dirty();
+        if !dirty_keys.is_empty() {
+            tracing::debug!(dirty_count = dirty_keys.len(), "recompute_dirty found dirty entries");
+        }
         let mut recomputed = 0;
 
         for (repr_key, _loc_desc) in &dirty_keys {
             let collection = match self.find_collection_for_entity(&repr_key.entity_id) {
                 Ok(c) => c,
-                Err(_) => continue, // entity might have been deleted
+                Err(_) => {
+                    tracing::debug!(entity = %repr_key.entity_id, "recompute: entity not found in collection map, skipping");
+                    continue;
+                }
             };
 
             let entity = match self.store.get(&collection, &repr_key.entity_id) {
