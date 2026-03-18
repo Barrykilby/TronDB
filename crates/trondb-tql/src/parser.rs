@@ -160,16 +160,110 @@ impl Parser {
                                     operation: AlterCollectionOp::DropField { field_name },
                                 }))
                             }
+                            Some(Token::Set) => {
+                                // ALTER COLLECTION name SET MODEL 'id' MODEL_PATH '/path';
+                                self.advance(); // SET
+                                self.expect(&Token::Model)?;
+                                let model = self.expect_string_lit()?;
+                                self.expect(&Token::ModelPath)?;
+                                let model_path = self.expect_string_lit()?;
+                                self.expect(&Token::Semicolon)?;
+                                Ok(Statement::AlterCollection(AlterCollectionStmt {
+                                    collection,
+                                    operation: AlterCollectionOp::SetModel { model, model_path },
+                                }))
+                            }
+                            Some(Token::Alter) => {
+                                // ALTER COLLECTION name ALTER REPRESENTATION repr SET FIELDS (f1, f2);
+                                self.advance(); // ALTER
+                                self.expect(&Token::Representation)?;
+                                let repr_name = self.expect_ident()?;
+                                self.expect(&Token::Set)?;
+                                self.expect(&Token::Fields)?;
+                                self.expect(&Token::LParen)?;
+                                let mut fields = Vec::new();
+                                loop {
+                                    fields.push(self.expect_ident()?);
+                                    if self.peek() == Some(&Token::Comma) {
+                                        self.advance();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                self.expect(&Token::RParen)?;
+                                self.expect(&Token::Semicolon)?;
+                                Ok(Statement::AlterCollection(AlterCollectionStmt {
+                                    collection,
+                                    operation: AlterCollectionOp::AlterRepresentationSetFields { repr_name, fields },
+                                }))
+                            }
+                            Some(Token::Add) => {
+                                // ALTER COLLECTION name ADD REPRESENTATION name DIMENSIONS n METRIC m [SPARSE true] [FIELDS (f1, f2)];
+                                self.advance(); // ADD
+                                self.expect(&Token::Representation)?;
+                                let name = self.expect_ident()?;
+                                // Parse optional DIMENSIONS
+                                let dimensions = if self.peek() == Some(&Token::Dimensions) {
+                                    self.advance();
+                                    Some(self.expect_int()? as usize)
+                                } else {
+                                    None
+                                };
+                                // Parse METRIC
+                                self.expect(&Token::TokenMetric)?;
+                                let metric = match self.peek() {
+                                    Some(Token::Cosine) => { self.advance(); Metric::Cosine }
+                                    Some(Token::InnerProduct) => { self.advance(); Metric::InnerProduct }
+                                    _ => return Err(ParseError::InvalidSyntax("expected COSINE or INNER_PRODUCT".into())),
+                                };
+                                // Parse optional SPARSE
+                                let sparse = if self.peek() == Some(&Token::Sparse) {
+                                    self.advance();
+                                    let val = self.expect_ident()?;
+                                    val.to_lowercase() == "true"
+                                } else {
+                                    false
+                                };
+                                // Parse optional FIELDS
+                                let fields = if self.peek() == Some(&Token::Fields) {
+                                    self.advance();
+                                    self.expect(&Token::LParen)?;
+                                    let mut fs = Vec::new();
+                                    loop {
+                                        fs.push(self.expect_ident()?);
+                                        if self.peek() == Some(&Token::Comma) {
+                                            self.advance();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    self.expect(&Token::RParen)?;
+                                    fs
+                                } else {
+                                    Vec::new()
+                                };
+                                self.expect(&Token::Semicolon)?;
+                                Ok(Statement::AlterCollection(AlterCollectionStmt {
+                                    collection,
+                                    operation: AlterCollectionOp::AddRepresentation {
+                                        name,
+                                        dimensions,
+                                        metric,
+                                        sparse,
+                                        fields,
+                                    },
+                                }))
+                            }
                             Some(tok) => {
                                 let tok_str = format!("{tok:?}");
                                 let pos = self.tokens[self.pos].1.start;
                                 Err(ParseError::UnexpectedToken {
                                     pos,
-                                    expected: "RENAME or DROP".into(),
+                                    expected: "RENAME, DROP, SET, ALTER, or ADD".into(),
                                     got: tok_str,
                                 })
                             }
-                            None => Err(ParseError::UnexpectedEof("expected RENAME or DROP".into())),
+                            None => Err(ParseError::UnexpectedEof("expected RENAME, DROP, SET, ALTER, or ADD".into())),
                         }
                     }
                     Some(tok) => {

@@ -326,6 +326,12 @@ fn register_vectorisers(engine: &trondb_core::Engine) {
             CollectionEvent::Dropped(name) => {
                 registry.remove_collection(name);
             }
+            CollectionEvent::SchemaAltered(schema) => {
+                // Deregister all existing vectorisers for this collection,
+                // then re-register with the updated config.
+                registry.remove_collection(&schema.name);
+                register_vectorisers_for_schema(&registry, schema);
+            }
         }
     }));
 }

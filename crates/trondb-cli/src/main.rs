@@ -292,6 +292,10 @@ fn register_vectorisers(engine: &Engine) {
             CollectionEvent::Dropped(name) => {
                 registry.remove_collection(name);
             }
+            CollectionEvent::SchemaAltered(schema) => {
+                registry.remove_collection(&schema.name);
+                register_vectorisers_for_schema(&registry, schema);
+            }
         }
     }));
 }

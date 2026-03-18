@@ -91,6 +91,9 @@ message AlterCollectionPlanProto {
     oneof operation {
         RenameFieldOp rename_field = 2;
         DropFieldOp drop_field = 3;
+        SetModelOp set_model = 4;
+        AlterReprSetFieldsOp alter_repr_fields = 5;
+        AddRepresentationOp add_representation = 6;
     }
 }
 
@@ -101,6 +104,24 @@ message RenameFieldOp {
 
 message DropFieldOp {
     string field_name = 1;
+}
+
+message SetModelOp {
+    string model = 1;
+    string model_path = 2;
+}
+
+message AlterReprSetFieldsOp {
+    string repr_name = 1;
+    repeated string fields = 2;
+}
+
+message AddRepresentationOp {
+    string name = 1;
+    optional uint32 dimensions = 2;
+    string metric = 3;
+    bool sparse = 4;
+    repeated string fields = 5;
 }
 
 message ImportPlanProto {

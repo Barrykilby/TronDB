@@ -229,6 +229,9 @@ pub enum Token {
     #[token("AUTH", priority = 10, ignore(ascii_case))]
     TokenAuth,
 
+    #[token("ADD", priority = 10, ignore(ascii_case))]
+    Add,
+
     #[token("INFER", priority = 10, ignore(ascii_case))]
     Infer,
 

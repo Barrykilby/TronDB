@@ -851,6 +851,37 @@ impl From<&Plan> for pb::PlanRequest {
                                 },
                             ))
                         }
+                        AlterCollectionOp::SetModel { model, model_path } => {
+                            Some(pb::alter_collection_plan_proto::Operation::SetModel(
+                                pb::SetModelOp {
+                                    model: model.clone(),
+                                    model_path: model_path.clone(),
+                                },
+                            ))
+                        }
+                        AlterCollectionOp::AlterRepresentationSetFields { repr_name, fields } => {
+                            Some(pb::alter_collection_plan_proto::Operation::AlterReprFields(
+                                pb::AlterReprSetFieldsOp {
+                                    repr_name: repr_name.clone(),
+                                    fields: fields.clone(),
+                                },
+                            ))
+                        }
+                        AlterCollectionOp::AddRepresentation { name, dimensions, metric, sparse, fields } => {
+                            let metric_str = match metric {
+                                trondb_tql::Metric::Cosine => "COSINE",
+                                trondb_tql::Metric::InnerProduct => "INNER_PRODUCT",
+                            };
+                            Some(pb::alter_collection_plan_proto::Operation::AddRepresentation(
+                                pb::AddRepresentationOp {
+                                    name: name.clone(),
+                                    dimensions: dimensions.map(|d| d as u32),
+                                    metric: metric_str.to_string(),
+                                    sparse: *sparse,
+                                    fields: fields.clone(),
+                                },
+                            ))
+                        }
                     };
                     PP::AlterCollection(pb::AlterCollectionPlanProto {
                         collection: p.collection.clone(),
@@ -1190,6 +1221,27 @@ impl TryFrom<pb::PlanRequest> for Plan {
                     },
                     Operation::DropField(df) => trondb_tql::AlterCollectionOp::DropField {
                         field_name: df.field_name,
+                    },
+                    Operation::SetModel(sm) => trondb_tql::AlterCollectionOp::SetModel {
+                        model: sm.model,
+                        model_path: sm.model_path,
+                    },
+                    Operation::AlterReprFields(arf) => trondb_tql::AlterCollectionOp::AlterRepresentationSetFields {
+                        repr_name: arf.repr_name,
+                        fields: arf.fields,
+                    },
+                    Operation::AddRepresentation(ar) => {
+                        let metric = match ar.metric.to_uppercase().as_str() {
+                            "INNER_PRODUCT" => trondb_tql::Metric::InnerProduct,
+                            _ => trondb_tql::Metric::Cosine,
+                        };
+                        trondb_tql::AlterCollectionOp::AddRepresentation {
+                            name: ar.name,
+                            dimensions: ar.dimensions.map(|d| d as usize),
+                            metric,
+                            sparse: ar.sparse,
+                            fields: ar.fields,
+                        }
                     },
                 };
                 Ok(Plan::AlterCollection(AlterCollectionPlan {

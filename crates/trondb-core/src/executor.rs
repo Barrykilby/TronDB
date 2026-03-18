@@ -40,6 +40,9 @@ struct SchemaAlterPayload {
 enum SchemaAlterOp {
     RenameField { old_name: String, new_name: String },
     DropField { field_name: String },
+    SetModel { model: String, model_path: String },
+    AlterRepresentationSetFields { repr_name: String, fields: Vec<String> },
+    AddRepresentation { name: String, dimensions: Option<usize>, metric: crate::types::Metric, sparse: bool, fields: Vec<String> },
 }
 
 // ---------------------------------------------------------------------------
@@ -48,10 +51,11 @@ enum SchemaAlterOp {
 // depending on trondb-vectoriser.
 // ---------------------------------------------------------------------------
 
-/// Event fired after a collection is created or dropped.
+/// Event fired after a collection is created, dropped, or altered.
 pub enum CollectionEvent<'a> {
     Created(&'a CollectionSchema),
     Dropped(&'a str),
+    SchemaAltered(&'a CollectionSchema),
 }
 
 /// Callback type for collection lifecycle events.
@@ -327,6 +331,39 @@ impl Executor {
                             SchemaAlterOp::DropField { field_name } => {
                                 if schema.fields.iter().any(|f| f.name == *field_name) {
                                     schema.fields.retain(|f| f.name != *field_name);
+                                    self.store.update_collection_schema(&schema)?;
+                                    self.schemas.insert(payload.collection.clone(), schema);
+                                }
+                            }
+                            SchemaAlterOp::SetModel { model, model_path } => {
+                                let vc = schema.vectoriser_config.get_or_insert(crate::types::VectoriserConfig {
+                                    model: None, model_path: None, device: None,
+                                    vectoriser_type: None, endpoint: None, auth: None,
+                                });
+                                vc.model = Some(model.clone());
+                                vc.model_path = Some(model_path.clone());
+                                self.store.update_collection_schema(&schema)?;
+                                self.schemas.insert(payload.collection.clone(), schema);
+                            }
+                            SchemaAlterOp::AlterRepresentationSetFields { repr_name, fields } => {
+                                if let Some(repr) = schema.representations.iter_mut().find(|r| r.name == *repr_name) {
+                                    repr.fields = fields.clone();
+                                    self.store.update_collection_schema(&schema)?;
+                                    self.schemas.insert(payload.collection.clone(), schema);
+                                }
+                            }
+                            SchemaAlterOp::AddRepresentation { name, dimensions, metric, sparse, fields } => {
+                                if !schema.representations.iter().any(|r| r.name == *name) {
+                                    schema.representations.push(crate::types::StoredRepresentation {
+                                        name: name.clone(),
+                                        model: None,
+                                        dimensions: *dimensions,
+                                        metric: metric.clone(),
+                                        sparse: *sparse,
+                                        fields: fields.clone(),
+                                        computed_at: 0,
+                                        model_version: String::new(),
+                                    });
                                     self.store.update_collection_schema(&schema)?;
                                     self.schemas.insert(payload.collection.clone(), schema);
                                 }
@@ -2802,6 +2839,21 @@ impl Executor {
                         }
                     }
                     trondb_tql::AlterCollectionOp::DropField { .. } => {}
+                    trondb_tql::AlterCollectionOp::SetModel { .. } => {}
+                    trondb_tql::AlterCollectionOp::AlterRepresentationSetFields { repr_name, .. } => {
+                        if !schema.representations.iter().any(|r| r.name == *repr_name) {
+                            return Err(EngineError::InvalidQuery(
+                                format!("representation '{}' not found in collection '{}'", repr_name, p.collection)
+                            ));
+                        }
+                    }
+                    trondb_tql::AlterCollectionOp::AddRepresentation { name, .. } => {
+                        if schema.representations.iter().any(|r| r.name == *name) {
+                            return Err(EngineError::InvalidQuery(
+                                format!("representation '{}' already exists in collection '{}'", name, p.collection)
+                            ));
+                        }
+                    }
                 }
 
                 let tx_id = self.wal.next_tx_id();
@@ -2816,6 +2868,15 @@ impl Executor {
                         }
                         trondb_tql::AlterCollectionOp::DropField { field_name } => {
                             SchemaAlterOp::DropField { field_name: field_name.clone() }
+                        }
+                        trondb_tql::AlterCollectionOp::SetModel { model, model_path } => {
+                            SchemaAlterOp::SetModel { model: model.clone(), model_path: model_path.clone() }
+                        }
+                        trondb_tql::AlterCollectionOp::AlterRepresentationSetFields { repr_name, fields } => {
+                            SchemaAlterOp::AlterRepresentationSetFields { repr_name: repr_name.clone(), fields: fields.clone() }
+                        }
+                        trondb_tql::AlterCollectionOp::AddRepresentation { name, dimensions, metric, sparse, fields } => {
+                            SchemaAlterOp::AddRepresentation { name: name.clone(), dimensions: *dimensions, metric: convert_metric(metric), sparse: *sparse, fields: fields.clone() }
                         }
                     },
                 };
@@ -2838,6 +2899,10 @@ impl Executor {
                         trondb_tql::AlterCollectionOp::DropField { field_name } => {
                             entity.metadata.remove(field_name.as_str()).is_some()
                         }
+                        // Schema-only operations — no entity mutation needed
+                        trondb_tql::AlterCollectionOp::SetModel { .. } |
+                        trondb_tql::AlterCollectionOp::AlterRepresentationSetFields { .. } |
+                        trondb_tql::AlterCollectionOp::AddRepresentation { .. } => false,
                     };
                     if changed {
                         let payload = rmp_serde::to_vec_named(&entity)
@@ -2852,6 +2917,7 @@ impl Executor {
 
                 // 4. Apply to Fjall (idempotent — safe to re-apply on WAL replay)
                 // Update schema
+                let mut fire_schema_altered = false;
                 match &p.operation {
                     trondb_tql::AlterCollectionOp::RenameField { old_name, new_name } => {
                         let field = schema.fields.iter_mut().find(|f| f.name == *old_name)
@@ -2863,13 +2929,72 @@ impl Executor {
                     trondb_tql::AlterCollectionOp::DropField { field_name } => {
                         schema.fields.retain(|f| f.name != *field_name);
                     }
+                    trondb_tql::AlterCollectionOp::SetModel { model, model_path } => {
+                        let vc = schema.vectoriser_config.get_or_insert(crate::types::VectoriserConfig {
+                            model: None, model_path: None, device: None,
+                            vectoriser_type: None, endpoint: None, auth: None,
+                        });
+                        vc.model = Some(model.clone());
+                        vc.model_path = Some(model_path.clone());
+                        fire_schema_altered = true;
+                    }
+                    trondb_tql::AlterCollectionOp::AlterRepresentationSetFields { repr_name, fields } => {
+                        let repr_idx = schema.representations.iter().position(|r| r.name == *repr_name)
+                            .ok_or_else(|| EngineError::InvalidQuery(
+                                format!("representation '{}' not found", repr_name)
+                            ))?;
+                        schema.representations[repr_idx].fields = fields.clone();
+                        fire_schema_altered = true;
+
+                        // Mark all entities dirty for this representation so recompute_dirty regenerates vectors
+                        let scan_entities = self.store.scan(&p.collection)?;
+                        let mut dirty_count = 0u64;
+                        for entity in &scan_entities {
+                            let key = crate::location::ReprKey {
+                                entity_id: entity.id.clone(),
+                                repr_index: repr_idx as u32,
+                            };
+                            if self.location.get(&key).is_some() {
+                                let _ = self.location.transition(&key, crate::location::LocState::Dirty);
+                                dirty_count += 1;
+                            }
+                        }
+                        tracing::info!(
+                            collection = %p.collection,
+                            representation = %repr_name,
+                            dirty_count,
+                            "marked entities dirty for recomputation"
+                        );
+                    }
+                    trondb_tql::AlterCollectionOp::AddRepresentation { name, dimensions, metric, sparse, fields } => {
+                        schema.representations.push(crate::types::StoredRepresentation {
+                            name: name.clone(),
+                            model: None,
+                            dimensions: *dimensions,
+                            metric: convert_metric(metric),
+                            sparse: *sparse,
+                            fields: fields.clone(),
+                            computed_at: 0,
+                            model_version: String::new(),
+                        });
+                        fire_schema_altered = true;
+                    }
                 }
                 self.store.update_collection_schema(&schema)?;
-                self.schemas.insert(p.collection.clone(), schema);
+                self.schemas.insert(p.collection.clone(), schema.clone());
 
                 // Write mutated entities to Fjall
                 for entity in mutated_entities {
                     self.store.insert(&p.collection, entity)?;
+                }
+
+                // Fire schema altered hook so the server re-registers vectorisers
+                if fire_schema_altered {
+                    if let Ok(guard) = self.collection_hook.lock() {
+                        if let Some(ref hook) = *guard {
+                            hook(CollectionEvent::SchemaAltered(&schema));
+                        }
+                    }
                 }
 
                 Ok(QueryResult {

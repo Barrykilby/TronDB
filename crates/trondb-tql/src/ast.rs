@@ -488,6 +488,18 @@ pub struct RestoreStmt {
 pub enum AlterCollectionOp {
     RenameField { old_name: String, new_name: String },
     DropField { field_name: String },
+    /// SET MODEL 'id' MODEL_PATH '/path' — set/update collection vectoriser config
+    SetModel { model: String, model_path: String },
+    /// ALTER REPRESENTATION name SET FIELDS (f1, f2) — make repr managed, marks entities dirty
+    AlterRepresentationSetFields { repr_name: String, fields: Vec<String> },
+    /// ADD REPRESENTATION name DIMENSIONS n METRIC m [SPARSE true] [FIELDS (f1, f2)]
+    AddRepresentation {
+        name: String,
+        dimensions: Option<usize>,
+        metric: Metric,
+        sparse: bool,
+        fields: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
