@@ -1,0 +1,27 @@
+# Rust
+/target
+/tmp-target
+
+# TronDB runtime state
+trondb_data/
+*.wal
+wal/
+
+# Vectoriser models (large, fetched separately)
+models/
+
+# Worktrees
+.worktrees/
+
+# Python tooling artefacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

@@ -1,0 +1,13 @@
+-- tests/cluster/test_queries.tql
+-- Run against router endpoint
+
+CREATE COLLECTION cluster_test {
+    REPRESENTATION default DIMENSIONS 3 METRIC cosine;
+    FIELD name TEXT;
+};
+
+INSERT INTO cluster_test (name) VALUES ('entity1') REPRESENTATION default VECTOR [1.0, 0.0, 0.0];
+INSERT INTO cluster_test (name) VALUES ('entity2') REPRESENTATION default VECTOR [0.0, 1.0, 0.0];
+
+FETCH * FROM cluster_test;
+-- Expect 2 rows

@@ -1,0 +1,20 @@
+[package]
+name = "trondb-cli"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "trondb"
+path = "src/main.rs"
+
+[dependencies]
+trondb-core = { path = "../trondb-core" }
+trondb-proto = { path = "../trondb-proto" }
+trondb-routing = { path = "../trondb-routing" }
+trondb-tql = { path = "../trondb-tql" }
+trondb-wal = { path = "../trondb-wal" }
+trondb-vectoriser = { path = "../trondb-vectoriser" }
+comfy-table.workspace = true
+rustyline.workspace = true
+tokio.workspace = true
+tonic.workspace = true

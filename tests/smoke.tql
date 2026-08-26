@@ -1,0 +1,13 @@
+-- TronDB Phase 2 smoke test (persistence, no SEARCH)
+CREATE COLLECTION venues WITH DIMENSIONS 3;
+
+INSERT INTO venues (id, name, city) VALUES ('v1', 'The Jazz Cafe', 'London') VECTOR [1.0, 0.0, 0.0];
+INSERT INTO venues (id, name, city) VALUES ('v2', 'Blues Kitchen', 'London') VECTOR [0.9, 0.1, 0.0];
+INSERT INTO venues (id, name, city) VALUES ('v3', 'Rock City', 'Nottingham') VECTOR [0.0, 1.0, 0.0];
+INSERT INTO venues (id, name, city) VALUES ('v4', 'The Cavern Club', 'Liverpool') VECTOR [0.1, 0.9, 0.1];
+
+FETCH * FROM venues WHERE city = 'London';
+
+FETCH name, city FROM venues LIMIT 2;
+
+EXPLAIN FETCH * FROM venues;

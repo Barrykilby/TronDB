@@ -1,0 +1,31 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench-smoke:
+    name: bench smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      # Criterion's --test mode runs every benchmark once. It proves the
+      # harness still compiles and every workload still executes; it does
+      # not produce publishable timings. Numbers in the README come from
+      # `cargo bench` on known hardware.
+      - name: Run benchmark harness in test mode
+        env:
+          TRONDB_BENCH_SCALE: small
+        run: cargo bench -p trondb-core --bench engine_bench -- --test

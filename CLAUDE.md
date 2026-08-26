@@ -1,0 +1,261 @@
+# TronDB
+
+Inference-first storage engine. Phase 16: Query Composition.
+
+## Project Structure
+
+- `crates/trondb-wal/` — Write-Ahead Log: record types (MessagePack), segment files, buffer, async writer, crash recovery
+- `crates/trondb-core/` — Engine: types, Fjall-backed store, Location Table (DashMap), HNSW index (hnsw_rs), edges (AdjacencyIndex), planner, async executor, Vectoriser trait + VectoriserRegistry. Depends on trondb-wal + trondb-tql.
+- `crates/trondb-vectoriser/` — Pluggable vectoriser implementations: PassthroughVectoriser, MockVectoriser, OnnxDenseVectoriser (feature: onnx), OnnxSparseVectoriser (feature: onnx), NetworkVectoriser, ExternalVectoriser (feature: external). Factory function create_vectoriser_from_config(). Depends on trondb-core.
+- `crates/trondb-tql/` — TQL parser (logos lexer + recursive descent). No engine dependency.
+- `crates/trondb-proto/` — Protobuf + tonic codegen: TronNode gRPC service, Plan/Result/WAL/Health message conversions. Depends on trondb-core + trondb-wal + trondb-routing.
+- `crates/trondb-server/` — gRPC server binary: role-based startup (primary/replica/router), WAL streaming replication, write forwarding, scatter-gather SEARCH, health probes. Depends on all crates.
+- `crates/trondb-cli/` — Interactive REPL binary (Tokio + rustyline). Depends on all crates.
+- Routing Intelligence: SemanticRouter with health signals, co-location, semantic routing
+  - `crates/trondb-routing/` — Routing layer: health signals, co-location, semantic router. Depends on trondb-core + trondb-wal + trondb-tql.
+  - NodeHandle trait: LocalNode (in-process), SimulatedNode (tests), RemoteNode (gRPC)
+  - HealthSignal + HealthCache: load score computation (RAM 0.35, queue 0.30, CPU 0.20, HNSW 0.10, lag 0.05)
+  - AffinityIndex: explicit groups (WAL-logged, Fjall-persisted) + implicit co-occurrence (RAM-only)
+  - Candidate scoring: health (40%) + verb fit (30%) + entity affinity (30%)
+  - Soft eviction: ungrouped LRU → implicit groups → explicit groups
+  - Background tasks: health polling (200ms), implicit affinity promotion (30s)
+  - TQL: COLLOCATE WITH, AFFINITY GROUP, CREATE AFFINITY GROUP, ALTER ENTITY DROP AFFINITY GROUP
+  - EXPLAIN shows routing section (selected node, score breakdown, candidates)
+- Tiered Storage: warm (PolarQuant/Int8) and archive (Binary) tiers with automatic migration
+  - Vector quantisation: 3-bit rotation+Lloyd-Max (~90% size reduction, measured 47% recall@10), Int8 scalar (~75%, 98%), Binary (~97%, 21%)
+  - Tier partitions: {collection} (hot), warm.{collection}, archive.{collection}
+  - TierMigrator: background demotion cycle (hot→warm→archive) based on access patterns
+  - Promotion on access: warm→hot auto-promotion on FETCH (dequantise + HNSW re-insert)
+  - HNSW tombstone removal + periodic rebuild (10% threshold)
+  - TQL: DEMOTE/PROMOTE entities, EXPLAIN TIERS for distribution
+  - WAL: TierMigration record (0x70) for crash recovery
+  - LocationDescriptor.last_accessed for durable access tracking
+
+## Conventions
+
+- Rust 2021 edition, async (Tokio runtime)
+- Tests: `cargo test --workspace`
+- Run REPL: `cargo run -p trondb-cli`
+- Run REPL with custom data dir: `cargo run -p trondb-cli -- --data-dir /path/to/data`
+- TQL is case-insensitive for keywords, case-sensitive for identifiers
+- LogicalId is a String wrapper (user-provided or UUID v4)
+- Persistence: Fjall (LSM-based). Data dir default: ./trondb_data
+- WAL: MessagePack records, CRC32 verified, segment files. Dir: {data_dir}/wal/
+- Write path: WAL append → flush+fsync → apply to Fjall + Location Table + HNSW index + AdjacencyIndex → ack
+- UPDATE: metadata-only mutation via UPDATE 'id' IN collection SET field = value;
+  - Reuses EntityWrite WAL record (full entity blob)
+  - Captures old field index values before mutation, removes old entries, inserts new entries
+- Location Table: DashMap-backed control fabric, always in RAM
+  - Tracks LocationDescriptor per representation (tier, state, encoding, node address)
+  - WAL-logged via RecordType::LocationUpdate (0x40)
+  - Periodically snapshotted to {data_dir}/location_table.snap
+  - Restored from snapshot + WAL replay on startup
+  - State machine: Clean → Dirty → Recomputing → Clean; Clean → Migrating → Clean
+- WAL replay: all actively-written record types handled
+  - EntityDelete: Fjall delete + tiered storage cleanup
+  - AffinityGroup*: routed to AffinityIndex::replay_affinity_record() via unhandled records
+  - TierMigration: state-inspection recovery (check source/target tier existence)
+  - Engine::open returns (Engine, Vec<WalRecord>) — unhandled records for routing layer
+- HNSW Index: per-collection vector index, always in RAM (control fabric)
+  - Uses hnsw_rs with DistCosine (cosine similarity)
+  - SEARCH returns results with similarity scores, filtered by confidence threshold
+  - QueryMode::Probabilistic for SEARCH, QueryMode::Deterministic for FETCH
+- HNSW Persistence: snapshot + incremental WAL catch-up
+  - Directory: {data_dir}/hnsw_snapshots/
+  - Files per index: .hnsw.graph, .hnsw.data, .hnsw.idmap (bincode), .hnsw.meta (JSON)
+  - Startup: load snapshot → incremental WAL catch-up → fallback to full Fjall rebuild
+  - Periodic background snapshots (configurable interval)
+- Edges: schema-first structural edges with AdjacencyIndex
+  - Edge types declared via CREATE EDGE, stored in Fjall
+  - Edges stored in Fjall per-type partitions (edges.{type})
+  - AdjacencyIndex (DashMap) in RAM for fast TRAVERSE, rebuilt from Fjall on startup
+  - AdjacencyIndex backward index for efficient reverse edge lookup
+  - Edge created_at timestamp (u64 millis) for decay computation
+  - Structural edges have confidence=1.0, no decay
+  - TRAVERSE: BFS multi-hop (depth cap 10), cycle detection via HashSet, forward-only
+  - Edge confidence decay: lazy computation on TRAVERSE, exponential/linear/step functions
+  - DecaySweeper background task: periodic edge pruning (60s interval)
+  - CREATE EDGE DECAY syntax: EXPONENTIAL/LINEAR/STEP with RATE/FLOOR/PRUNE
+  - Entity deletion: cascading 9-step cleanup (WAL, HNSW, field index, sparse index, location table, Fjall, edges, tiered storage)
+  - DELETE 'id' FROM collection syntax for entity removal
+- Field Index: Fjall-backed sortable byte encoding, compound/partial indexes
+  - One Fjall partition per declared index (fidx.{collection}.{index_name})
+  - Sortable encoding: Text=UTF-8, Int=sign-bit-flipped BE, Float=IEEE754 manipulated, Bool=0x00/0x01
+  - Compound keys: null-byte separated, prefix scan on leading fields
+  - Range queries: Gt/Lt/Gte/Lte → FieldIndexRange strategy, uses lookup_range()
+- Sparse Vector Index: RAM-resident inverted index (DashMap), SPLADE-style sparse vectors
+  - SparseIndex rebuilt from Fjall on startup
+  - Inner product scoring, min_weight=0.001 filter
+- Hybrid SEARCH: RRF merge (k=60, 1-based ranking) combines dense + sparse results
+- ScalarPreFilter: WHERE + SEARCH optimisation via field index narrowing (post-filter, 4x over-fetch)
+- Planner: schema-aware strategy selection (Hnsw, Sparse, Hybrid, FieldIndexLookup, ScalarPreFilter)
+- CREATE COLLECTION: block syntax with REPRESENTATION, FIELD, INDEX declarations
+- INSERT: named representation vectors (REPRESENTATION name VECTOR/SPARSE)
+- EXPLAIN: shows strategy, index names, pre-filter details
+- Multi-Node Distribution (Phase 9)
+  - gRPC transport via tonic: TronNode service with Execute, HealthSnapshot, StreamHealth, StreamWal, StreamLocationUpdates RPCs
+  - Protobuf serialisation: all 16 Plan variants + nested TQL types, bidirectional conversions
+  - Server roles: Primary (write authority), Replica (WAL-streaming read replica), Router (stateless query router)
+  - WAL streaming replication: bidirectional gRPC stream, ReplicaTracker, semi-synchronous writes (min_ack_replicas, ack_timeout_ms)
+  - Write forwarding: replica/router nodes proxy write plans to primary via Execute RPC
+  - Location Table streaming: primary broadcasts snapshot + deltas to router nodes
+  - Scatter-gather SEARCH: fan-out to multiple nodes, merge results (score sort for dense, RRF for hybrid)
+  - RemoteNode: NodeHandle implementation over gRPC (execute + health_snapshot)
+  - Real metrics: SystemMetrics (sysinfo CPU/RAM), RollingPercentile (HNSW latency), QueryCounter (RAII guard)
+  - Startup wiring: process_pending_wal_records replays AffinityGroup + TierMigration records on restart
+  - Graceful shutdown: SIGTERM handler, WAL flush, HNSW snapshot save, background task abort
+  - tonic-health integration: gRPC health probes for readiness/liveness checks
+  - Cluster config: TOML file + environment variable overrides for container deployment
+  - Container deployment: single binary Dockerfile, 3-node docker-compose.yml (primary + replica + router)
+  - Run server: `cargo run -p trondb-server -- --config cluster.toml`
+  - Run server with env: `TRONDB_ROLE=primary TRONDB_BIND_ADDR=0.0.0.0:9400 cargo run -p trondb-server`
+- Pluggable Vectoriser + Mutation Cascade (Phase 10)
+  - Vectoriser trait in trondb-core/src/vectoriser.rs: object-safe, async-trait, encode(FieldSet) → VectorData, encode_query(str) → VectorData
+  - VectoriserRegistry: DashMap mapping "{collection}:{repr_name}" → Arc<dyn Vectoriser>
+  - Dependency inversion: trondb-core defines trait, trondb-vectoriser implements, binaries wire
+  - Three vectoriser tiers: Local ONNX (no auth), Network cluster (no auth), External API (Bearer auth)
+  - Feature flags: `onnx` (OnnxDense + OnnxSparse), `external` (ExternalVectoriser)
+  - FIELDS clause on REPRESENTATION declarations for managed representations
+  - VectoriserConfig on CollectionSchema: model, model_path, device, vectoriser_type, endpoint, auth
+  - Auto-vectorise INSERT: detects managed representations (non-empty fields + registered vectoriser), calls encode()
+  - Recipe hash: SHA-256 of model_id + sorted field names, stored per representation for staleness detection
+  - Mutation cascade: UPDATE → detect changed fields → mark affected representations Dirty (WAL-logged) → background recompute → Clean
+  - SEARCH dirty exclusion: entities with Dirty/Recomputing representation excluded from SEARCH on that representation
+  - Natural language SEARCH: NEAR 'text query' USING repr_name → vectoriser.encode_query() → HNSW search
+  - NaturalLanguage search strategy in planner + proto/gRPC transport
+  - WAL record types: ReprDirty (0x21), ReprWrite (0x20) — both replayed on crash recovery
+  - Location Table state machine extended: Clean → Dirty → Recomputing → Clean
+  - Entity→collection reverse lookup: DashMap in executor for O(1) recompute_dirty lookups
+  - Engine::schemas() public method for iterating stored collection schemas
+  - CLI + server startup: iterate schemas, create_vectoriser_from_config() factory, register managed vectorisers
+  - Backwards compatibility: #[serde(default)] on new fields in StoredRepresentation and CollectionSchema
+- Inference Pipeline (Phase 11)
+  - EdgeSource classification: Structural (app-asserted, confidence 1.0, permanent), Inferred (engine-proposed, decays, prunable), Confirmed (promoted from Inferred, excluded from auto-prune)
+  - Edge struct: `source: EdgeSource` field with `#[serde(default)]` for backward compatibility
+  - INFER verb: read-only query proposing edges from HNSW vector similarity
+    - Syntax: INFER EDGES FROM 'id' [VIA type1, type2] RETURNING (TOP n | ALL) [CONFIDENCE > threshold];
+    - Pipeline: fetch source vector → HNSW search target collections → filter existing edges → score + rank → return proposals
+  - CONFIRM verb: creates or promotes edges to Confirmed status
+    - Syntax: CONFIRM EDGE FROM 'id' TO 'id' TYPE name CONFIDENCE value;
+    - Behavior: None→create Confirmed, Inferred→promote to Confirmed, Confirmed→update confidence, Structural→error
+  - InferenceSweeper: background task (30s interval), drains DashSet work queue populated by INSERT/UPDATE
+    - Only for edge types with INFER AUTO enabled
+    - Creates Inferred edges via WAL (EdgeInferred 0x31) + Fjall + AdjacencyIndex
+  - DecaySweeper: background task (60s interval), prunes Inferred edges below prune_threshold
+    - Uses effective_confidence() with decay function, only affects Inferred source edges
+  - InferenceAuditBuffer: Mutex<VecDeque> ring buffer (capacity 1000), records every INFER execution
+  - EXPLAIN HISTORY: queries audit buffer for inference history per entity
+    - Syntax: EXPLAIN HISTORY 'id' [LIMIT n];
+  - CREATE EDGE TYPE extended: INFER AUTO CONFIDENCE > threshold LIMIT n
+  - InferenceConfig on EdgeType: auto, confidence_floor, limit with #[serde(default)]
+  - WAL record types: EdgeInferred (0x31), EdgeConfidenceUpdate (0x32), EdgeConfirm (0x33), EdgeDelete (0x34)
+  - Proto/gRPC: InferPlanProto, ConfirmEdgePlanProto, ExplainHistoryPlanProto messages
+- Query Language Completions (Phase 12)
+  - Advanced WHERE: NOT, IS NULL, IS NOT NULL, IN (list), LIKE (pattern), != (not equal)
+  - LIKE uses SQL semantics: % = any sequence, _ = any single character
+  - WHERE evaluation: all operators in entity_matches() with recursive descent
+  - ORDER BY: multi-field sort with ASC/DESC, NULL-last semantics
+    - Syntax: FETCH ... ORDER BY field [ASC|DESC], ... [LIMIT n]
+    - Applied after filtering, before LIMIT truncation
+  - DROP COLLECTION: cascading cleanup (HNSW, sparse, field indexes, location table, Fjall, schema)
+  - DROP EDGE TYPE: cascading cleanup (adjacency index, Fjall edge partition, edge type metadata)
+  - WAL record types: SchemaDropColl (0x52), SchemaDropEdgeType (0x53)
+  - Query hints: /*+ HINT */ syntax, advisory to planner
+    - NO_PROMOTE: skip warm→hot promotion on access
+    - NO_PREFILTER: skip scalar pre-filter on SEARCH WHERE
+    - FORCE_FULL_SCAN: bypass field index lookup
+    - MAX_ACU(n): ACU budget (enforced, Phase 13)
+    - TIMEOUT(ms): query timeout (future use)
+    - Hints shown in EXPLAIN output
+  - JOINs: structural and probabilistic joins across edge-linked collections
+    - Syntax: FETCH alias.field, ... FROM collection AS alias [INNER|LEFT|RIGHT|FULL] JOIN collection AS alias ON alias.field = alias.field [CONFIDENCE > threshold]
+    - Join types: INNER (default), LEFT, RIGHT, FULL
+    - Structural joins: field-value matching (e.g., venue_id = id)
+    - Probabilistic joins: edge-based with CONFIDENCE threshold, adds _edge.confidence to results
+    - Qualified field references: alias.field in SELECT, ON, WHERE clauses
+    - Row keys are alias-qualified: "e.name", "v.address", "_edge.confidence"
+    - WHERE filter applied to alias-qualified combined row
+    - New AST types: FetchJoinStmt, JoinClause, JoinFieldList, QualifiedField, JoinType
+    - New Plan type: Plan::Join(JoinPlan)
+    - New tokens: Join, Inner, Left, Right, Full, As, Dot
+  - TRAVERSE MATCH: Cypher-inspired pattern matching for graph traversal
+    - Syntax: TRAVERSE FROM 'id' MATCH (a)-[e:TYPE]->(b) DEPTH min..max [CONFIDENCE > threshold] [LIMIT n]
+    - Edge patterns: (a)-[e:TYPE]->(b) forward, (a)-[e:TYPE]-(b) undirected
+    - Optional edge variable binding and edge type filter
+    - Variable depth range: min..max (capped at 10)
+    - Confidence threshold filters low-confidence edges
+    - Results include _edge.confidence, _edge.type, _depth metadata
+    - Legacy TRAVERSE syntax still supported (no MATCH keyword)
+    - New AST types: TraverseMatchStmt, MatchPattern, EdgePattern, EdgeDirection
+    - New Plan type: Plan::TraverseMatch(TraverseMatchPlan)
+    - New tokens: Match, Arrow (->), DotDot (..), Dash (-)
+- Planner & Cost Model (Phase 13)
+  - ACU (Abstract Cost Unit): base calibration 1 hot-tier FETCH = 1.0 ACU
+  - CostProvider trait: per-operation ACU costs (fetch_hot, fetch_warm, search_hnsw, etc.)
+  - ConstantCostProvider: hardcoded defaults, ships as sole implementation
+  - AcuEstimate: itemised cost breakdown attached to every query result
+  - PlanWarning: severity (Info/Warning/Critical), message, suggestion, ACU impact
+  - MAX_ACU query hint enforced: estimated cost > budget → AcuBudgetExceeded error
+  - EXPLAIN shows: estimated_acu, cost_breakdown, rules_applied, warnings
+  - Five optimisation rules (all enabled by default, individually disableable):
+    - ScalarPreFilter: ACU integration, warns on unindexed SEARCH WHERE
+    - ConfidencePushdown: advisory for high-confidence early termination
+    - TraverseHopReorder: warns on deep TRAVERSE, future edge reordering
+    - OnDemandPromotion: respects NO_PROMOTE hint, warns on suppressed promotion
+    - BatchedFetchAfterSearch: warns on large result sets (k > 50)
+  - Two-pass query strategy: selected for k >= 50, first pass over-fetches 3x, structural infrastructure for future Int8/Binary first pass
+  - OptimiserConfig: per-rule enable/disable
+- Bi-Temporal Model (Phase 14)
+  - Three time axes: Valid Time (when fact was true), Transaction Time (when TronDB learned it), Vector Time (when embedding was computed)
+  - Entity: valid_from/valid_to (application-controlled, Option<i64> millis), tx_time (WAL tx_id, engine-controlled)
+  - Representation: computed_at (u64 millis), model_version (String)
+  - Edge: valid_from/valid_to (application-controlled, Option<i64> millis)
+  - Query modifiers: AS OF 'timestamp', VALID DURING 'start'..'end', AS OF TRANSACTION lsn
+  - INSERT temporal: VALID FROM 'timestamp' [TO 'timestamp']
+  - INSERT EDGE temporal: VALID FROM 'timestamp' [TO 'timestamp']
+  - Temporal filtering on FETCH (all strategies: FullScan, FieldIndexLookup, FieldIndexRange)
+  - Temporal filtering on TRAVERSE MATCH (edge valid_from/valid_to)
+  - Temporal fields in EXPLAIN output
+  - Backward compatible: #[serde(default)] on all new fields
+  - New tokens: Of, Transaction, Valid, During
+  - AST: TemporalClause enum (AsOf, ValidDuring, AsOfTransaction)
+  - Proto: TemporalClauseProto, ValidDuringProto messages
+  - Timestamp parsing: ISO 8601 (YYYY-MM-DDTHH:MM:SSZ), date-only (YYYY-MM-DD), millis-as-string
+- Operational Excellence (Phase 15)
+  - UPSERT: INSERT OR UPDATE semantics — atomic create-or-update by entity ID
+    - Syntax: INSERT OR UPDATE INTO collection (fields) VALUES (values) [REPRESENTATION ...];
+    - Functionally delegates to INSERT (which already handles overwrites)
+  - CHECKPOINT: admin command to trigger WAL checkpoint + location table snapshot
+    - Syntax: CHECKPOINT;
+    - Writes 0xFF WAL record, returns checkpoint_lsn
+  - Prometheus metrics: Counter, Gauge, Histogram in trondb-core/src/metrics.rs
+    - EngineMetrics: queries_total, queries_error_total, inserts_total, entities_total,
+      collections_total, wal_writes_total, query_duration_seconds, inflight_queries
+    - Prometheus text exposition format via render()
+    - HTTP endpoint on port 9401 in trondb-server (lightweight TCP, spawned as background task)
+  - Slow query log: ACU-threshold logging in trondb-core/src/slow_log.rs
+    - SlowQueryConfig: acu_threshold (default 100.0), max_entries (default 1000)
+    - Ring buffer of SlowQueryEntry, tracing::warn on slow queries
+  - Backup/restore: BACKUP TO '/path'; exports schemas + entities as JSON-lines
+    - RESTORE FROM '/path'; informational (requires engine restart)
+  - Schema migration: ALTER COLLECTION name RENAME FIELD old TO new;
+    - ALTER COLLECTION name DROP FIELD field_name;
+    - Updates schema + migrates all existing entities
+  - Bulk import: IMPORT INTO collection FROM '/path/to/file.jsonl';
+    - Reads JSON objects line-by-line, creates entities with WAL logging
+  - OpenTelemetry tracing scaffolding: tracing::debug! spans on execute, INSERT, FETCH, SEARCH, UPSERT
+    - Future OTel export via tracing subscriber layer (OTEL_EXPORTER_OTLP_ENDPOINT)
+  - Proto/gRPC: proper proto messages for UPSERT, CHECKPOINT, BACKUP, RESTORE, ALTER COLLECTION, IMPORT
+  - Benchmark suite: criterion benches for INSERT throughput, FETCH full scan, point lookup
+- Query Composition (Phase 16)
+  - WITHIN clause on SEARCH: scope vector search to a graph subgraph
+    - Syntax: SEARCH ... NEAR ... USING ... WITHIN (TRAVERSE FROM 'id' MATCH pattern DEPTH min..max) LIMIT k
+    - All TRAVERSE features available inside WITHIN (direction, confidence, temporal, edge type filter)
+    - Orthogonal modifier: works with Hnsw, Sparse, Hybrid, NaturalLanguage strategies
+  - Two execution approaches, auto-selected at runtime:
+    - BruteForceSubgraph (candidate set < 500): bypass HNSW, fetch vectors, compute cosine/inner-product directly
+    - IndexPostFilter (candidate set >= 500): HNSW search with adaptive over-fetch, post-filter against candidate set
+  - Combined WHERE + WITHIN: candidate sets intersected
+  - WITHIN subquery shown in EXPLAIN output
+  - Proto/gRPC: TraverseMatchPlanProto within field (field 16) on SearchPlan
+  - execute_traverse_match_plan() extracted as reusable helper

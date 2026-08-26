@@ -1,0 +1,667 @@
+syntax = "proto3";
+package trondb;
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service TronNode {
+    // Execute a plan and return results
+    rpc Execute(PlanRequest) returns (QueryResponse);
+
+    // Execute raw TQL text (parse + plan + execute server-side)
+    rpc ExecuteTql(TqlRequest) returns (QueryResponse);
+
+    // Pull health snapshot on demand
+    rpc HealthSnapshot(Empty) returns (HealthSignalResponse);
+
+    // Push health updates as a stream
+    rpc StreamHealth(Empty) returns (stream HealthSignalResponse);
+
+    // WAL replication: primary streams records, replica sends acks
+    rpc StreamWal(stream WalAck) returns (stream WalRecordMessage);
+
+    // Location Table: primary streams updates to routers
+    rpc StreamLocationUpdates(Empty) returns (stream LocationUpdateMessage);
+}
+
+message Empty {}
+
+message TqlRequest {
+    string tql = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Plan types (maps to trondb_core::planner::Plan, 16 variants)
+// ---------------------------------------------------------------------------
+
+message PlanRequest {
+    oneof plan {
+        CreateCollectionPlan create_collection = 1;
+        InsertPlan insert = 2;
+        FetchPlan fetch = 3;
+        SearchPlan search = 4;
+        ExplainPlan explain = 5;
+        CreateEdgeTypePlan create_edge_type = 6;
+        InsertEdgePlan insert_edge = 7;
+        DeleteEntityPlan delete_entity = 8;
+        DeleteEdgePlan delete_edge = 9;
+        TraversePlan traverse = 10;
+        CreateAffinityGroupPlan create_affinity_group = 11;
+        AlterEntityDropAffinityPlan alter_entity_drop_affinity = 12;
+        DemotePlan demote = 13;
+        PromotePlan promote = 14;
+        ExplainTiersPlan explain_tiers = 15;
+        UpdateEntityPlan update_entity = 16;
+        InferPlanProto infer = 17;
+        ConfirmEdgePlanProto confirm_edge = 18;
+        ExplainHistoryPlanProto explain_history = 19;
+        DropCollectionPlanProto drop_collection = 20;
+        DropEdgeTypePlanProto drop_edge_type = 21;
+        JoinPlanProto join = 22;
+        TraverseMatchPlanProto traverse_match = 23;
+        UpsertPlanProto upsert = 24;
+        CheckpointPlanProto checkpoint = 25;
+        BackupPlanProto backup = 26;
+        RestorePlanProto restore = 27;
+        AlterCollectionPlanProto alter_collection = 28;
+        ImportPlanProto import_plan = 29;
+    }
+}
+
+message UpsertPlanProto {
+    string collection = 1;
+    repeated string fields = 2;
+    repeated LiteralValue values = 3;
+    repeated NamedVector vectors = 4;
+}
+
+message CheckpointPlanProto {}
+
+message BackupPlanProto {
+    string path = 1;
+}
+
+message RestorePlanProto {
+    string path = 1;
+}
+
+message AlterCollectionPlanProto {
+    string collection = 1;
+    oneof operation {
+        RenameFieldOp rename_field = 2;
+        DropFieldOp drop_field = 3;
+        SetModelOp set_model = 4;
+        AlterReprSetFieldsOp alter_repr_fields = 5;
+        AddRepresentationOp add_representation = 6;
+        AlterReprSetModelOp alter_repr_model = 7;
+    }
+}
+
+message RenameFieldOp {
+    string old_name = 1;
+    string new_name = 2;
+}
+
+message DropFieldOp {
+    string field_name = 1;
+}
+
+message SetModelOp {
+    string model = 1;
+    string model_path = 2;
+}
+
+message AlterReprSetFieldsOp {
+    string repr_name = 1;
+    repeated string fields = 2;
+}
+
+message AlterReprSetModelOp {
+    string repr_name = 1;
+    string model = 2;
+    string model_path = 3;
+}
+
+message AddRepresentationOp {
+    string name = 1;
+    optional uint32 dimensions = 2;
+    string metric = 3;
+    bool sparse = 4;
+    repeated string fields = 5;
+}
+
+message ImportPlanProto {
+    string collection = 1;
+    string path = 2;
+}
+
+message CreateCollectionPlan {
+    string name = 1;
+    repeated RepresentationDecl representations = 2;
+    repeated FieldDecl fields = 3;
+    repeated IndexDecl indexes = 4;
+}
+
+message InsertPlan {
+    string collection = 1;
+    repeated string fields = 2;
+    repeated LiteralValue values = 3;
+    repeated NamedVector vectors = 4;
+    repeated string collocate_with = 5;    // empty if None
+    optional string affinity_group = 6;
+    optional string valid_from = 7;
+    optional string valid_to = 8;
+}
+
+message FetchPlan {
+    string collection = 1;
+    FieldListProto fields = 2;
+    optional WhereClauseProto filter = 3;
+    optional uint64 limit = 4;
+    FetchStrategyProto strategy = 5;
+    string strategy_index_name = 6;    // carries index name for FieldIndexLookup/Range
+    repeated OrderByClauseProto order_by = 7;
+    repeated string hints = 8;
+    optional TemporalClauseProto temporal = 9;
+}
+
+message TwoPassConfigProto {
+    uint64 first_pass_k = 1;
+    bool use_binary_first_pass = 2;
+}
+
+message SearchPlan {
+    string collection = 1;
+    FieldListProto fields = 2;
+    repeated double dense_vector = 3;      // empty if None
+    repeated SparseEntry sparse_vector = 4; // empty if None
+    optional WhereClauseProto filter = 5;
+    optional PreFilterProto pre_filter = 6;
+    uint64 k = 7;
+    double confidence_threshold = 8;
+    SearchStrategyProto strategy = 9;
+    bool has_dense = 10;                   // disambiguate empty vec from None
+    bool has_sparse = 11;
+    optional string query_text = 12;
+    optional string using_repr = 13;
+    repeated string hints = 14;
+    optional TwoPassConfigProto two_pass = 15;
+    optional TraverseMatchPlanProto within = 16;
+}
+
+message ExplainPlan {
+    PlanRequest inner = 1;                 // recursive
+}
+
+message CreateEdgeTypePlan {
+    string name = 1;
+    string from_collection = 2;
+    string to_collection = 3;
+    optional DecayConfigProto decay_config = 4;
+}
+
+message InsertEdgePlan {
+    string edge_type = 1;
+    string from_id = 2;
+    string to_id = 3;
+    repeated FieldAssignment metadata = 4;
+    optional string valid_from = 5;
+    optional string valid_to = 6;
+}
+
+message DeleteEntityPlan {
+    string entity_id = 1;
+    string collection = 2;
+}
+
+message DeleteEdgePlan {
+    string edge_type = 1;
+    string from_id = 2;
+    string to_id = 3;
+}
+
+message TraversePlan {
+    string edge_type = 1;
+    string from_id = 2;
+    uint64 depth = 3;
+    optional uint64 limit = 4;
+}
+
+message CreateAffinityGroupPlan {
+    string name = 1;
+}
+
+message AlterEntityDropAffinityPlan {
+    string entity_id = 1;
+}
+
+message DemotePlan {
+    string entity_id = 1;
+    string collection = 2;
+    TierTargetProto target_tier = 3;
+}
+
+message PromotePlan {
+    string entity_id = 1;
+    string collection = 2;
+}
+
+message ExplainTiersPlan {
+    string collection = 1;
+}
+
+message UpdateEntityPlan {
+    string entity_id = 1;
+    string collection = 2;
+    repeated FieldAssignment assignments = 3;
+}
+
+message InferPlanProto {
+    string from_id = 1;
+    repeated string edge_types = 2;
+    optional uint64 limit = 3;
+    optional float confidence_floor = 4;
+}
+
+message ConfirmEdgePlanProto {
+    string from_id = 1;
+    string to_id = 2;
+    string edge_type = 3;
+    float confidence = 4;
+}
+
+message ExplainHistoryPlanProto {
+    string entity_id = 1;
+    optional uint64 limit = 2;
+}
+
+message DropCollectionPlanProto {
+    string name = 1;
+}
+
+message DropEdgeTypePlanProto {
+    string name = 1;
+}
+
+message QualifiedFieldProto {
+    string alias = 1;
+    string field = 2;
+}
+
+message JoinClauseProto {
+    JoinTypeProto join_type = 1;
+    string collection = 2;
+    string alias = 3;
+    QualifiedFieldProto on_left = 4;
+    QualifiedFieldProto on_right = 5;
+    optional double confidence_threshold = 6;
+}
+
+enum JoinTypeProto {
+    JOIN_TYPE_INNER = 0;
+    JOIN_TYPE_LEFT = 1;
+    JOIN_TYPE_RIGHT = 2;
+    JOIN_TYPE_FULL = 3;
+}
+
+message JoinFieldListProto {
+    bool all = 1;
+    repeated QualifiedFieldProto names = 2;
+}
+
+message JoinPlanProto {
+    JoinFieldListProto fields = 1;
+    string from_collection = 2;
+    string from_alias = 3;
+    repeated JoinClauseProto joins = 4;
+    optional WhereClauseProto filter = 5;
+    repeated OrderByClauseProto order_by = 6;
+    optional uint64 limit = 7;
+    repeated string hints = 8;
+}
+
+enum EdgeDirectionProto {
+    EDGE_DIRECTION_FORWARD = 0;
+    EDGE_DIRECTION_BACKWARD = 1;
+    EDGE_DIRECTION_UNDIRECTED = 2;
+}
+
+message EdgePatternProto {
+    optional string variable = 1;
+    optional string edge_type = 2;
+    EdgeDirectionProto direction = 3;
+}
+
+message MatchPatternProto {
+    string source_var = 1;
+    EdgePatternProto edge = 2;
+    string target_var = 3;
+}
+
+message TraverseMatchPlanProto {
+    string from_id = 1;
+    MatchPatternProto pattern = 2;
+    uint64 min_depth = 3;
+    uint64 max_depth = 4;
+    optional double confidence_threshold = 5;
+    optional uint64 limit = 6;
+    optional TemporalClauseProto temporal = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Nested TQL types
+// ---------------------------------------------------------------------------
+
+message RepresentationDecl {
+    string name = 1;
+    optional string model = 2;
+    optional uint64 dimensions = 3;
+    MetricProto metric = 4;
+    bool sparse = 5;
+}
+
+message FieldDecl {
+    string name = 1;
+    FieldTypeProto field_type = 2;
+    optional string entity_ref_collection = 3;  // only set when field_type = ENTITY_REF
+}
+
+message IndexDecl {
+    string name = 1;
+    repeated string fields = 2;
+    optional WhereClauseProto partial_condition = 3;
+}
+
+message NamedVector {
+    string name = 1;
+    VectorLiteralProto vector = 2;
+}
+
+message VectorLiteralProto {
+    oneof vector {
+        DenseVector dense = 1;
+        SparseVector sparse = 2;
+    }
+}
+
+message DenseVector {
+    repeated double values = 1;
+}
+
+message SparseVector {
+    repeated SparseEntry entries = 1;
+}
+
+message SparseEntry {
+    uint32 index = 1;
+    float value = 2;
+}
+
+message LiteralValue {
+    oneof value {
+        string string_val = 1;
+        int64 int_val = 2;
+        double float_val = 3;
+        bool bool_val = 4;
+        bool null_val = 5;             // if true, value is null
+    }
+}
+
+message FieldAssignment {
+    string field = 1;
+    LiteralValue value = 2;
+}
+
+message WhereClauseProto {
+    oneof clause {
+        ComparisonClause eq = 1;
+        ComparisonClause gt = 2;
+        ComparisonClause lt = 3;
+        ComparisonClause gte = 4;
+        ComparisonClause lte = 5;
+        BinaryClause and = 6;
+        BinaryClause or = 7;
+    }
+}
+
+message ComparisonClause {
+    string field = 1;
+    LiteralValue value = 2;
+}
+
+message BinaryClause {
+    WhereClauseProto left = 1;
+    WhereClauseProto right = 2;
+}
+
+message FieldListProto {
+    bool all = 1;                      // if true, select all fields
+    repeated string names = 2;         // used when all=false
+}
+
+message PreFilterProto {
+    string index_name = 1;
+    WhereClauseProto clause = 2;
+}
+
+message OrderByClauseProto {
+    string field = 1;
+    string direction = 2;  // "ASC" or "DESC"
+}
+
+// Temporal clause for bi-temporal queries
+message TemporalClauseProto {
+    oneof clause {
+        string as_of = 1;                 // AS OF 'timestamp'
+        ValidDuringProto valid_during = 2; // VALID DURING 'start'..'end'
+        uint64 as_of_transaction = 3;      // AS OF TRANSACTION lsn
+    }
+}
+
+message ValidDuringProto {
+    string start = 1;
+    string end = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Enum types
+// ---------------------------------------------------------------------------
+
+enum MetricProto {
+    METRIC_COSINE = 0;
+    METRIC_INNER_PRODUCT = 1;
+}
+
+enum FieldTypeProto {
+    FIELD_TYPE_TEXT = 0;
+    FIELD_TYPE_DATETIME = 1;
+    FIELD_TYPE_BOOL = 2;
+    FIELD_TYPE_INT = 3;
+    FIELD_TYPE_FLOAT = 4;
+    FIELD_TYPE_ENTITY_REF = 5;
+}
+
+enum SearchStrategyProto {
+    SEARCH_STRATEGY_HNSW = 0;
+    SEARCH_STRATEGY_SPARSE = 1;
+    SEARCH_STRATEGY_HYBRID = 2;
+    SEARCH_STRATEGY_NATURAL_LANGUAGE = 3;
+}
+
+enum FetchStrategyProto {
+    FETCH_STRATEGY_FULL_SCAN = 0;
+    FETCH_STRATEGY_FIELD_INDEX_LOOKUP = 1;
+    FETCH_STRATEGY_FIELD_INDEX_RANGE = 2;
+}
+
+enum TierTargetProto {
+    TIER_TARGET_WARM = 0;
+    TIER_TARGET_ARCHIVE = 1;
+}
+
+message DecayConfigProto {
+    optional DecayFnProto decay_fn = 1;
+    optional double decay_rate = 2;
+    optional double floor = 3;
+    optional double promote_threshold = 4;
+    optional double prune_threshold = 5;
+}
+
+enum DecayFnProto {
+    DECAY_FN_EXPONENTIAL = 0;
+    DECAY_FN_LINEAR = 1;
+    DECAY_FN_STEP = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Query response
+// ---------------------------------------------------------------------------
+
+message QueryResponse {
+    repeated string columns = 1;
+    repeated RowMessage rows = 2;
+    QueryStatsMessage stats = 3;
+}
+
+message RowMessage {
+    map<string, ValueMessage> values = 1;
+    optional float score = 2;
+}
+
+message ValueMessage {
+    oneof value {
+        string string_val = 1;
+        int64 int_val = 2;
+        double float_val = 3;
+        bool bool_val = 4;
+        bool null_val = 5;
+    }
+}
+
+message AcuLineItemProto {
+    string operation = 1;
+    uint64 count = 2;
+    double unit_cost = 3;
+    double total = 4;
+}
+
+message AcuEstimateProto {
+    repeated AcuLineItemProto items = 1;
+    double total_acu = 2;
+}
+
+message PlanWarningProto {
+    string severity = 1;     // "INFO", "WARN", "CRIT"
+    string message = 2;
+    string suggestion = 3;   // empty if none
+    double acu_impact = 4;   // 0 if none
+}
+
+message QueryStatsMessage {
+    uint64 elapsed_nanos = 1;
+    uint64 entities_scanned = 2;
+    QueryModeProto mode = 3;
+    string tier = 4;
+    optional AcuEstimateProto cost = 10;
+    repeated PlanWarningProto warnings = 11;
+}
+
+enum QueryModeProto {
+    QUERY_MODE_DETERMINISTIC = 0;
+    QUERY_MODE_PROBABILISTIC = 1;
+}
+
+// ---------------------------------------------------------------------------
+// WAL replication
+// ---------------------------------------------------------------------------
+
+message WalRecordMessage {
+    uint64 lsn = 1;
+    int64 timestamp = 2;               // maps to WalRecord.ts
+    uint64 tx_id = 3;
+    RecordTypeProto record_type = 4;
+    uint32 schema_ver = 5;
+    string collection = 6;
+    bytes payload = 7;                 // opaque MessagePack bytes
+}
+
+message WalAck {
+    uint64 confirmed_lsn = 1;
+}
+
+enum RecordTypeProto {
+    RECORD_TYPE_TX_BEGIN = 0;
+    RECORD_TYPE_TX_COMMIT = 1;
+    RECORD_TYPE_TX_ABORT = 2;
+    RECORD_TYPE_ENTITY_WRITE = 3;
+    RECORD_TYPE_ENTITY_DELETE = 4;
+    RECORD_TYPE_REPR_WRITE = 5;
+    RECORD_TYPE_REPR_DIRTY = 6;
+    RECORD_TYPE_EDGE_WRITE = 7;
+    RECORD_TYPE_EDGE_INFERRED = 8;
+    RECORD_TYPE_EDGE_CONFIDENCE_UPDATE = 9;
+    RECORD_TYPE_EDGE_CONFIRM = 10;
+    RECORD_TYPE_EDGE_DELETE = 11;
+    RECORD_TYPE_LOCATION_UPDATE = 12;
+    RECORD_TYPE_SCHEMA_CREATE_COLL = 13;
+    RECORD_TYPE_SCHEMA_CREATE_EDGE_TYPE = 14;
+    RECORD_TYPE_AFFINITY_GROUP_CREATE = 15;
+    RECORD_TYPE_AFFINITY_GROUP_MEMBER = 16;
+    RECORD_TYPE_AFFINITY_GROUP_REMOVE = 17;
+    RECORD_TYPE_TIER_MIGRATION = 18;
+    RECORD_TYPE_CHECKPOINT = 19;
+    RECORD_TYPE_SCHEMA_DROP_COLL = 20;
+    RECORD_TYPE_SCHEMA_DROP_EDGE_TYPE = 21;
+    RECORD_TYPE_SCHEMA_ALTER = 22;
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+message HealthSignalResponse {
+    string node_id = 1;
+    NodeRoleProto node_role = 2;
+    int64 signal_ts = 3;
+    uint64 sequence = 4;
+    float cpu_utilisation = 5;
+    float ram_pressure = 6;
+    uint64 hot_entity_count = 7;
+    uint64 hot_tier_capacity = 8;
+    uint64 warm_entity_count = 9;
+    uint64 archive_entity_count = 10;
+    uint32 queue_depth = 11;
+    uint32 queue_capacity = 12;
+    float hnsw_p50_ms = 13;
+    float hnsw_p99_ms = 14;
+    optional uint64 replica_lag_ms = 15;
+    float load_score = 16;
+    NodeStatusProto status = 17;
+}
+
+enum NodeRoleProto {
+    NODE_ROLE_PRIMARY = 0;
+    NODE_ROLE_HOT_NODE = 1;
+    NODE_ROLE_WARM_NODE = 2;
+    NODE_ROLE_READ_REPLICA = 3;
+    NODE_ROLE_ROUTER = 4;
+}
+
+enum NodeStatusProto {
+    NODE_STATUS_HEALTHY = 0;
+    NODE_STATUS_DEGRADED = 1;
+    NODE_STATUS_OVERLOADED = 2;
+    NODE_STATUS_FAULTED = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Location Table
+// ---------------------------------------------------------------------------
+
+message LocationUpdateMessage {
+    bool is_snapshot = 1;              // true for initial full snapshot
+    bytes payload = 2;                 // LocationTable::snapshot() binary for snapshot,
+                                       // or single LocationUpdate WAL record for delta
+    uint64 lsn = 3;                   // WAL LSN at time of this update
+}

@@ -1,0 +1,5 @@
+# Pinned so local builds and CI agree.
+# Floor is set by ort-sys (ONNX vectoriser feature), which requires >= 1.88.
+[toolchain]
+channel = "1.88"
+components = ["rustfmt", "clippy"]

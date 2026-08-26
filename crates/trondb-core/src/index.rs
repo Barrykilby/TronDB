@@ -1,0 +1,448 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use anndists::dist::DistCosine;
+use dashmap::DashMap;
+use hnsw_rs::hnsw::{Hnsw, Neighbour};
+
+use crate::types::LogicalId;
+
+// ---------------------------------------------------------------------------
+// HNSW parameters — sensible defaults for single-node
+// ---------------------------------------------------------------------------
+
+pub(crate) const MAX_NB_CONNECTION: usize = 16;
+pub(crate) const MAX_ELEMENTS: usize = 100_000;
+pub(crate) const MAX_LAYER: usize = 16;
+pub(crate) const EF_CONSTRUCTION: usize = 200;
+const EF_SEARCH: usize = 50;
+
+/// Below this many live entries, a search that comes back short falls back to
+/// an exact scan. At this size a scan is microseconds, so correctness is worth
+/// more than the saved work. Above it, an occasional missed neighbour is
+/// accepted rather than scanning a large index.
+const SCAN_FALLBACK_MAX_ELEMENTS: usize = 1024;
+
+/// Fraction of live entries that tombstones must exceed before a rebuild is
+/// triggered. 10% = 0.10.
+const TOMBSTONE_REBUILD_THRESHOLD: f64 = 0.10;
+
+// ---------------------------------------------------------------------------
+// HnswIndex — one per collection
+// ---------------------------------------------------------------------------
+
+pub struct HnswIndex {
+    inner: Mutex<Hnsw<'static, f32, DistCosine>>,
+    dimensions: usize,
+    id_to_idx: DashMap<LogicalId, usize>,
+    idx_to_id: DashMap<usize, LogicalId>,
+    next_idx: AtomicUsize,
+    tombstones: DashMap<LogicalId, ()>,
+    tombstone_count: AtomicUsize,
+}
+
+impl HnswIndex {
+    pub fn new(dimensions: usize) -> Self {
+        let hnsw = Hnsw::new(
+            MAX_NB_CONNECTION,
+            MAX_ELEMENTS,
+            MAX_LAYER,
+            EF_CONSTRUCTION,
+            DistCosine,
+        );
+        Self {
+            inner: Mutex::new(hnsw),
+            dimensions,
+            id_to_idx: DashMap::new(),
+            idx_to_id: DashMap::new(),
+            next_idx: AtomicUsize::new(0),
+            tombstones: DashMap::new(),
+            tombstone_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Restore an HnswIndex from a loaded hnsw_rs graph and saved ID maps.
+    pub fn from_snapshot(
+        hnsw: Hnsw<'static, f32, DistCosine>,
+        dimensions: usize,
+        id_to_idx_map: std::collections::HashMap<String, usize>,
+        idx_to_id_map: std::collections::HashMap<usize, String>,
+        next_idx_val: usize,
+        tombstone_list: Vec<String>,
+    ) -> Self {
+        let id_to_idx = DashMap::new();
+        for (k, v) in id_to_idx_map {
+            id_to_idx.insert(LogicalId::from_string(&k), v);
+        }
+        let idx_to_id = DashMap::new();
+        for (k, v) in idx_to_id_map {
+            idx_to_id.insert(k, LogicalId::from_string(&v));
+        }
+        let tombstones = DashMap::new();
+        let tombstone_count = tombstone_list.len();
+        for id in tombstone_list {
+            tombstones.insert(LogicalId::from_string(&id), ());
+        }
+
+        Self {
+            inner: Mutex::new(hnsw),
+            dimensions,
+            id_to_idx,
+            idx_to_id,
+            next_idx: AtomicUsize::new(next_idx_val),
+            tombstones,
+            tombstone_count: AtomicUsize::new(tombstone_count),
+        }
+    }
+
+    /// Insert a vector for an entity. Idempotent: skips if already indexed.
+    pub fn insert(&self, id: &LogicalId, vector: &[f32]) {
+        // Idempotent — skip if already in the index
+        if self.id_to_idx.contains_key(id) {
+            return;
+        }
+
+        let idx = self.next_idx.fetch_add(1, Ordering::SeqCst);
+        self.id_to_idx.insert(id.clone(), idx);
+        self.idx_to_id.insert(idx, id.clone());
+
+        let hnsw = self.inner.lock().unwrap();
+        hnsw.insert((vector, idx));
+    }
+
+    /// Mark an entity as tombstoned (logically removed from the index).
+    /// The entry remains in the underlying HNSW graph but is filtered from
+    /// search results. Calling remove on a non-existent id is a no-op.
+    pub fn remove(&self, id: &LogicalId) {
+        if !self.id_to_idx.contains_key(id) {
+            return;
+        }
+        // Only count a new tombstone if not already tombstoned.
+        if self.tombstones.insert(id.clone(), ()).is_none() {
+            self.tombstone_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Returns the current number of tombstoned entries.
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstone_count.load(Ordering::SeqCst)
+    }
+
+    /// Returns true when tombstones exceed TOMBSTONE_REBUILD_THRESHOLD of the
+    /// live (non-tombstoned) entry count.
+    pub fn needs_rebuild(&self) -> bool {
+        let ts = self.tombstone_count.load(Ordering::SeqCst);
+        if ts == 0 {
+            return false;
+        }
+        let total = self.id_to_idx.len();
+        let live = total.saturating_sub(ts);
+        if live == 0 {
+            return ts > 0;
+        }
+        (ts as f64 / live as f64) > TOMBSTONE_REBUILD_THRESHOLD
+    }
+
+    /// Rebuild the HNSW index from scratch using only the provided live data.
+    /// All existing data and tombstones are cleared.
+    pub fn rebuild(&self, live_data: &[(LogicalId, Vec<f32>)]) {
+        let new_hnsw = Hnsw::new(
+            MAX_NB_CONNECTION,
+            MAX_ELEMENTS,
+            MAX_LAYER,
+            EF_CONSTRUCTION,
+            DistCosine,
+        );
+
+        self.id_to_idx.clear();
+        self.idx_to_id.clear();
+        self.tombstones.clear();
+        self.tombstone_count.store(0, Ordering::SeqCst);
+        self.next_idx.store(0, Ordering::SeqCst);
+
+        for (id, vector) in live_data {
+            let idx = self.next_idx.fetch_add(1, Ordering::SeqCst);
+            self.id_to_idx.insert(id.clone(), idx);
+            self.idx_to_id.insert(idx, id.clone());
+            new_hnsw.insert((vector.as_slice(), idx));
+        }
+
+        *self.inner.lock().unwrap() = new_hnsw;
+    }
+
+    /// Search for k nearest neighbours.
+    /// Returns (LogicalId, similarity_score) sorted by descending similarity.
+    /// similarity = 1.0 - cosine_distance.
+    /// Tombstoned entries are excluded from results.
+    pub fn search(&self, query: &[f32], k: usize) -> Vec<(LogicalId, f32)> {
+        self.search_with_ef(query, k, EF_SEARCH)
+    }
+
+    /// `search` with an explicit ef. Exposed so the determinism probe can
+    /// measure whether extra search effort recovers results that the graph
+    /// walk misses.
+    pub fn search_with_ef(&self, query: &[f32], k: usize, ef: usize) -> Vec<(LogicalId, f32)> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+
+        let hnsw = self.inner.lock().unwrap();
+        let neighbours: Vec<Neighbour> = hnsw.search(query, k, ef);
+
+        let mut results: Vec<(LogicalId, f32)> = neighbours
+            .into_iter()
+            .filter_map(|n| {
+                let idx = n.d_id;
+                let similarity = 1.0 - n.distance;
+                self.idx_to_id.get(&idx).and_then(|id| {
+                    if self.tombstones.contains_key(id.value()) {
+                        None
+                    } else {
+                        Some((id.clone(), similarity))
+                    }
+                })
+            })
+            .collect();
+
+        // The graph walk can miss reachable points. hnsw_rs assigns layers
+        // from StdRng::from_os_rng, and on a small index that leaves some
+        // points unreachable from the entry point: measured at 5-8% of builds,
+        // worst case 1 result returned from an 8-point index. Raising ef does
+        // not help (ef 50 to 800 changes nothing), because the points are not
+        // reachable at any effort. See tests/hnsw_determinism_probe.rs.
+        //
+        // When the index is small enough that an exact scan is cheap, and the
+        // walk came back short, scan instead. This costs nothing on the normal
+        // path: it only runs when the walk already failed, and only below the
+        // threshold, so a large index never pays for it.
+        let live = self.len();
+        let expected = k.min(live);
+        if results.len() < expected && live <= SCAN_FALLBACK_MAX_ELEMENTS {
+            results = self.exact_scan(&hnsw, query, k);
+        }
+
+        // Sort by descending similarity
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results
+    }
+
+    /// Exact k-nearest-neighbour scan over every live point in the index.
+    /// Only called as a fallback, and only for small indexes.
+    fn exact_scan(
+        &self,
+        hnsw: &Hnsw<'static, f32, DistCosine>,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<(LogicalId, f32)> {
+        let q_norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mut scored: Vec<(LogicalId, f32)> = hnsw
+            .get_point_indexation()
+            .into_iter()
+            .filter_map(|point| {
+                let id = self.idx_to_id.get(&point.get_origin_id())?;
+                if self.tombstones.contains_key(id.value()) {
+                    return None;
+                }
+                let v = point.get_v();
+                let dot: f32 = query.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                let v_norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let similarity = if q_norm == 0.0 || v_norm == 0.0 {
+                    0.0
+                } else {
+                    dot / (q_norm * v_norm)
+                };
+                Some((id.clone(), similarity))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
+    }
+
+    pub fn len(&self) -> usize {
+        self.id_to_idx
+            .len()
+            .saturating_sub(self.tombstone_count.load(Ordering::SeqCst))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    /// Access the underlying HNSW mutex (for snapshot dump).
+    pub fn inner(&self) -> &Mutex<Hnsw<'static, f32, DistCosine>> {
+        &self.inner
+    }
+
+    /// Snapshot the ID maps for persistence.
+    pub fn snapshot_id_maps(
+        &self,
+    ) -> (
+        std::collections::HashMap<String, usize>,
+        std::collections::HashMap<usize, String>,
+        usize,
+        Vec<String>,
+    ) {
+        let id_to_idx: std::collections::HashMap<String, usize> = self
+            .id_to_idx
+            .iter()
+            .map(|e| (e.key().as_str().to_owned(), *e.value()))
+            .collect();
+        let idx_to_id: std::collections::HashMap<usize, String> = self
+            .idx_to_id
+            .iter()
+            .map(|e| (*e.key(), e.value().as_str().to_owned()))
+            .collect();
+        let next_idx = self.next_idx.load(Ordering::SeqCst);
+        let tombstones: Vec<String> = self
+            .tombstones
+            .iter()
+            .map(|e| e.key().as_str().to_owned())
+            .collect();
+        (id_to_idx, idx_to_id, next_idx, tombstones)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_id(s: &str) -> LogicalId {
+        LogicalId::from_string(s)
+    }
+
+    #[test]
+    fn insert_and_search() {
+        let idx = HnswIndex::new(3);
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0]);
+        idx.insert(&make_id("e2"), &[0.0, 1.0, 0.0]);
+        idx.insert(&make_id("e3"), &[0.9, 0.1, 0.0]);
+
+        let results = idx.search(&[1.0, 0.0, 0.0], 3);
+        assert!(results.len() >= 2 && results.len() <= 3);
+        // e1 should be the closest match (exact vector)
+        assert_eq!(results[0].0, make_id("e1"));
+        // similarity should be close to 1.0
+        assert!(results[0].1 > 0.99);
+    }
+
+    #[test]
+    fn search_empty_index() {
+        let idx = HnswIndex::new(3);
+        let results = idx.search(&[1.0, 0.0, 0.0], 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn idempotent_insert() {
+        let idx = HnswIndex::new(3);
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0]);
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0]); // duplicate
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn similarity_score_range() {
+        let idx = HnswIndex::new(3);
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0]);
+        idx.insert(&make_id("e2"), &[0.0, 1.0, 0.0]); // orthogonal
+
+        let results = idx.search(&[1.0, 0.0, 0.0], 2);
+        assert_eq!(results.len(), 2);
+        // First result (e1) should have high similarity
+        assert!(results[0].1 > 0.9);
+        // Second result (e2) should have low similarity (orthogonal ≈ 0.0)
+        assert!(results[1].1 < 0.1);
+    }
+
+    #[test]
+    fn results_sorted_descending() {
+        let idx = HnswIndex::new(3);
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0]);
+        idx.insert(&make_id("e2"), &[0.5, 0.5, 0.0]);
+        idx.insert(&make_id("e3"), &[0.0, 1.0, 0.0]);
+
+        let results = idx.search(&[1.0, 0.0, 0.0], 3);
+        for w in results.windows(2) {
+            assert!(
+                w[0].1 >= w[1].1,
+                "results should be sorted by descending similarity"
+            );
+        }
+    }
+
+    #[test]
+    fn len_and_dimensions() {
+        let idx = HnswIndex::new(5);
+        assert_eq!(idx.dimensions(), 5);
+        assert_eq!(idx.len(), 0);
+        assert!(idx.is_empty());
+
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(idx.len(), 1);
+        assert!(!idx.is_empty());
+    }
+
+    #[test]
+    fn remove_excludes_from_search() {
+        let idx = HnswIndex::new(3);
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0]);
+        idx.insert(&make_id("e2"), &[0.0, 1.0, 0.0]);
+        idx.insert(&make_id("e3"), &[0.9, 0.1, 0.0]);
+
+        idx.remove(&make_id("e1"));
+
+        let results = idx.search(&[1.0, 0.0, 0.0], 3);
+        assert!(results.iter().all(|(id, _)| id != &make_id("e1")));
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let idx = HnswIndex::new(3);
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0]);
+        idx.remove(&make_id("nonexistent"));
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn tombstone_count_tracking() {
+        let idx = HnswIndex::new(3);
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0]);
+        idx.insert(&make_id("e2"), &[0.0, 1.0, 0.0]);
+        assert_eq!(idx.tombstone_count(), 0);
+        idx.remove(&make_id("e1"));
+        assert_eq!(idx.tombstone_count(), 1);
+        assert!(idx.needs_rebuild()); // 1 tombstone, 1 live = 50% > 10%
+    }
+
+    #[test]
+    fn rebuild_clears_tombstones() {
+        let idx = HnswIndex::new(3);
+        idx.insert(&make_id("e1"), &[1.0, 0.0, 0.0]);
+        idx.insert(&make_id("e2"), &[0.0, 1.0, 0.0]);
+        idx.insert(&make_id("e3"), &[0.5, 0.5, 0.0]);
+        idx.remove(&make_id("e1"));
+
+        let live_data: Vec<(LogicalId, Vec<f32>)> = vec![
+            (make_id("e2"), vec![0.0, 1.0, 0.0]),
+            (make_id("e3"), vec![0.5, 0.5, 0.0]),
+        ];
+        idx.rebuild(&live_data);
+
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx.tombstone_count(), 0);
+        assert!(!idx.needs_rebuild());
+
+        let results = idx.search(&[0.0, 1.0, 0.0], 2);
+        assert_eq!(results[0].0, make_id("e2"));
+    }
+}
